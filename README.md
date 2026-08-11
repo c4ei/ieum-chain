@@ -255,21 +255,17 @@ v0.18.1에는 지갑이 화상채팅을 연결할 때 필요한 암호화 통신
 keystore 또는 운영체제 보안 저장소에만 보관해야 합니다.
 
 v0.21.10부터 일반 계정과 노드 보상 주소는 모두 `0x`로 시작하는 40자리
-secp256k1 계정 주소를 사용합니다. 새 로컬 계정은 암호 파일을 준비해 만듭니다.
+secp256k1 계정 주소를 사용합니다. v0.21.12부터 상대경로는 항상 실행 중인
+바이너리 폴더를 기준으로 하며, 계정 암호 파일은 인스턴스별로 자동 생성됩니다.
 
 ```bash
-printf '%s\n' '10자이상-강한-암호' > /secure/ieum-account.password
-chmod 600 /secure/ieum-account.password
-
-./ieum-chain account new --password-file /secure/ieum-account.password
-./ieum-chain account import /secure/private-key.hex \
-  --password-file /secure/ieum-account.password
+./ieum-chain account new
+./ieum-chain account import secure/private-key.hex
 ./ieum-chain account list
 ./ieum-chain account send \
   --from 0x보내는주소 \
   --to 0x받는주소 \
-  --amount 0.1 \
-  --password-file /secure/ieum-account.password
+  --amount 0.1
 
 ./ieum-chain account balance 0x계정주소 --rpc-port 8989
 ./ieum-chain account transaction 0x거래해시 --rpc-port 8989
@@ -286,6 +282,12 @@ chmod 600 /secure/ieum-account.password
 CLI와 `personal_newAccount`/`personal_importRawKey` RPC는 동일한
 `data/keystore`를 사용합니다. v0.21.11부터 새 파일은
 `UTC--timestamp--주소` 형식으로 계정별 누적되며 기존 `주소.json`도 계속 읽습니다.
+기본 암호 파일은 `<바이너리 폴더>/secure/ieum-account.password`이며 최초
+`account new` 또는 `account import` 때 0600 권한의 임의 암호로 생성됩니다.
+
+`/opt/ieum-node1/ieum-chain`과 `/opt/ieum-node2/ieum-chain`을 함께 실행해도 각각
+자기 폴더의 `config`, `data`, `secure`와 자기 바이너리 업데이트만 사용합니다.
+systemd `WorkingDirectory`나 명령을 호출한 셸의 폴더는 기준을 바꾸지 않습니다.
 
 64자리 Ed25519 값은 검증자·합의·P2P 신원용 공개키이며 송금 주소가 아닙니다.
 v0.21.9가 만든 구형 Ed25519 보상 keystore는 첫 로드 때

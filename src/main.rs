@@ -20,6 +20,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const DEFAULT_BOOTSTRAP_CONFIG: &str = "config/bootstrap.json";
 const DEFAULT_NETWORK_CONFIG: &str = "config/network.json";
+const DEFAULT_ACCOUNT_PASSWORD_FILE: &str = "secure/ieum-account.password";
 const DEFAULT_BOOTSTRAP_PEERS: [&str; 4] = [
     "/dns4/node.ieum.aah.name/udp/7001/quic-v1/p2p/12D3KooWGABnBEucGacnREpBieFwspL5q7Aa6RRuj1MtxEYwrPo2",
     "/dns4/node.ieum.aah.name/udp/7002/quic-v1/p2p/12D3KooWLqqVdBzWGGc3bjaarVpsu2WA6DTYuzKGoYCznbgrugnX",
@@ -172,8 +173,8 @@ enum AccountCommand {
     New {
         #[arg(long, default_value = "data/keystore")]
         keystore_dir: PathBuf,
-        /// 10자 이상 암호 한 줄을 담은 0600 파일
-        #[arg(long)]
+        /// 10자 이상 암호 한 줄을 담은 0600 파일. 없으면 이 인스턴스에 자동 생성합니다.
+        #[arg(long, default_value = DEFAULT_ACCOUNT_PASSWORD_FILE)]
         password_file: PathBuf,
     },
     /// 32바이트 secp256k1 개인키 파일을 암호화 keystore로 가져옵니다.
@@ -182,7 +183,7 @@ enum AccountCommand {
         key_file: PathBuf,
         #[arg(long, default_value = "data/keystore")]
         keystore_dir: PathBuf,
-        #[arg(long)]
+        #[arg(long, default_value = DEFAULT_ACCOUNT_PASSWORD_FILE)]
         password_file: PathBuf,
     },
     /// 로컬 keystore에 저장된 0x 주소를 나열합니다.
@@ -202,7 +203,7 @@ enum AccountCommand {
         fee: String,
         #[arg(long, default_value = "data/keystore")]
         keystore_dir: PathBuf,
-        #[arg(long)]
+        #[arg(long, default_value = DEFAULT_ACCOUNT_PASSWORD_FILE)]
         password_file: PathBuf,
         #[arg(long, default_value_t = 8989)]
         rpc_port: u16,
@@ -503,6 +504,7 @@ fn parse_sync_quorum_peers(value: &str) -> Result<usize, String> {
 
 #[tokio::main]
 async fn main() -> Result<(), String> {
+    use_binary_directory()?;
     migrate_legacy_key_files()?;
     let cli = Args::parse();
     if cli.command.is_some() && cli.mode != RunMode::Auto {
@@ -1598,8 +1600,7 @@ fn run_account_command(command: AccountCommand) -> Result<(), String> {
             keystore_dir,
             password_file,
         } => {
-            let password = fs::read_to_string(&password_file)
-                .map_err(|error| format!("계정 암호 파일 읽기 실패: {error}"))?;
+            let password = load_or_create_account_password(&password_file)?;
             let keystore = Keystore::new(keystore_dir)?;
             let wallet = AccountWallet::new();
             println!("{}", keystore.store(&wallet, password.trim())?);
@@ -1618,8 +1619,7 @@ fn run_account_command(command: AccountCommand) -> Result<(), String> {
         } => {
             let private_key = fs::read_to_string(&key_file)
                 .map_err(|error| format!("개인키 파일 읽기 실패: {error}"))?;
-            let password = fs::read_to_string(&password_file)
-                .map_err(|error| format!("계정 암호 파일 읽기 실패: {error}"))?;
+            let password = load_or_create_account_password(&password_file)?;
             let wallet = AccountWallet::from_private_key_hex(private_key.trim())?;
             println!(
                 "{}",
@@ -1636,8 +1636,12 @@ fn run_account_command(command: AccountCommand) -> Result<(), String> {
             password_file,
             rpc_port,
         } => {
-            let password = fs::read_to_string(&password_file)
-                .map_err(|error| format!("계정 암호 파일 읽기 실패: {error}"))?;
+            let password = fs::read_to_string(&password_file).map_err(|error| {
+                format!(
+                    "계정 암호 파일 읽기 실패({}): {error}. 계정을 만든 인스턴스의 암호 파일인지 확인하세요.",
+                    password_file.display()
+                )
+            })?;
             let wallet = Keystore::new(keystore_dir)?.load(&from, password.trim())?;
             send_wallet_balance(&wallet, to, amount, fee, rpc_port)
         }
@@ -1661,6 +1665,47 @@ fn run_account_command(command: AccountCommand) -> Result<(), String> {
             print_rpc_lookup(rpc_port, "eth_getTransactionReceipt", &hash)
         }
     }
+}
+
+/// 모든 상대 경로를 호출한 셸의 cwd가 아니라 현재 바이너리 인스턴스 기준으로
+/// 해석합니다. 한 서버의 /opt/ieum-node1, node2, node3가 서로의 키와 설정을
+/// 공유하거나 다른 바이너리를 업데이트하지 않게 하는 인스턴스 경계입니다.
+fn use_binary_directory() -> Result<PathBuf, String> {
+    let executable = std::env::current_exe()
+        .map_err(|error| format!("현재 실행 바이너리 경로 확인 실패: {error}"))?;
+    let directory = executable
+        .parent()
+        .ok_or("현재 실행 바이너리의 상위 폴더를 확인할 수 없습니다.")?
+        .to_path_buf();
+    std::env::set_current_dir(&directory).map_err(|error| {
+        format!(
+            "바이너리 기준 폴더로 이동할 수 없습니다({}): {error}",
+            directory.display()
+        )
+    })?;
+    Ok(directory)
+}
+
+fn load_or_create_account_password(path: &Path) -> Result<String, String> {
+    if path.exists() {
+        return fs::read_to_string(path)
+            .map(|value| value.trim().to_string())
+            .map_err(|error| format!("계정 암호 파일 읽기 실패({}): {error}", path.display()));
+    }
+    let mut secret = [0_u8; 32];
+    OsRng.fill_bytes(&mut secret);
+    let password = hex::encode(secret);
+    atomic_private_write(path, password.as_bytes()).map_err(|error| {
+        format!(
+            "이 인스턴스의 계정 암호 파일 생성 실패({}): {error}",
+            path.display()
+        )
+    })?;
+    eprintln!(
+        "이 인스턴스의 계정 암호 파일을 생성했습니다: {}",
+        path.display()
+    );
+    Ok(password)
 }
 
 fn print_rpc_lookup(rpc_port: u16, method: &str, hash: &str) -> Result<(), String> {
@@ -1711,6 +1756,11 @@ fn format_ieum_amount(value: u128) -> String {
 }
 
 fn atomic_private_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
     let temporary = path.with_extension("tmp");
     let mut options = OpenOptions::new();
     options.write(true).create(true).truncate(true);

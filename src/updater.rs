@@ -69,24 +69,16 @@ impl AutoUpdateConfig {
         Ok(Some(config))
     }
 
-    /// 설치 위치와 현재 작업 디렉터리가 달라도 자동 업데이트 설정을 찾습니다.
-    /// systemd 설치본은 실행 파일 옆의 `config/update.json`을 우선 신뢰하고,
-    /// 소스에서 직접 실행하는 경우에는 기존 상대 경로를 사용합니다.
+    /// 각 인스턴스는 자기 실행 파일 옆의 설정만 신뢰합니다. 한 서버에 여러
+    /// ieum-node 디렉터리가 있어도 다른 인스턴스의 업데이트 설정을 읽지 않습니다.
     pub fn discover() -> Result<Option<(PathBuf, Self)>, String> {
-        let mut candidates = Vec::new();
-        if let Ok(executable) = std::env::current_exe()
-            && let Some(directory) = executable.parent()
-        {
-            candidates.push(directory.join("config/update.json"));
-        }
-        candidates.push(PathBuf::from("config/update.json"));
-
-        for path in candidates {
-            if let Some(config) = Self::load_if_enabled(&path)? {
-                return Ok(Some((path, config)));
-            }
-        }
-        Ok(None)
+        let executable = std::env::current_exe()
+            .map_err(|error| format!("현재 실행 바이너리 경로 확인 실패: {error}"))?;
+        let directory = executable
+            .parent()
+            .ok_or("현재 실행 바이너리의 상위 폴더를 확인할 수 없습니다.")?;
+        let path = directory.join("config/update.json");
+        Ok(Self::load_if_enabled(&path)?.map(|config| (path, config)))
     }
 }
 
