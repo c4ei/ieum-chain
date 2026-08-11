@@ -10,7 +10,7 @@ use ieum_chain::{
 use libp2p::{Multiaddr, multiaddr::Protocol};
 use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::net::{IpAddr, Ipv4Addr, TcpListener, TcpStream, UdpSocket};
@@ -784,6 +784,10 @@ async fn main() -> Result<(), String> {
     // 비제안자 RPC로 들어온 거래는 제안자가 받을 때까지 주기적으로 재전파하되,
     // 매 consensus tick마다 같은 payload를 쏟아내지는 않습니다.
     let mut announced_transactions = std::collections::HashMap::<String, std::time::Instant>::new();
+    // 같은 블록은 여러 피어에서 도착할 수 있습니다. 운영 로그에는 최초 수신만 남겨
+    // 로그 폭증을 막되, 블록 검증과 합의 처리는 기존대로 모두 수행합니다.
+    let mut logged_block_hashes = HashSet::<String>::new();
+    let mut logged_block_order = VecDeque::<String>::new();
     // 거래가 없는 동안에는 빈 블록을 만들지 않는다. 첫 거래나 제안이 도착했을 때
     // 노드 시작 시점의 만료된 deadline을 쓰지 않도록 활성 전환을 추적한다.
     let mut consensus_was_active = false;
@@ -1137,6 +1141,24 @@ async fn main() -> Result<(), String> {
                     }
                     Some(NetworkEvent::TransactionReceived { transaction, .. }) => {
                         rpc.restore_transactions(vec![transaction])?;
+                    }
+                    Some(NetworkEvent::BlockReceived { source, block }) => {
+                        if logged_block_hashes.insert(block.hash.clone()) {
+                            let block_hash = block.hash.clone();
+                            log_info!(
+                                "{}",
+                                NetworkEvent::BlockReceived {
+                                    source,
+                                    block,
+                                }
+                            );
+                            logged_block_order.push_back(block_hash);
+                            if logged_block_order.len() > 4_096
+                                && let Some(expired) = logged_block_order.pop_front()
+                            {
+                                logged_block_hashes.remove(&expired);
+                            }
+                        }
                     }
                     Some(NetworkEvent::CommunicationReceived { envelope, .. }) => {
                         rpc.receive_communication(envelope, unix_timestamp())?;

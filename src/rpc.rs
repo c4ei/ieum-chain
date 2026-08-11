@@ -1103,6 +1103,44 @@ mod tests {
     }
 
     #[test]
+    fn standard_json_rpc_request_dispatches_method() {
+        let shared = RpcServer::new(test_rpc_config("standard-json-rpc-request")).state;
+        let response = rpc_response(
+            &shared,
+            &json!({"jsonrpc": "2.0", "method": "eth_blockNumber", "params": [], "id": 7}),
+        );
+        assert_eq!(
+            response,
+            json!({"jsonrpc": "2.0", "id": 7, "result": "0x0"})
+        );
+    }
+
+    #[test]
+    fn explorer_block_contract_keeps_standard_fields_and_hides_raw_signature() {
+        let transaction = Transaction {
+            from: "0x1111111111111111111111111111111111111111".into(),
+            to: "0x2222222222222222222222222222222222222222".into(),
+            amount: 10,
+            fee: 21_000,
+            nonce: 0,
+            signature: "raw-signature-must-not-be-exposed".into(),
+        };
+        let block = Block::new(
+            1,
+            "00".repeat(32),
+            123,
+            "validator".into(),
+            vec![transaction],
+        );
+        let value = block_json(&block, true);
+
+        assert_eq!(value["number"], "0x1");
+        assert_eq!(value["transactions"][0]["blockHash"], value["hash"]);
+        assert_eq!(value["transactions"][0]["transactionIndex"], "0x0");
+        assert!(value["transactions"][0].get("signature").is_none());
+    }
+
+    #[test]
     fn malformed_raw_ethereum_transaction_is_rejected() {
         let shared = RpcServer::new(test_rpc_config("malformed-raw-transaction")).state;
         let error = dispatch(&shared, "eth_sendRawTransaction", &[json!("0x00")]).unwrap_err();

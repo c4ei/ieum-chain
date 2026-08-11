@@ -1,9 +1,9 @@
-# IEUM Chain v0.20.9 쉬운 실행 안내
+# IEUM Chain v0.21.13 쉬운 실행 안내
 
-설치, systemd, 백업, 자동 업데이트 등 전체 운영 방법은
-[`docs/USER_MANUAL_0.20.9.md`](docs/USER_MANUAL_0.20.9.md)에 정리되어 있으며,
-v0.20.9 사고 복구 원칙은
-[`docs/VERSION_0.20.9.md`](docs/VERSION_0.20.9.md)를 참고하세요.
+설치, systemd, 계정, 백업, 자동 업데이트와 익스플로러 연동은
+[`docs/IEUM_USER_MANUAL_FIRST_RELEASE.md`](docs/IEUM_USER_MANUAL_FIRST_RELEASE.md)에,
+이번 변경과 배포·태그 절차는
+[`docs/VERSION_0.21.13.md`](docs/VERSION_0.21.13.md)에 정리되어 있습니다.
 
 ## Ubuntu 신규 노드 배포본 자동 생성
 

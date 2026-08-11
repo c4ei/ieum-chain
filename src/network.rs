@@ -345,7 +345,11 @@ impl fmt::Display for NetworkEvent {
             Self::BlockReceived { source, block } => {
                 write!(
                     formatter,
-                    "[P2P 블록 수신] PeerId: {source}, 블록: {block:?}"
+                    "[P2P 블록 수신] PeerId: {source}, 높이: {}, 해시: {}, 거래: {}개, 시스템 이벤트: {}개",
+                    block.height,
+                    block.hash,
+                    block.transactions.len(),
+                    block.system_events.len()
                 )
             }
             Self::TransactionReceived {
@@ -1573,6 +1577,35 @@ mod connection_log_tests {
     #[test]
     fn formats_connection_duration() {
         assert_eq!(format_duration(Duration::from_secs(3_725)), "1시간 2분 5초");
+    }
+
+    #[test]
+    fn block_received_log_is_concise_and_does_not_expose_signature() {
+        let block = Block::new(
+            2,
+            "00".repeat(32),
+            123,
+            "validator".into(),
+            vec![Transaction {
+                from: "0x1111111111111111111111111111111111111111".into(),
+                to: "0x2222222222222222222222222222222222222222".into(),
+                amount: 1,
+                fee: 21_000,
+                nonce: 0,
+                signature: "ethraw:secret-signature".into(),
+            }],
+        );
+        let line = NetworkEvent::BlockReceived {
+            source: PeerId::random(),
+            block: block.clone(),
+        }
+        .to_string();
+
+        assert!(line.contains("높이: 2"));
+        assert!(line.contains(&format!("해시: {}", block.hash)));
+        assert!(line.contains("거래: 1개"));
+        assert!(!line.contains("ethraw:"));
+        assert!(!line.contains("signature"));
     }
 
     #[tokio::test]
