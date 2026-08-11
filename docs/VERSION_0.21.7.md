@@ -1,4 +1,4 @@
-# IEUM Chain 0.21.7 변경 내역
+# IEUM Chain 0.21.8 변경 내역
 
 작성일: 2026-08-05
 
@@ -22,7 +22,7 @@
 
 ## 키 파일 이름과 호환 이전
 
-| 역할 | 이전 경로 | 0.21.7 기본 경로 |
+| 역할 | 이전 경로 | 0.21.8 기본 경로 |
 |---|---|---|
 | P2P 노드 식별 | `data/server.node.key` | `data/keys/p2p_identity.key` |
 | BFT 합의 서명 | `config/validator.key` | `data/keys/consensus_signing.key` |

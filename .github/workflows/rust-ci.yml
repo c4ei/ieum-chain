@@ -35,6 +35,9 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all --check
 
+      - name: Check CI regression guards
+        run: bash tests/ci_regression_guard.sh
+
       - name: Run Clippy
         run: cargo clippy --all-targets --all-features --locked -- -D warnings
 
