@@ -1,11 +1,11 @@
 use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
 use ieum_chain::{
-    ConsensusRuntime, ConsensusTimeouts, EventSchedule, EvidenceStore, ExternalSigner,
-    FinalityStore, GenesisConfig, NetworkCommand, NetworkConfig, NetworkEvent,
-    NodeRewardRegistration, NodeWalletKeystore, P2pNode, RpcConfig, RpcServer, ScheduledEvent,
-    ScheduledEventAction, SyncTip, TipQuorum, UpgradeSchedule, Validator, ValidatorRegistration,
-    ValidatorSigner, Wallet, log_error, log_info, logger::init_server_log,
-    node_key::load_or_create_node_key,
+    AccountWallet, ConsensusRuntime, ConsensusTimeouts, EventSchedule, EvidenceStore,
+    ExternalSigner, FinalityStore, GenesisConfig, Keystore, NetworkCommand, NetworkConfig,
+    NetworkEvent, NodeRewardRegistration, NodeWalletKeystore, P2pNode, RpcConfig, RpcServer,
+    ScheduledEvent, ScheduledEventAction, SyncTip, TipQuorum, Transaction, UpgradeSchedule,
+    Validator, ValidatorRegistration, ValidatorSigner, Wallet, log_error, log_info,
+    logger::init_server_log, node_key::load_or_create_node_key,
 };
 use libp2p::{Multiaddr, multiaddr::Protocol};
 use rand_core::{OsRng, RngCore};
@@ -88,6 +88,11 @@ enum Command {
         #[command(subcommand)]
         command: RewardCommand,
     },
+    /// geth personal 계정과 같은 0x 지갑을 로컬 암호화 keystore로 관리합니다.
+    Account {
+        #[command(subcommand)]
+        command: AccountCommand,
+    },
     /// 부트스트랩과 이 서버가 외부에 광고할 공개 주소를 관리합니다.
     Network {
         #[command(subcommand)]
@@ -158,6 +163,40 @@ enum RewardCommand {
         /// 새 암호만 담긴 소유자 전용(0600) 파일. 명령행에 암호를 직접 노출하지 않습니다.
         #[arg(long)]
         new_password_file: PathBuf,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum AccountCommand {
+    /// 새 secp256k1 계정을 만들고 0x 주소를 출력합니다.
+    New {
+        #[arg(long, default_value = "data/keystore")]
+        keystore_dir: PathBuf,
+        /// 10자 이상 암호 한 줄을 담은 0600 파일
+        #[arg(long)]
+        password_file: PathBuf,
+    },
+    /// 로컬 keystore에 저장된 0x 주소를 나열합니다.
+    List {
+        #[arg(long, default_value = "data/keystore")]
+        keystore_dir: PathBuf,
+    },
+    /// 로컬 keystore 계정으로 서명해 실행 중인 노드 RPC에 송금합니다.
+    Send {
+        #[arg(long)]
+        from: String,
+        #[arg(long)]
+        to: String,
+        #[arg(long)]
+        amount: String,
+        #[arg(long, default_value = "0.000001")]
+        fee: String,
+        #[arg(long, default_value = "data/keystore")]
+        keystore_dir: PathBuf,
+        #[arg(long)]
+        password_file: PathBuf,
+        #[arg(long, default_value_t = 8989)]
+        rpc_port: u16,
     },
 }
 
@@ -448,6 +487,7 @@ async fn main() -> Result<(), String> {
     let (mode, mut args, bootstrap_peers, is_client) = match cli.command {
         Some(Command::ValidatorKey { command }) => return run_validator_key_command(command),
         Some(Command::Reward { command }) => return run_reward_command(command),
+        Some(Command::Account { command }) => return run_account_command(command),
         Some(Command::Node { command }) => return run_node_command(command),
         Some(Command::Network { command }) => return run_network_command(command),
         Some(Command::Recovery { command }) => return run_recovery_command(command),
@@ -1525,6 +1565,42 @@ fn run_reward_command(command: RewardCommand) -> Result<(), String> {
     }
 }
 
+fn run_account_command(command: AccountCommand) -> Result<(), String> {
+    match command {
+        AccountCommand::New {
+            keystore_dir,
+            password_file,
+        } => {
+            let password = fs::read_to_string(&password_file)
+                .map_err(|error| format!("계정 암호 파일 읽기 실패: {error}"))?;
+            let keystore = Keystore::new(keystore_dir)?;
+            let wallet = AccountWallet::new();
+            println!("{}", keystore.store(&wallet, password.trim())?);
+            Ok(())
+        }
+        AccountCommand::List { keystore_dir } => {
+            for address in Keystore::new(keystore_dir)?.addresses()? {
+                println!("{address}");
+            }
+            Ok(())
+        }
+        AccountCommand::Send {
+            from,
+            to,
+            amount,
+            fee,
+            keystore_dir,
+            password_file,
+            rpc_port,
+        } => {
+            let password = fs::read_to_string(&password_file)
+                .map_err(|error| format!("계정 암호 파일 읽기 실패: {error}"))?;
+            let wallet = Keystore::new(keystore_dir)?.load(&from, password.trim())?;
+            send_wallet_balance(&wallet, to, amount, fee, rpc_port)
+        }
+    }
+}
+
 fn atomic_private_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
     let temporary = path.with_extension("tmp");
     let mut options = OpenOptions::new();
@@ -1540,13 +1616,42 @@ fn atomic_private_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
     fs::rename(temporary, path).map_err(|e| e.to_string())
 }
 
-fn send_wallet_balance(
-    wallet: &Wallet,
+trait CliTransferWallet {
+    fn cli_address(&self) -> String;
+    fn cli_sign_transfer(&self, to: String, amount: u128, fee: u128, nonce: u64) -> Transaction;
+}
+
+impl CliTransferWallet for AccountWallet {
+    fn cli_address(&self) -> String {
+        self.address()
+    }
+    fn cli_sign_transfer(&self, to: String, amount: u128, fee: u128, nonce: u64) -> Transaction {
+        self.sign_transfer(to, amount, fee, nonce)
+    }
+}
+
+impl CliTransferWallet for Wallet {
+    fn cli_address(&self) -> String {
+        self.address()
+    }
+    fn cli_sign_transfer(&self, to: String, amount: u128, fee: u128, nonce: u64) -> Transaction {
+        self.sign_transfer(to, amount, fee, nonce)
+    }
+}
+
+fn send_wallet_balance<W: CliTransferWallet>(
+    wallet: &W,
     to: String,
     amount: String,
     fee: String,
     rpc_port: u16,
 ) -> Result<(), String> {
+    if !to.starts_with("0x")
+        || to.len() != 42
+        || !to[2..].bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err("받는 주소는 0x로 시작하는 40자리 IEUM 계정 주소여야 합니다.".into());
+    }
     let fee = parse_ieum_amount(&fee)?;
     let balance_response = rpc_call(
         rpc_port,
@@ -1554,7 +1659,7 @@ fn send_wallet_balance(
             "jsonrpc": "2.0",
             "id": 1,
             "method": "eth_getBalance",
-            "params": [wallet.address(), "latest"]
+            "params": [wallet.cli_address(), "latest"]
         }),
     )?;
     let balance = parse_rpc_quantity(&balance_response, "잔액")?;
@@ -1577,13 +1682,13 @@ fn send_wallet_balance(
             "jsonrpc": "2.0",
             "id": 2,
             "method": "eth_getTransactionCount",
-            "params": [wallet.address(), "pending"]
+            "params": [wallet.cli_address(), "pending"]
         }),
     )?;
     let nonce = u64::try_from(parse_rpc_quantity(&nonce_response, "nonce")?)
         .map_err(|_| "RPC nonce가 u64 범위를 벗어났습니다.".to_string())?;
-    let from = wallet.address();
-    let transaction = wallet.sign_transfer(to.clone(), amount, fee, nonce);
+    let from = wallet.cli_address();
+    let transaction = wallet.cli_sign_transfer(to.clone(), amount, fee, nonce);
     let response = rpc_call(
         rpc_port,
         serde_json::json!({
@@ -1596,7 +1701,7 @@ fn send_wallet_balance(
     if let Some(error) = response.get("error") {
         return Err(format!("송금 제출 실패: {error}"));
     }
-    println!("[서명 확인] 기존 검증자 주소: {from}");
+    println!("[보내는 계정] {from}");
     println!("[송금 대상] {to}");
     println!(
         "송금 제출 완료: {}",

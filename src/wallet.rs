@@ -23,11 +23,6 @@ impl Wallet {
         }
     }
 
-    /// 암호화된 노드 지갑을 저장하거나 다시 암호화할 때만 사용합니다.
-    pub(crate) fn seed_bytes(&self) -> [u8; 32] {
-        self.signing_key.to_bytes()
-    }
-
     /// 현재 예제에서는 공개키의 hex 표현을 주소로 사용합니다.
     /// 추후 주소 형식과 checksum을 도입할 때 이 부분을 교체합니다.
     pub fn address(&self) -> Address {

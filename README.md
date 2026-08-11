@@ -254,15 +254,32 @@ v0.18.1에는 지갑이 화상채팅을 연결할 때 필요한 암호화 통신
 검증자 콘솔에서 개인키를 붙여 넣어 송금하지 마세요. 송금 개인키는 지갑의 암호화
 keystore 또는 운영체제 보안 저장소에만 보관해야 합니다.
 
-v0.19.7의 최초 참여 보상 주소와 잔액 전송은 노드에서 다음 명령으로 처리합니다.
+v0.21.10부터 일반 계정과 노드 보상 주소는 모두 `0x`로 시작하는 40자리
+secp256k1 계정 주소를 사용합니다. 새 로컬 계정은 암호 파일을 준비해 만듭니다.
 
 ```bash
+printf '%s\n' '10자이상-강한-암호' > /secure/ieum-account.password
+chmod 600 /secure/ieum-account.password
+
+./ieum-chain account new --password-file /secure/ieum-account.password
+./ieum-chain account list
+./ieum-chain account send \
+  --from 0x보내는주소 \
+  --to 0x받는주소 \
+  --amount 0.1 \
+  --password-file /secure/ieum-account.password
+
 ./ieum-chain reward address
 ./ieum-chain reward send --to 0x받는지갑주소 --amount 1 --fee 0.000001
 ```
 
 `reward send`는 실행 중인 로컬 RPC `127.0.0.1:8989`에서 nonce를 조회하고
-`data/reward.key`로 서명한 뒤 거래를 제출합니다. 보상 키 파일은 다른 서버와
-공유하거나 Git에 커밋하지 마세요.
+`data/keys/node_wallet.keystore`로 서명한 뒤 거래를 제출합니다. 다른 RPC 포트는
+`--rpc-port`로 지정합니다. `--amount all`은 수수료를 뺀 전액을 보냅니다.
+
+64자리 Ed25519 값은 검증자·합의·P2P 신원용 공개키이며 송금 주소가 아닙니다.
+v0.21.9가 만든 구형 Ed25519 보상 keystore는 첫 로드 때
+`node_wallet.keystore.ed25519.bak`으로 보존되고, 동일한 32바이트 비밀값으로 새
+secp256k1 계정 keystore가 생성됩니다. 백업은 삭제하지 마세요.
 
 개발자용 빌드, 테스트, 구조 설명은 [README_DEV.md](README_DEV.md)를 참고하세요.

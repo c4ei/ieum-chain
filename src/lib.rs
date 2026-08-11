@@ -40,6 +40,7 @@ pub mod validator_key;
 pub mod validator_policy;
 pub mod wallet;
 
+pub use account::AccountWallet;
 pub use account_security::{AccountKey, AccountPolicy, Authorization, Permission, RecoveryRequest};
 pub use archive::ArchiveStore;
 pub use chain::{Blockchain, FEE_BPS_DENOMINATOR, FOUNDATION_FEE_ADDRESS, FOUNDATION_FEE_BPS};

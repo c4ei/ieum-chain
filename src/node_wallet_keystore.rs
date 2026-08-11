@@ -1,4 +1,4 @@
-use crate::Wallet;
+use crate::account::AccountWallet;
 use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -19,13 +19,24 @@ struct Document {
     kdf_rounds: u32,
 }
 
-/// 실제 노드 보상 자산용 지갑입니다. 등록 증명용 node_reward_signing.key와 분리됩니다.
+/// 실제 노드 보상 자산용 secp256k1 지갑입니다.
+/// 합의/등록 증명용 Ed25519 키와 분리하며 주소는 사용자 지갑과 같은 0x+40자리입니다.
 pub struct NodeWalletKeystore;
 
 impl NodeWalletKeystore {
-    pub fn load_or_create_default(path: &Path, password_path: &Path) -> Result<Wallet, String> {
+    pub fn load_or_create_default(
+        path: &Path,
+        password_path: &Path,
+    ) -> Result<AccountWallet, String> {
         if path.exists() {
-            return Self::load(path, read_password(password_path)?.trim());
+            let password = read_password(password_path)?;
+            return match Self::load(path, password.trim()) {
+                Ok(wallet) => Ok(wallet),
+                Err(error) if error == "legacy-ed25519-keystore" => {
+                    Self::migrate_legacy(path, password.trim())
+                }
+                Err(error) => Err(error),
+            };
         }
         if password_path.exists() {
             return Err(
@@ -33,7 +44,7 @@ impl NodeWalletKeystore {
                     .into(),
             );
         }
-        let wallet = Wallet::new();
+        let wallet = AccountWallet::new();
         let password = random_password();
         write_private_new(password_path, password.as_bytes())?;
         if let Err(error) = Self::store(path, &wallet, &password) {
@@ -43,11 +54,11 @@ impl NodeWalletKeystore {
         Ok(wallet)
     }
 
-    pub fn load(path: &Path, password: &str) -> Result<Wallet, String> {
+    pub fn load(path: &Path, password: &str) -> Result<AccountWallet, String> {
         let bytes = fs::read(path).map_err(|e| format!("노드 지갑 읽기 실패: {e}"))?;
         let doc: Document = serde_json::from_slice(&bytes)
             .map_err(|_| "node_wallet.keystore가 손상되었습니다.".to_string())?;
-        if doc.version != 1 || doc.kdf_rounds < KDF_ROUNDS {
+        if !matches!(doc.version, 1 | 2) || doc.kdf_rounds < KDF_ROUNDS {
             return Err("지원하지 않거나 너무 약한 node_wallet.keystore입니다.".into());
         }
         let salt = decode_32(&doc.salt)?;
@@ -57,17 +68,20 @@ impl NodeWalletKeystore {
         if mac(&key, &nonce, &ciphertext) != decode_32(&doc.mac)? {
             return Err("노드 지갑 비밀번호가 틀렸거나 파일이 변조되었습니다.".into());
         }
-        let seed: [u8; 32] = crypt(&ciphertext, &key, &nonce)
+        let private_key: [u8; 32] = crypt(&ciphertext, &key, &nonce)
             .try_into()
             .map_err(|_| "노드 지갑 개인키 길이 오류")?;
-        let wallet = Wallet::from_seed(seed);
+        if doc.version == 1 && !doc.address.starts_with("0x") {
+            return Err("legacy-ed25519-keystore".into());
+        }
+        let wallet = AccountWallet::from_private_key(private_key)?;
         if wallet.address() != doc.address {
             return Err("노드 지갑 주소 검증 실패".into());
         }
         Ok(wallet)
     }
 
-    pub fn store(path: &Path, wallet: &Wallet, password: &str) -> Result<(), String> {
+    pub fn store(path: &Path, wallet: &AccountWallet, password: &str) -> Result<(), String> {
         if password.len() < 10 {
             return Err("노드 지갑 비밀번호는 10자 이상이어야 합니다.".into());
         }
@@ -76,9 +90,9 @@ impl NodeWalletKeystore {
         OsRng.fill_bytes(&mut salt);
         OsRng.fill_bytes(&mut nonce);
         let key = derive_key(password.as_bytes(), &salt, KDF_ROUNDS);
-        let ciphertext = crypt(&wallet.seed_bytes(), &key, &nonce);
+        let ciphertext = crypt(&wallet.private_key_bytes(), &key, &nonce);
         let doc = Document {
-            version: 1,
+            version: 2,
             address: wallet.address(),
             salt: hex::encode(salt),
             nonce: hex::encode(nonce),
@@ -97,6 +111,35 @@ impl NodeWalletKeystore {
             return Err("재암호화 후 주소 불일치".into());
         }
         Ok(())
+    }
+
+    fn migrate_legacy(path: &Path, password: &str) -> Result<AccountWallet, String> {
+        let bytes = fs::read(path).map_err(|e| format!("노드 지갑 읽기 실패: {e}"))?;
+        let doc: Document = serde_json::from_slice(&bytes)
+            .map_err(|_| "node_wallet.keystore가 손상되었습니다.".to_string())?;
+        let salt = decode_32(&doc.salt)?;
+        let nonce = decode_32(&doc.nonce)?;
+        let ciphertext = hex::decode(&doc.ciphertext).map_err(|_| "노드 지갑 암호문 오류")?;
+        let key = derive_key(password.as_bytes(), &salt, doc.kdf_rounds);
+        if mac(&key, &nonce, &ciphertext) != decode_32(&doc.mac)? {
+            return Err("노드 지갑 비밀번호가 틀렸거나 파일이 변조되었습니다.".into());
+        }
+        let private_key: [u8; 32] = crypt(&ciphertext, &key, &nonce)
+            .try_into()
+            .map_err(|_| "노드 지갑 개인키 길이 오류")?;
+        let backup = PathBuf::from(format!("{}.ed25519.bak", path.display()));
+        if !backup.exists() {
+            fs::copy(path, &backup).map_err(|e| format!("구형 보상 지갑 백업 실패: {e}"))?;
+            set_private_permissions(&backup)?;
+        }
+        let wallet = AccountWallet::from_private_key(private_key)?;
+        Self::store(path, &wallet, password)?;
+        eprintln!(
+            "[지갑 이관] 구형 Ed25519 보상 keystore를 {}에 백업하고 0x 계정으로 전환했습니다: {}",
+            backup.display(),
+            wallet.address()
+        );
+        Ok(wallet)
     }
 }
 
@@ -167,6 +210,16 @@ fn write_private_new(path: &Path, bytes: &[u8]) -> Result<(), String> {
     f.write_all(bytes).map_err(|e| e.to_string())?;
     f.sync_all().map_err(|e| e.to_string())
 }
+
+fn set_private_permissions(path: &Path) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+            .map_err(|e| format!("개인 파일 권한 설정 실패: {e}"))?;
+    }
+    Ok(())
+}
 fn atomic_verified_replace(
     path: &Path,
     bytes: &[u8],
@@ -202,7 +255,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!("ieum-node-wallet-{}", std::process::id()));
         fs::create_dir_all(&root).unwrap();
         let path = root.join("node_wallet.keystore");
-        let w = Wallet::from_seed([9; 32]);
+        let w = AccountWallet::from_private_key([9; 32]).unwrap();
         NodeWalletKeystore::store(&path, &w, "initial-password").unwrap();
         NodeWalletKeystore::change_password(&path, "initial-password", "replacement-password")
             .unwrap();
@@ -212,7 +265,45 @@ mod tests {
                 .address(),
             w.address()
         );
+        assert!(w.address().starts_with("0x"));
+        assert_eq!(w.address().len(), 42);
         assert!(NodeWalletKeystore::load(&path, "initial-password").is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn legacy_ed25519_document_is_backed_up_and_migrated() {
+        let root =
+            std::env::temp_dir().join(format!("ieum-node-wallet-legacy-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("node_wallet.keystore");
+        let password_path = root.join("node_wallet.password");
+        let password = "legacy-test-password";
+        fs::write(&password_path, password).unwrap();
+        let legacy_seed = [7; 32];
+        let legacy = crate::Wallet::from_seed(legacy_seed);
+        let salt = [1; 32];
+        let nonce = [2; 32];
+        let key = derive_key(password.as_bytes(), &salt, KDF_ROUNDS);
+        let ciphertext = crypt(&legacy_seed, &key, &nonce);
+        let doc = Document {
+            version: 1,
+            address: legacy.address(),
+            salt: hex::encode(salt),
+            nonce: hex::encode(nonce),
+            ciphertext: hex::encode(&ciphertext),
+            mac: hex::encode(mac(&key, &nonce, &ciphertext)),
+            kdf_rounds: KDF_ROUNDS,
+        };
+        fs::write(&path, serde_json::to_vec(&doc).unwrap()).unwrap();
+
+        let migrated = NodeWalletKeystore::load_or_create_default(&path, &password_path).unwrap();
+        assert!(migrated.address().starts_with("0x"));
+        assert!(PathBuf::from(format!("{}.ed25519.bak", path.display())).exists());
+        assert_eq!(
+            NodeWalletKeystore::load(&path, password).unwrap().address(),
+            migrated.address()
+        );
         let _ = fs::remove_dir_all(root);
     }
 }

@@ -453,7 +453,11 @@ fn integer_sqrt(value: u64) -> u64 {
 }
 
 fn validate_reward_address(address: &str) -> Result<(), String> {
-    if address.len() != 64 || !address.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+    let is_account = address.starts_with("0x")
+        && address.len() == 42
+        && address[2..].bytes().all(|byte| byte.is_ascii_hexdigit());
+    let is_legacy = address.len() == 64 && address.bytes().all(|byte| byte.is_ascii_hexdigit());
+    if !is_account && !is_legacy {
         return Err("노드 보상 주소 형식이 올바르지 않습니다.".into());
     }
     Ok(())

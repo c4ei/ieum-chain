@@ -257,7 +257,11 @@ fn validate_address(address: &str) -> Result<(), String> {
 }
 
 fn validate_reward_address(address: &str) -> Result<(), String> {
-    if address.len() != 64 || !address.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+    let is_account = address.starts_with("0x")
+        && address.len() == 42
+        && address[2..].bytes().all(|byte| byte.is_ascii_hexdigit());
+    let is_legacy = address.len() == 64 && address.bytes().all(|byte| byte.is_ascii_hexdigit());
+    if !is_account && !is_legacy {
         return Err(format!("잘못된 노드 보상 주소: {address}"));
     }
     Ok(())
@@ -266,6 +270,13 @@ fn validate_reward_address(address: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reward_address_accepts_new_account_and_legacy_history() {
+        assert!(validate_reward_address("0x1111111111111111111111111111111111111111").is_ok());
+        assert!(validate_reward_address(&"11".repeat(32)).is_ok());
+        assert!(validate_reward_address("0x1234").is_err());
+    }
 
     #[test]
     fn due_events_are_ordered_and_exactly_once() {
