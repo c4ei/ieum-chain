@@ -262,12 +262,18 @@ printf '%s\n' '10자이상-강한-암호' > /secure/ieum-account.password
 chmod 600 /secure/ieum-account.password
 
 ./ieum-chain account new --password-file /secure/ieum-account.password
+./ieum-chain account import /secure/private-key.hex \
+  --password-file /secure/ieum-account.password
 ./ieum-chain account list
 ./ieum-chain account send \
   --from 0x보내는주소 \
   --to 0x받는주소 \
   --amount 0.1 \
   --password-file /secure/ieum-account.password
+
+./ieum-chain account balance 0x계정주소 --rpc-port 8989
+./ieum-chain account transaction 0x거래해시 --rpc-port 8989
+./ieum-chain account receipt 0x거래해시 --rpc-port 8989
 
 ./ieum-chain reward address
 ./ieum-chain reward send --to 0x받는지갑주소 --amount 1 --fee 0.000001
@@ -276,6 +282,10 @@ chmod 600 /secure/ieum-account.password
 `reward send`는 실행 중인 로컬 RPC `127.0.0.1:8989`에서 nonce를 조회하고
 `data/keys/node_wallet.keystore`로 서명한 뒤 거래를 제출합니다. 다른 RPC 포트는
 `--rpc-port`로 지정합니다. `--amount all`은 수수료를 뺀 전액을 보냅니다.
+
+CLI와 `personal_newAccount`/`personal_importRawKey` RPC는 동일한
+`data/keystore`를 사용합니다. v0.21.11부터 새 파일은
+`UTC--timestamp--주소` 형식으로 계정별 누적되며 기존 `주소.json`도 계속 읽습니다.
 
 64자리 Ed25519 값은 검증자·합의·P2P 신원용 공개키이며 송금 주소가 아닙니다.
 v0.21.9가 만든 구형 Ed25519 보상 keystore는 첫 로드 때

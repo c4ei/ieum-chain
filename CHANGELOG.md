@@ -374,3 +374,9 @@
 - 높이 100과 2026-08-10 00:00 KST를 모두 충족하는 보상 활성화 조건 추가
 - 2026~2040 노드 보상 총량 210,000,000 IEUM 및 매년 반감 예산 추가
 - 메인 4노드 1.5배 가중치와 기존 전송 수수료 20% 재단 배분 정책 문서화
+# 0.21.11
+
+- CLI와 `personal_*` RPC가 동일한 `data/keystore` 다중 계정 저장소를 사용합니다.
+- `account import`, `account balance`, `account transaction`, `account receipt`를 추가했습니다.
+- keystore 파일명을 `UTC--timestamp--address` 형식으로 누적하며 기존 `address.json`도 읽습니다.
+- 계정 생성·raw key import·IEUM 전송·잔액 및 트랜잭션/영수증 조회 흐름을 문서화했습니다.

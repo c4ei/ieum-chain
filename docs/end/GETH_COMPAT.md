@@ -36,7 +36,8 @@ seed 문구는 BIP-39 영어 단어를 사용하며 HD 파생 경로는 MetaMask
 | `eth_blockNumber` | 지원 | 최신 확정 높이 |
 | `eth_accounts` | 지원 | 노드 관리형 계정 |
 | `eth_coinbase` | 지원 | 개발용 faucet 계정 |
-| `personal_newAccount` | 개발용 지원 | 암호는 아직 저장하지 않음 |
+| `personal_newAccount` | localhost 지원 | 암호화 keystore에 영구 저장 |
+| `personal_importRawKey` | localhost 지원 | raw secp256k1 키를 암호화해 가져오기 |
 | `personal_importRawKey` | 개발용 지원 | geth형 32바이트 secp256k1 개인키 가져오기 |
 | `ieum_newMnemonic` | IEUM 확장 | BIP-39 12단어 및 0번 계정 생성 |
 | `ieum_importMnemonic` | IEUM 확장 | seed와 index로 표준 HD 계정 복원 |
@@ -127,7 +128,8 @@ web3.js 버전에 따라 `personal_newAccount`는 provider의 직접 RPC 호출 
 
 - RPC 기본 리스닝 주소는 localhost입니다.
 - v0.0.4의 관리형 계정은 메모리 기반이라 노드 재시작 후 자동 복구되지 않습니다.
-- `personal_newAccount`의 암호는 v0.0.4에서 실제 암호화에 사용되지 않습니다.
+- v0.21.11부터 `personal_newAccount`와 `personal_importRawKey`는 CLI와 같은
+  `data/keystore`에 계정별 암호화 파일을 저장합니다. 외부 공개 RPC에서는 차단됩니다.
 - `ieum_newMnemonic` 응답의 seed는 RPC 로그나 화면 캡처에 남기지 말고 오프라인에
   안전하게 보관해야 합니다. seed를 잃으면 복구할 수 없고 노출되면 자산을 잃습니다.
 - 테스트 코인만 사용하세요.

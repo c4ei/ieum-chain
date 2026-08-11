@@ -176,6 +176,15 @@ enum AccountCommand {
         #[arg(long)]
         password_file: PathBuf,
     },
+    /// 32바이트 secp256k1 개인키 파일을 암호화 keystore로 가져옵니다.
+    Import {
+        /// 0x 접두사가 선택적인 64자리 hex 개인키 파일
+        key_file: PathBuf,
+        #[arg(long, default_value = "data/keystore")]
+        keystore_dir: PathBuf,
+        #[arg(long)]
+        password_file: PathBuf,
+    },
     /// 로컬 keystore에 저장된 0x 주소를 나열합니다.
     List {
         #[arg(long, default_value = "data/keystore")]
@@ -195,6 +204,24 @@ enum AccountCommand {
         keystore_dir: PathBuf,
         #[arg(long)]
         password_file: PathBuf,
+        #[arg(long, default_value_t = 8989)]
+        rpc_port: u16,
+    },
+    /// 계정의 확정 잔액을 IEUM과 최소 단위로 조회합니다.
+    Balance {
+        address: String,
+        #[arg(long, default_value_t = 8989)]
+        rpc_port: u16,
+    },
+    /// 거래 해시로 트랜잭션을 조회합니다.
+    Transaction {
+        hash: String,
+        #[arg(long, default_value_t = 8989)]
+        rpc_port: u16,
+    },
+    /// 거래 해시로 영수증과 확정 여부를 조회합니다.
+    Receipt {
+        hash: String,
         #[arg(long, default_value_t = 8989)]
         rpc_port: u16,
     },
@@ -1584,6 +1611,22 @@ fn run_account_command(command: AccountCommand) -> Result<(), String> {
             }
             Ok(())
         }
+        AccountCommand::Import {
+            key_file,
+            keystore_dir,
+            password_file,
+        } => {
+            let private_key = fs::read_to_string(&key_file)
+                .map_err(|error| format!("개인키 파일 읽기 실패: {error}"))?;
+            let password = fs::read_to_string(&password_file)
+                .map_err(|error| format!("계정 암호 파일 읽기 실패: {error}"))?;
+            let wallet = AccountWallet::from_private_key_hex(private_key.trim())?;
+            println!(
+                "{}",
+                Keystore::new(keystore_dir)?.store(&wallet, password.trim())?
+            );
+            Ok(())
+        }
         AccountCommand::Send {
             from,
             to,
@@ -1598,7 +1641,73 @@ fn run_account_command(command: AccountCommand) -> Result<(), String> {
             let wallet = Keystore::new(keystore_dir)?.load(&from, password.trim())?;
             send_wallet_balance(&wallet, to, amount, fee, rpc_port)
         }
+        AccountCommand::Balance { address, rpc_port } => {
+            validate_account_address(&address)?;
+            let response = rpc_call(
+                rpc_port,
+                serde_json::json!({
+                    "jsonrpc": "2.0", "id": 1, "method": "eth_getBalance",
+                    "params": [address, "latest"]
+                }),
+            )?;
+            let value = parse_rpc_quantity(&response, "잔액")?;
+            println!("{} IEUM ({value} wei)", format_ieum_amount(value));
+            Ok(())
+        }
+        AccountCommand::Transaction { hash, rpc_port } => {
+            print_rpc_lookup(rpc_port, "eth_getTransactionByHash", &hash)
+        }
+        AccountCommand::Receipt { hash, rpc_port } => {
+            print_rpc_lookup(rpc_port, "eth_getTransactionReceipt", &hash)
+        }
     }
+}
+
+fn print_rpc_lookup(rpc_port: u16, method: &str, hash: &str) -> Result<(), String> {
+    if !hash.starts_with("0x")
+        || hash.len() != 66
+        || !hash[2..].bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err("거래 해시는 0x로 시작하는 64자리 hex여야 합니다.".into());
+    }
+    let response = rpc_call(
+        rpc_port,
+        serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": [hash]}),
+    )?;
+    if let Some(error) = response.get("error") {
+        return Err(format!("RPC 조회 실패: {error}"));
+    }
+    let result = response
+        .get("result")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&result).map_err(|error| error.to_string())?
+    );
+    Ok(())
+}
+
+fn validate_account_address(address: &str) -> Result<(), String> {
+    if address.starts_with("0x")
+        && address.len() == 42
+        && address[2..].bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        Ok(())
+    } else {
+        Err("주소는 0x로 시작하는 40자리 IEUM 계정 주소여야 합니다.".into())
+    }
+}
+
+fn format_ieum_amount(value: u128) -> String {
+    let whole = value / 1_000_000_000_000_000_000;
+    let fraction = value % 1_000_000_000_000_000_000;
+    if fraction == 0 {
+        return whole.to_string();
+    }
+    format!("{whole}.{:018}", fraction)
+        .trim_end_matches('0')
+        .to_string()
 }
 
 fn atomic_private_write(path: &Path, bytes: &[u8]) -> Result<(), String> {

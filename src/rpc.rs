@@ -56,6 +56,7 @@ struct RpcState {
     communication_inbox: CommunicationInbox,
     communication_outbox: CommunicationInbox,
     communication_rpc_enabled: bool,
+    personal_rpc_enabled: bool,
     data_dir: PathBuf,
 }
 
@@ -213,8 +214,15 @@ impl RpcServer {
             .unwrap_or(99_000_000);
         let archive = ArchiveStore::new(&config.data_dir, max_active_bytes)
             .expect("활성 블록 저장소를 만들 수 있어야 합니다.");
-        let keystore = Keystore::new(config.data_dir.join("keystore"))
-            .expect("keystore 디렉터리를 만들 수 있어야 합니다.");
+        // 원장은 data/ledger에, 사용자 계정은 CLI와 동일한 data/keystore에 둡니다.
+        // 사용자 지정 원장 경로에서도 그 부모를 계정 루트로 사용합니다.
+        let keystore_root = config
+            .data_dir
+            .parent()
+            .unwrap_or(&config.data_dir)
+            .join("keystore");
+        let keystore =
+            Keystore::new(keystore_root).expect("keystore 디렉터리를 만들 수 있어야 합니다.");
         let state_store =
             StateStore::new(&config.data_dir).expect("상태 저장소를 만들 수 있어야 합니다.");
         let mut chain = match config.genesis.as_ref() {
@@ -296,6 +304,7 @@ impl RpcServer {
                 communication_inbox: CommunicationInbox::default(),
                 communication_outbox: CommunicationInbox::default(),
                 communication_rpc_enabled: config.listen_ip.is_loopback(),
+                personal_rpc_enabled: config.listen_ip.is_loopback(),
                 data_dir: config.data_dir.clone(),
             })),
             config,
@@ -418,7 +427,14 @@ fn dispatch(
         "eth_accounts" | "personal_listAccounts" => {
             let state = read_state(state)?;
             let mut accounts: Vec<_> = state.wallets.keys().cloned().collect();
+            accounts.extend(
+                state
+                    .keystore
+                    .addresses()
+                    .map_err(|message| (-32000, message))?,
+            );
             accounts.sort();
+            accounts.dedup();
             Ok(json!(accounts))
         }
         "eth_coinbase" => {
@@ -432,6 +448,12 @@ fn dispatch(
                 .or_else(|| cfg!(test).then_some("test-password"))
                 .ok_or_else(|| (-32602, "keystore 비밀번호가 필요합니다.".into()))?;
             let mut state = write_state(state)?;
+            if !state.personal_rpc_enabled {
+                return Err((
+                    -32000,
+                    "personal RPC는 localhost에서만 사용할 수 있습니다.".into(),
+                ));
+            }
             let wallet = AccountWallet::new();
             let address = wallet.address();
             state
@@ -448,6 +470,12 @@ fn dispatch(
                 .map_err(|message| (-32602, message))?;
             let address = wallet.address();
             let mut state = write_state(state)?;
+            if !state.personal_rpc_enabled {
+                return Err((
+                    -32000,
+                    "personal RPC는 localhost에서만 사용할 수 있습니다.".into(),
+                ));
+            }
             state
                 .keystore
                 .store(&wallet, password)
@@ -456,6 +484,12 @@ fn dispatch(
             Ok(json!(address))
         }
         "ieum_newMnemonic" => {
+            if !read_state(state)?.personal_rpc_enabled {
+                return Err((
+                    -32000,
+                    "계정 RPC는 localhost에서만 사용할 수 있습니다.".into(),
+                ));
+            }
             let password = string_param(params, 0)?;
             let words = AccountWallet::generate_mnemonic().map_err(|message| (-32603, message))?;
             let wallet =
@@ -470,6 +504,12 @@ fn dispatch(
             Ok(json!({"mnemonic": words, "address": address, "path": "m/44'/60'/0'/0/0"}))
         }
         "ieum_importMnemonic" => {
+            if !read_state(state)?.personal_rpc_enabled {
+                return Err((
+                    -32000,
+                    "계정 RPC는 localhost에서만 사용할 수 있습니다.".into(),
+                ));
+            }
             let words = string_param(params, 0)?;
             let index = params.get(1).and_then(Value::as_u64).unwrap_or(0);
             let password = string_param(params, 2)?;
@@ -490,6 +530,12 @@ fn dispatch(
             let address = string_param(params, 0)?;
             let password = string_param(params, 1)?;
             let mut state = write_state(state)?;
+            if !state.personal_rpc_enabled {
+                return Err((
+                    -32000,
+                    "personal RPC는 localhost에서만 사용할 수 있습니다.".into(),
+                ));
+            }
             let normalized = normalize_address(address);
             let wallet = state
                 .keystore
@@ -1012,10 +1058,12 @@ mod tests {
     fn test_rpc_config(test_name: &str) -> RpcConfig {
         let sequence = TEST_DATA_DIR_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         RpcConfig {
-            data_dir: std::env::temp_dir().join(format!(
-                "ieum-rpc-{test_name}-{}-{sequence}",
-                std::process::id()
-            )),
+            data_dir: std::env::temp_dir()
+                .join(format!(
+                    "ieum-rpc-{test_name}-{}-{sequence}",
+                    std::process::id()
+                ))
+                .join("ledger"),
             ..RpcConfig::default()
         }
     }
