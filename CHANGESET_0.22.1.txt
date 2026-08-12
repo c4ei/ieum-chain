@@ -1,0 +1,21 @@
+IEUM Chain v0.22.1 changed-files package
+
+CHANGELOG.md
+Cargo.lock
+Cargo.toml
+README.md
+config/genesis.json
+docs/VERSION_0.22.1.md
+monitoring/alertmanager.yml.example
+monitoring/alerts.yml
+monitoring/grafana-dashboard.json
+monitoring/ieum-exporter@.service
+monitoring/ieum_exporter.py
+monitoring/prometheus.yml
+src/genesis.rs
+src/main.rs
+src/rpc.rs
+
+Base commit: a3f307c (IEUM Chain v0.21.13)
+Target version: v0.22.1
+Note: source/configuration changes only; no prebuilt binary is included.

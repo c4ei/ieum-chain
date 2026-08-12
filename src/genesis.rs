@@ -12,6 +12,9 @@ pub struct GenesisConfig {
     pub genesis_time: u64,
     /// 최소 단위(1 IEUM = 10^18)입니다. 운영 배분량이 u64를 넘을 수 있어 u128을 씁니다.
     pub initial_balances: Vec<(Address, u128)>,
+    /// 유통량에서 제외할 재단 락업·베스팅 주소입니다.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub locked_addresses: Vec<Address>,
     pub validators: Vec<Validator>,
     pub max_block_bytes: u64,
     /// 모든 활성 블록 파일을 합한 최대 크기입니다. 과거 이름도 읽을 수 있습니다.
@@ -23,6 +26,18 @@ impl GenesisConfig {
     pub fn validate(&self) -> Result<(), String> {
         if self.chain_id == 0 {
             return Err("chain_id는 0일 수 없습니다.".into());
+        }
+        let balance_addresses: HashSet<_> = self
+            .initial_balances
+            .iter()
+            .map(|(address, _)| address.to_ascii_lowercase())
+            .collect();
+        let mut locked = HashSet::new();
+        for address in &self.locked_addresses {
+            let normalized = address.to_ascii_lowercase();
+            if !balance_addresses.contains(&normalized) || !locked.insert(normalized) {
+                return Err("locked_addresses는 제네시스에 존재하는 고유 주소여야 합니다.".into());
+            }
         }
         if self.validators.len() < 4 {
             return Err("BFT 제네시스 검증자는 최소 4개가 필요합니다.".into());

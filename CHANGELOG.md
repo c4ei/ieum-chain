@@ -1,5 +1,11 @@
 # 변경 기록
 
+## 0.22.1 - 2026-08-12
+
+- 공급량·주소 잔액 인덱스·validator 서명률·블록 생성 품질 RPC 추가
+- Prometheus exporter, Grafana 대시보드와 Telegram/이메일 장애 알림 구성 추가
+- 민감한 원문을 기록하지 않는 관리자 작업 감사 로그 추가
+
 ## 0.21.13 - 2026-08-11
 
 - P2P 블록 수신 로그를 `PeerId/height/hash/tx count/system event count` 요약으로 변경

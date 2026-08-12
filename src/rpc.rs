@@ -1,3 +1,4 @@
+use crate::consensus::{FinalityCertificate, Validator};
 use crate::model::{Block, Transaction};
 use crate::{
     ArchiveStore, Blockchain, CommunicationEnvelope, CommunicationInbox, GenesisConfig, Keystore,
@@ -5,7 +6,10 @@ use crate::{
 };
 use axum::{Json, Router, routing::post};
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use sha2::Digest;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
@@ -22,6 +26,8 @@ pub struct RpcConfig {
     pub chain_id: u64,
     pub genesis: Option<GenesisConfig>,
     pub data_dir: PathBuf,
+    pub validators: Vec<Validator>,
+    pub locked_addresses: Vec<String>,
 }
 
 impl Default for RpcConfig {
@@ -33,6 +39,8 @@ impl Default for RpcConfig {
             chain_id: 21004,
             genesis: None,
             data_dir: PathBuf::from("data/ledger"),
+            validators: Vec::new(),
+            locked_addresses: Vec::new(),
         }
     }
 }
@@ -58,6 +66,10 @@ struct RpcState {
     communication_rpc_enabled: bool,
     personal_rpc_enabled: bool,
     data_dir: PathBuf,
+    validators: Vec<Validator>,
+    locked_addresses: HashSet<String>,
+    finality_history: VecDeque<FinalityCertificate>,
+    audit_log_path: PathBuf,
 }
 
 /// 기존 geth 스크립트에서 자주 쓰는 계정·잔액·송금 API를 제공하는 호환 계층입니다.
@@ -76,6 +88,17 @@ pub struct RpcNodeHandle {
 }
 
 impl RpcNodeHandle {
+    pub fn record_finality(&self, certificate: FinalityCertificate) -> Result<(), String> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| "RPC 상태 쓰기 잠금이 손상되었습니다.".to_string())?;
+        state.finality_history.push_back(certificate);
+        while state.finality_history.len() > 10_000 {
+            state.finality_history.pop_front();
+        }
+        Ok(())
+    }
     pub fn drain_outbound_communication(&self) -> Result<Vec<CommunicationEnvelope>, String> {
         self.state
             .write()
@@ -306,6 +329,14 @@ impl RpcServer {
                 communication_rpc_enabled: config.listen_ip.is_loopback(),
                 personal_rpc_enabled: config.listen_ip.is_loopback(),
                 data_dir: config.data_dir.clone(),
+                validators: config.validators.clone(),
+                locked_addresses: config
+                    .locked_addresses
+                    .iter()
+                    .map(|v| normalize_address(v))
+                    .collect(),
+                finality_history: VecDeque::new(),
+                audit_log_path: config.data_dir.join("audit/admin-actions.jsonl"),
             })),
             config,
         }
@@ -367,6 +398,11 @@ fn rpc_response(state: &Arc<RwLock<RpcState>>, request: &Value) -> Value {
         .unwrap_or_default();
 
     let result = dispatch(state, method, &params);
+    if is_audited_method(method)
+        && let Ok(guard) = state.read()
+    {
+        let _ = append_audit_log(&guard.audit_log_path, method, result.is_ok(), &params);
+    }
     match result {
         Ok(value) => json!({"jsonrpc": "2.0", "id": id, "result": value}),
         Err((code, message)) => {
@@ -660,6 +696,107 @@ fn dispatch(
             )
             .map_err(|error| (-32603, error.to_string()))
         }
+        "ieum_supplyStatus" => {
+            let state = read_state(state)?;
+            let balances = state.chain.balances_snapshot();
+            let total_issued = balances
+                .values()
+                .try_fold(0_u128, |sum, value| sum.checked_add(*value))
+                .ok_or_else(|| (-32603, "총발행량 합계가 u128 범위를 넘었습니다.".into()))?;
+            let locked_balance = state
+                .locked_addresses
+                .iter()
+                .try_fold(0_u128, |sum, address| {
+                    sum.checked_add(balances.get(address).copied().unwrap_or(0))
+                })
+                .ok_or_else(|| (-32603, "잠금 잔액 합계가 u128 범위를 넘었습니다.".into()))?;
+            Ok(json!({
+                "totalIssued": total_issued.to_string(),
+                "circulating": total_issued.saturating_sub(locked_balance).to_string(),
+                "locked": locked_balance.to_string(),
+                "unit": "wei",
+                "decimals": 18,
+                "lockedAddressCount": state.locked_addresses.len(),
+                "height": state.chain.tip_height()
+            }))
+        }
+        "ieum_addressBalances" => {
+            let offset = params.first().and_then(Value::as_u64).unwrap_or(0) as usize;
+            let limit = params
+                .get(1)
+                .and_then(Value::as_u64)
+                .unwrap_or(100)
+                .min(1_000) as usize;
+            let state = read_state(state)?;
+            let mut entries: Vec<_> = state
+                .chain
+                .balances_snapshot()
+                .into_iter()
+                .filter(|(_, balance)| *balance > 0)
+                .collect();
+            entries.sort_by(|left, right| left.0.cmp(&right.0));
+            let total = entries.len();
+            let accounts: Vec<_> = entries
+                .into_iter()
+                .skip(offset)
+                .take(limit)
+                .map(|(address, balance)| {
+                    let locked = state.locked_addresses.contains(&address);
+                    json!({"address": address, "balance": balance.to_string(), "locked": locked})
+                })
+                .collect();
+            Ok(
+                json!({"height": state.chain.tip_height(), "offset": offset, "limit": limit, "total": total, "accounts": accounts}),
+            )
+        }
+        "ieum_validatorStatus" => {
+            let state = read_state(state)?;
+            let window = params
+                .first()
+                .and_then(Value::as_u64)
+                .unwrap_or(1_000)
+                .min(10_000) as usize;
+            let history: Vec<_> = state.finality_history.iter().rev().take(window).collect();
+            let blocks = history.len() as u64;
+            let validators: Vec<_> = state.validators.iter().map(|validator| {
+                let signed = history
+                    .iter()
+                    .filter(|certificate| certificate.precommits.iter().any(|vote| vote.validator_id == validator.id))
+                    .count() as u64;
+                json!({"id": validator.id, "votingPower": validator.voting_power, "signedBlocks": signed,
+                    "eligibleBlocks": blocks, "signingRatePercent": if blocks == 0 { 0.0 } else { signed as f64 * 100.0 / blocks as f64 }})
+            }).collect();
+            Ok(
+                json!({"height": state.chain.tip_height(), "windowBlocks": blocks, "validators": validators}),
+            )
+        }
+        "ieum_blockProductionStatus" => {
+            let state = read_state(state)?;
+            let window = params
+                .first()
+                .and_then(Value::as_u64)
+                .unwrap_or(100)
+                .clamp(2, 10_000) as usize;
+            let blocks: Vec<_> = state.chain.blocks.iter().rev().take(window).collect();
+            let mut intervals = Vec::new();
+            for pair in blocks.windows(2) {
+                intervals.push(pair[0].timestamp.saturating_sub(pair[1].timestamp));
+            }
+            let average = if intervals.is_empty() {
+                0.0
+            } else {
+                intervals.iter().sum::<u64>() as f64 / intervals.len() as f64
+            };
+            let delayed = intervals.iter().filter(|seconds| **seconds > 6).count();
+            let estimated_missed: u64 = intervals
+                .iter()
+                .map(|seconds| seconds.saturating_sub(1) / 3)
+                .sum();
+            Ok(
+                json!({"height": state.chain.tip_height(), "sampleBlocks": blocks.len(), "averageBlockTimeSeconds": average,
+                "delayedIntervalCount": delayed, "estimatedMissedSlots": estimated_missed, "targetBlockTimeSeconds": 3}),
+            )
+        }
         "txpool_status" => {
             let state = read_state(state)?;
             Ok(json!({
@@ -795,6 +932,41 @@ fn dispatch(
         }
         _ => Err((-32601, format!("지원하지 않는 JSON-RPC 메서드: {method}"))),
     }
+}
+
+fn is_audited_method(method: &str) -> bool {
+    matches!(
+        method,
+        "personal_newAccount"
+            | "personal_importRawKey"
+            | "ieum_newMnemonic"
+            | "ieum_importMnemonic"
+            | "personal_unlockAccount"
+            | "eth_sendTransaction"
+            | "personal_sendTransaction"
+            | "eth_sendRawTransaction"
+            | "ieum_sendSignedTransaction"
+    )
+}
+
+fn append_audit_log(
+    path: &std::path::Path,
+    method: &str,
+    success: bool,
+    params: &[Value],
+) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let digest = sha2::Sha256::digest(serde_json::to_vec(params).map_err(|e| e.to_string())?);
+    let record = json!({"timestamp": unix_timestamp()?, "method": method, "success": success,
+        "parameterSha256": hex::encode(digest), "pid": std::process::id()});
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|e| e.to_string())?;
+    writeln!(file, "{record}").map_err(|e| e.to_string())
 }
 
 fn send_raw_transaction(

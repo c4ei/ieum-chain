@@ -1,0 +1,18 @@
+route:
+  receiver: operations
+  group_by: [alertname]
+  group_wait: 30s
+  repeat_interval: 4h
+receivers:
+  - name: operations
+    email_configs:
+      - to: "ops@example.com"
+        from: "ieum-alert@example.com"
+        smarthost: "smtp.example.com:587"
+        auth_username: "ieum-alert@example.com"
+        auth_password: "CHANGE_ME"
+        require_tls: true
+    telegram_configs:
+      - bot_token: "CHANGE_ME"
+        chat_id: 0
+        send_resolved: true

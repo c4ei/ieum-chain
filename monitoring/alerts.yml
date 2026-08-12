@@ -1,0 +1,23 @@
+groups:
+  - name: ieum-chain
+    rules:
+      - alert: IeumNodeDown
+        expr: ieum_up == 0 or absent(ieum_up)
+        for: 2m
+        labels: {severity: critical}
+        annotations: {summary: "IEUM 노드 RPC 응답 없음"}
+      - alert: IeumPeerShortage
+        expr: ieum_peer_count < 2
+        for: 5m
+        labels: {severity: warning}
+        annotations: {summary: "IEUM 피어 수 부족"}
+      - alert: IeumValidatorSigningLow
+        expr: ieum_validator_signing_rate_percent < 90
+        for: 10m
+        labels: {severity: critical}
+        annotations: {summary: "IEUM validator 서명률 저하"}
+      - alert: IeumSlowBlocks
+        expr: ieum_block_time_seconds > 6
+        for: 10m
+        labels: {severity: warning}
+        annotations: {summary: "IEUM 평균 블록 생성 지연"}

@@ -660,17 +660,19 @@ async fn main() -> Result<(), String> {
         ]);
     }
     genesis.validate()?;
+    let mut validators = load_validators(&args.validators_config)?;
     let rpc_config = RpcConfig {
         listen_ip: args.rpc_host,
         port: args.rpc_port,
         data_dir: args.rpc_data_dir.clone(),
-        genesis: Some(genesis),
+        genesis: Some(genesis.clone()),
+        validators: validators.clone(),
+        locked_addresses: genesis.locked_addresses.clone(),
         ..RpcConfig::default()
     };
     let rpc_server = RpcServer::new(rpc_config);
     let rpc = rpc_server.node_handle();
     let mut rpc_task = tokio::spawn(rpc_server.run());
-    let mut validators = load_validators(&args.validators_config)?;
     if !is_client && validators.len() < 4 {
         log_info!(
             "[부트스트랩 합의] 현재 검증자 {}명입니다. 4명 이상 등록되기 전에는 \
@@ -776,7 +778,11 @@ async fn main() -> Result<(), String> {
     if evidence_count > 0 {
         log_info!("[BFT 이중투표 증거 복원] {evidence_count}개");
     }
-    let imported = consensus.import_certificate_history(finality_store.load(&validators)?)?;
+    let certificate_history = finality_store.load(&validators)?;
+    for certificate in &certificate_history {
+        rpc.record_finality(certificate.clone())?;
+    }
+    let imported = consensus.import_certificate_history(certificate_history)?;
     if imported > 0 {
         log_info!("[BFT 인증서 복원] {imported}개");
     }
@@ -1486,6 +1492,7 @@ async fn finalize_if_ready(
         let chain_after = consensus.chain.clone();
         rpc.install_finalized(&chain_before, chain_after, &certificate.block)?;
         finality_store.append(&certificate)?;
+        rpc.record_finality(certificate.clone())?;
         commands
             .send(NetworkCommand::PublishBlock(certificate.block.clone()))
             .await
