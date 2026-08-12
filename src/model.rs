@@ -110,10 +110,15 @@ pub struct Block {
 impl Block {
     /// 모든 노드가 동일하게 시작하는 0번 블록입니다.
     pub fn genesis() -> Self {
+        Self::genesis_at(0)
+    }
+
+    /// 제네시스 설정에 기록된 합의 시각으로 0번 블록을 만듭니다.
+    pub fn genesis_at(timestamp: u64) -> Self {
         let mut block = Self {
             height: 0,
             previous_hash: "0".repeat(64),
-            timestamp: 0,
+            timestamp,
             producer: "genesis".into(),
             transactions: vec![],
             system_events: vec![],

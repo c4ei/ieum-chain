@@ -684,6 +684,7 @@ async fn main() -> Result<(), String> {
         genesis: Some(genesis.clone()),
         validators: validators.clone(),
         locked_addresses: genesis.locked_addresses.clone(),
+        block_time_ms: args.block_time_ms,
         ..RpcConfig::default()
     };
     let rpc_server = RpcServer::new(rpc_config);

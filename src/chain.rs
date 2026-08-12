@@ -53,6 +53,7 @@ impl Blockchain {
             .map(|(address, balance)| (normalize_address(address), *balance))
             .collect();
         let mut chain = Self::with_chain_id(genesis.chain_id, balances);
+        chain.blocks = vec![Block::genesis_at(genesis.genesis_time)];
         chain.genesis_commitment = genesis.genesis_hash()?;
         Ok(chain)
     }
@@ -219,7 +220,15 @@ impl Blockchain {
         let mut balances = self.initial_balances.clone();
         let mut nonces = HashMap::new();
         let mut executed_events = HashSet::new();
-        if self.blocks.first() != Some(&Block::genesis()) {
+        let Some(genesis) = self.blocks.first() else {
+            return Err("제네시스 블록이 없습니다.".into());
+        };
+        if genesis.height != 0
+            || genesis.previous_hash != "0".repeat(64)
+            || genesis.producer != "genesis"
+            || !genesis.transactions.is_empty()
+            || !genesis.system_events.is_empty()
+        {
             return Err("제네시스 블록이 다릅니다.".into());
         }
         for (index, block) in self.blocks.iter().enumerate() {

@@ -28,6 +28,7 @@ pub struct RpcConfig {
     pub data_dir: PathBuf,
     pub validators: Vec<Validator>,
     pub locked_addresses: Vec<String>,
+    pub block_time_ms: u64,
 }
 
 impl Default for RpcConfig {
@@ -41,6 +42,7 @@ impl Default for RpcConfig {
             data_dir: PathBuf::from("data/ledger"),
             validators: Vec::new(),
             locked_addresses: Vec::new(),
+            block_time_ms: 5_000,
         }
     }
 }
@@ -71,6 +73,7 @@ struct RpcState {
     locked_addresses: HashSet<String>,
     finality_history: VecDeque<FinalityCertificate>,
     audit_log_path: PathBuf,
+    block_time_ms: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -413,6 +416,7 @@ impl RpcServer {
                     .collect(),
                 finality_history: VecDeque::new(),
                 audit_log_path: config.data_dir.join("audit/admin-actions.jsonl"),
+                block_time_ms: config.block_time_ms,
             })),
             config,
         }
@@ -896,21 +900,27 @@ fn dispatch(
             let blocks: Vec<_> = state.chain.blocks.iter().rev().take(window).collect();
             let mut intervals = Vec::new();
             for pair in blocks.windows(2) {
-                intervals.push(pair[0].timestamp.saturating_sub(pair[1].timestamp));
+                if pair[1].height > 0 {
+                    intervals.push(pair[0].timestamp.saturating_sub(pair[1].timestamp));
+                }
             }
             let average = if intervals.is_empty() {
                 0.0
             } else {
                 intervals.iter().sum::<u64>() as f64 / intervals.len() as f64
             };
-            let delayed = intervals.iter().filter(|seconds| **seconds > 6).count();
+            let target = state.block_time_ms as f64 / 1_000.0;
+            let delayed = intervals
+                .iter()
+                .filter(|seconds| **seconds as f64 > target * 1.2)
+                .count();
             let estimated_missed: u64 = intervals
                 .iter()
-                .map(|seconds| seconds.saturating_sub(1) / 3)
+                .map(|seconds| ((*seconds as f64 / target).floor() as u64).saturating_sub(1))
                 .sum();
             Ok(
                 json!({"height": state.chain.tip_height(), "sampleBlocks": blocks.len(), "averageBlockTimeSeconds": average,
-                "delayedIntervalCount": delayed, "estimatedMissedSlots": estimated_missed, "targetBlockTimeSeconds": 3}),
+                "delayedIntervalCount": delayed, "estimatedMissedSlots": estimated_missed, "targetBlockTimeSeconds": target}),
             )
         }
         "txpool_status" => {
