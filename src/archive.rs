@@ -178,6 +178,49 @@ impl ArchiveStore {
         Ok(blocks)
     }
 
+    /// Explorer/RPC용 전체 블록 이력을 높이 순서로 읽습니다.
+    /// 합의 상태 복구에는 체크포인트를 사용하고, 이 경로는 과거 조회에만 사용합니다.
+    pub fn load_all_blocks(&self) -> Result<Vec<Block>, String> {
+        let mut blocks = self.read_backup_blocks()?;
+        blocks.extend(self.load_active_blocks()?);
+        blocks.sort_by_key(|block| block.height);
+        blocks.dedup_by_key(|block| block.height);
+        Ok(blocks)
+    }
+
+    pub fn block_by_height(&self, height: u64) -> Result<Option<Block>, String> {
+        Ok(self
+            .load_all_blocks()?
+            .into_iter()
+            .find(|block| block.height == height))
+    }
+
+    pub fn block_by_hash(&self, hash: &str) -> Result<Option<Block>, String> {
+        let hash = hash.trim_start_matches("0x");
+        Ok(self
+            .load_all_blocks()?
+            .into_iter()
+            .find(|block| block.hash == hash))
+    }
+
+    pub fn transaction_by_hash(
+        &self,
+        hash: &str,
+    ) -> Result<Option<(Block, usize, crate::model::Transaction)>, String> {
+        let hash = hash.trim_start_matches("0x");
+        for block in self.load_all_blocks()? {
+            if let Some((index, transaction)) = block
+                .transactions
+                .iter()
+                .enumerate()
+                .find(|(_, transaction)| transaction.id() == hash)
+            {
+                return Ok(Some((block.clone(), index, transaction.clone())));
+            }
+        }
+        Ok(None)
+    }
+
     /// 전전년도 이전의 월별 파일을 연도별 `YYYY.jsonl.zst` 하나로 합칩니다.
     /// 최근 연도와 직전 연도는 `YYYYMM M` 월 파일을 유지해 Explorer 조회 범위를 좁힙니다.
     pub fn compact_old_backups(&self, current_year: i32) -> Result<Vec<PathBuf>, String> {

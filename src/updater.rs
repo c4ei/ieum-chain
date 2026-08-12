@@ -69,16 +69,29 @@ impl AutoUpdateConfig {
         Ok(Some(config))
     }
 
-    /// 각 인스턴스는 자기 실행 파일 옆의 설정만 신뢰합니다. 한 서버에 여러
-    /// ieum-node 디렉터리가 있어도 다른 인스턴스의 업데이트 설정을 읽지 않습니다.
+    /// 각 인스턴스는 항상 자기 실행 파일을 교체합니다. 설정은 인스턴스 로컬 파일을
+    /// 우선하고, 없으면 운영자가 지정한 공통 파일 또는 기본 설치본의 공통 파일을
+    /// 읽습니다. 이로써 `/opt/ieum-node1..3`도 동일한 서명 manifest를 사용하면서
+    /// 각각의 `current_exe()`를 안전하게 갱신합니다.
     pub fn discover() -> Result<Option<(PathBuf, Self)>, String> {
         let executable = std::env::current_exe()
             .map_err(|error| format!("현재 실행 바이너리 경로 확인 실패: {error}"))?;
         let directory = executable
             .parent()
             .ok_or("현재 실행 바이너리의 상위 폴더를 확인할 수 없습니다.")?;
-        let path = directory.join("config/update.json");
-        Ok(Self::load_if_enabled(&path)?.map(|config| (path, config)))
+        let mut candidates = vec![directory.join("config/update.json")];
+        if let Some(path) = std::env::var_os("IEUM_UPDATE_CONFIG") {
+            candidates.push(PathBuf::from(path));
+        }
+        #[cfg(target_os = "linux")]
+        candidates.push(PathBuf::from("/opt/ieum-chain/config/update.json"));
+
+        for path in candidates {
+            if let Some(config) = Self::load_if_enabled(&path)? {
+                return Ok(Some((path, config)));
+            }
+        }
+        Ok(None)
     }
 }
 

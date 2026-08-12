@@ -310,10 +310,10 @@ impl RpcServer {
                 vec![(faucet.address(), 1_000_000_000_000_000_000)],
             ),
         };
-        if let Some(state) = state_store
+        let stored_state = state_store
             .load()
-            .expect("embedded 상태 DB를 읽을 수 있어야 합니다.")
-        {
+            .expect("embedded 상태 DB를 읽을 수 있어야 합니다.");
+        if let Some(state) = stored_state {
             assert_eq!(state.chain_id, chain_id, "embedded DB chain ID 불일치");
             chain = Blockchain::from_snapshot_with_events(
                 chain_id,
@@ -358,6 +358,27 @@ impl RpcServer {
                     .apply_block(block)
                     .expect("활성 블록은 체크포인트에 연결되어야 합니다.");
             }
+        } else {
+            let archived = archive
+                .load_all_blocks()
+                .expect("저장된 블록 이력을 읽을 수 있어야 합니다.");
+            if archived.is_empty() {
+                // 제네시스도 실제 0번 블록으로 영구 보존합니다.
+                let genesis_block = chain.blocks[0].clone();
+                archive
+                    .append_finalized(&genesis_block, &chain, &chain)
+                    .expect("제네시스 블록을 저장할 수 있어야 합니다.");
+            } else {
+                // 상태 파일 쓰기 직전 장애가 나도 이미 fsync된 원본 블록으로 복구합니다.
+                for block in archived.into_iter().filter(|block| block.height > 0) {
+                    chain
+                        .apply_block(block)
+                        .expect("아카이브 블록은 제네시스부터 연속되어야 합니다.");
+                }
+            }
+            state_store
+                .commit(&chain)
+                .expect("복구된 체인 상태를 저장할 수 있어야 합니다.");
         }
         let mut wallets = HashMap::new();
         let faucet_address = faucet.address();
@@ -664,8 +685,16 @@ fn dispatch(
             } else {
                 Some(parse_quantity_u64(selector)?)
             };
-            Ok(height
-                .and_then(|height| state.chain.block_by_height(height))
+            let block = match height {
+                Some(height) => state
+                    .archive
+                    .block_by_height(height)
+                    .map_err(|message| (-32603, message))?
+                    .or_else(|| state.chain.block_by_height(height).cloned()),
+                None => None,
+            };
+            Ok(block
+                .as_ref()
                 .map(|block| block_json(block, full))
                 .unwrap_or(Value::Null))
         }
@@ -673,19 +702,34 @@ fn dispatch(
             let hash = string_param(params, 0)?;
             let full = params.get(1).and_then(Value::as_bool).unwrap_or(false);
             let state = read_state(state)?;
-            Ok(state
-                .chain
+            let block = state
+                .archive
                 .block_by_hash(hash)
+                .map_err(|message| (-32603, message))?
+                .or_else(|| state.chain.block_by_hash(hash).cloned());
+            Ok(block
+                .as_ref()
                 .map(|block| block_json(block, full))
                 .unwrap_or(Value::Null))
         }
         "eth_getTransactionByHash" => {
             let hash = string_param(params, 0)?;
             let state = read_state(state)?;
-            Ok(state
-                .chain
+            let transaction = state
+                .archive
                 .transaction_by_hash(hash)
-                .map(|(block, index, transaction)| transaction_json(block, index, transaction))
+                .map_err(|message| (-32603, message))?
+                .or_else(|| {
+                    state
+                        .chain
+                        .transaction_by_hash(hash)
+                        .map(|(block, index, transaction)| {
+                            (block.clone(), index, transaction.clone())
+                        })
+                });
+            Ok(transaction
+                .as_ref()
+                .map(|(block, index, transaction)| transaction_json(block, *index, transaction))
                 .unwrap_or(Value::Null))
         }
         "eth_getBlockTransactionCountByNumber" => {
@@ -696,9 +740,12 @@ fn dispatch(
             } else {
                 parse_quantity_u64(selector)?
             };
-            Ok(state
-                .chain
+            let block = state
+                .archive
                 .block_by_height(height)
+                .map_err(|message| (-32603, message))?
+                .or_else(|| state.chain.block_by_height(height).cloned());
+            Ok(block
                 .map(|block| json!(quantity(block.transactions.len() as u64)))
                 .unwrap_or(Value::Null))
         }
@@ -711,9 +758,13 @@ fn dispatch(
             } else {
                 parse_quantity_u64(selector)?
             };
-            Ok(state
-                .chain
+            let block = state
+                .archive
                 .block_by_height(height)
+                .map_err(|message| (-32603, message))?
+                .or_else(|| state.chain.block_by_height(height).cloned());
+            Ok(block
+                .as_ref()
                 .and_then(|block| {
                     block
                         .transactions
@@ -725,9 +776,19 @@ fn dispatch(
         "eth_getTransactionReceipt" => {
             let hash = string_param(params, 0)?;
             let state = read_state(state)?;
-            Ok(state
-                .chain
+            let transaction = state
+                .archive
                 .transaction_by_hash(hash)
+                .map_err(|message| (-32603, message))?
+                .or_else(|| {
+                    state
+                        .chain
+                        .transaction_by_hash(hash)
+                        .map(|(block, index, transaction)| {
+                            (block.clone(), index, transaction.clone())
+                        })
+                });
+            Ok(transaction
                 .map(|(block, index, transaction)| {
                     json!({
                         "transactionHash": format!("0x{}", transaction.id()),

@@ -312,6 +312,10 @@ struct NodeArgs {
     #[arg(long, default_value_t = 2_097_152)]
     max_message_bytes: usize,
 
+    /// 확정 블록 사이의 최소 목표 간격(ms). 100ms~15000ms, 기본 5초입니다.
+    #[arg(long, default_value_t = 5_000, value_parser = parse_block_time_ms)]
+    block_time_ms: u64,
+
     /// 지갑/geth 호환 JSON-RPC TCP 포트
     #[arg(long, default_value_t = 8989)]
     rpc_port: u16,
@@ -404,6 +408,7 @@ fn default_node_args() -> NodeArgs {
         git_action_test: false,
         port: 7001,
         max_message_bytes: 2_097_152,
+        block_time_ms: 5_000,
         rpc_port: 8989,
         rpc_host: IpAddr::V4(Ipv4Addr::LOCALHOST),
         rpc_data_dir: PathBuf::from("data/ledger"),
@@ -502,6 +507,16 @@ fn parse_sync_quorum_peers(value: &str) -> Result<usize, String> {
     }
 }
 
+fn parse_block_time_ms(value: &str) -> Result<u64, String> {
+    let milliseconds = value
+        .parse::<u64>()
+        .map_err(|_| "블록 생성 간격은 밀리초 정수여야 합니다.".to_string())?;
+    if !(100..=15_000).contains(&milliseconds) {
+        return Err("블록 생성 간격은 100ms 이상 15000ms 이하여야 합니다.".into());
+    }
+    Ok(milliseconds)
+}
+
 #[tokio::main]
 async fn main() -> Result<(), String> {
     use_binary_directory()?;
@@ -549,6 +564,7 @@ async fn main() -> Result<(), String> {
                 args.propose_timeout_ms = 1_500;
                 args.prevote_timeout_ms = 1_500;
                 args.precommit_timeout_ms = 1_500;
+                args.block_time_ms = 100;
             }
             if args.node_key == Path::new("data/node.key") {
                 args.node_key = PathBuf::from("data/keys/p2p_identity.key");
@@ -786,7 +802,10 @@ async fn main() -> Result<(), String> {
     if imported > 0 {
         log_info!("[BFT 인증서 복원] {imported}개");
     }
-    let mut consensus_tick = tokio::time::interval(Duration::from_millis(500));
+    let mut consensus_tick = tokio::time::interval(Duration::from_millis(100));
+    let block_interval = Duration::from_millis(args.block_time_ms);
+    let mut observed_tip_height = consensus.chain.tip_height();
+    let mut next_block_at = std::time::Instant::now() + block_interval;
     // 비제안자 RPC로 들어온 거래는 제안자가 받을 때까지 주기적으로 재전파하되,
     // 매 consensus tick마다 같은 payload를 쏟아내지는 않습니다.
     let mut announced_transactions = std::collections::HashMap::<String, std::time::Instant>::new();
@@ -821,6 +840,7 @@ async fn main() -> Result<(), String> {
     log_info!("P2P 포트: {}/UDP", args.port);
     log_info!("RPC 주소: {}:{}", args.rpc_host, args.rpc_port);
     log_info!("원장 경로: {}", args.rpc_data_dir.display());
+    log_info!("목표 블록 생성 간격: {}ms", args.block_time_ms);
     log_info!("노드 보상 주소: {}", reward_wallet.address());
     if is_client {
         log_info!("운영 서버 자동 연결 대상:");
@@ -872,6 +892,10 @@ async fn main() -> Result<(), String> {
                     .map_err(|error| error.to_string())?;
             }
             _ = consensus_tick.tick() => {
+                if consensus.chain.tip_height() != observed_tip_height {
+                    observed_tip_height = consensus.chain.tip_height();
+                    next_block_at = std::time::Instant::now() + block_interval;
+                }
                 for envelope in rpc.drain_outbound_communication()? {
                     commands
                         .send(NetworkCommand::SendCommunication(envelope))
@@ -964,6 +988,7 @@ async fn main() -> Result<(), String> {
                         });
                     }
                     if consensus.can_make_proposal()
+                        && std::time::Instant::now() >= next_block_at
                         && (rpc.has_pending_transactions()? || !due_events.is_empty())
                     {
                         // 제안자만 거래 큐를 비웁니다. 비제안자 RPC에 들어온 거래를 보존합니다.
@@ -979,6 +1004,7 @@ async fn main() -> Result<(), String> {
                         .with_system_events(due_events);
                         match consensus.make_proposal(block) {
                             Ok(proposal) => {
+                                next_block_at = std::time::Instant::now() + block_interval;
                                 let prevote = match consensus.receive_proposal(proposal.clone()) {
                                     Ok(prevote) => prevote,
                                     Err(error) => {
@@ -1437,7 +1463,16 @@ fn run_node_command(command: NodeCommand) -> Result<(), String> {
 
 #[cfg(test)]
 mod cli_tests {
-    use super::parse_sync_quorum_peers;
+    use super::{parse_block_time_ms, parse_sync_quorum_peers};
+
+    #[test]
+    fn block_time_accepts_100ms_through_15s() {
+        assert_eq!(parse_block_time_ms("100"), Ok(100));
+        assert_eq!(parse_block_time_ms("5000"), Ok(5000));
+        assert_eq!(parse_block_time_ms("15000"), Ok(15000));
+        assert!(parse_block_time_ms("99").is_err());
+        assert!(parse_block_time_ms("15001").is_err());
+    }
 
     #[test]
     fn sync_quorum_peers_accepts_two_or_three() {
