@@ -1,9 +1,9 @@
-# IEUM Chain v0.22.1 쉬운 실행 안내
+# IEUM Chain v0.22.2 쉬운 실행 안내
 
 설치, systemd, 계정, 백업, 자동 업데이트와 익스플로러 연동은
 [`docs/IEUM_USER_MANUAL_FIRST_RELEASE.md`](docs/IEUM_USER_MANUAL_FIRST_RELEASE.md)에,
 이번 운영 관측 변경과 배포·태그 절차는
-[`docs/VERSION_0.22.1.md`](docs/VERSION_0.22.1.md)에 정리되어 있습니다.
+[`docs/VERSION_0.22.2.md`](docs/VERSION_0.22.2.md)에 정리되어 있습니다.
 
 ## Ubuntu 신규 노드 배포본 자동 생성
 

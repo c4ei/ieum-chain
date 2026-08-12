@@ -1017,7 +1017,13 @@ async fn main() -> Result<(), String> {
             event = events.recv() => {
                 match event {
                     Some(NetworkEvent::PeerConnected { peer_id: connected, remote_address, remote_ip, direction, connection_id, unique_peers, peer_connections }) => {
-                        rpc.set_peer_count(unique_peers)?;
+                        rpc.peer_connected(
+                            &connected.to_string(),
+                            &remote_address.to_string(),
+                            remote_ip.as_deref(),
+                            direction,
+                            peer_connections,
+                        )?;
                         log_info!("{}", NetworkEvent::PeerConnected { peer_id: connected, remote_address, remote_ip, direction, connection_id, unique_peers, peer_connections });
                         commands.send(NetworkCommand::RequestSync {
                             from_height: consensus.chain.tip_height() + 1,
@@ -1265,7 +1271,7 @@ async fn main() -> Result<(), String> {
                         }
                     }
                     Some(NetworkEvent::PeerDisconnected { peer_id, remote_address, remote_ip, direction, connection_id, connected_for, unique_peers, peer_connections, cause }) => {
-                        rpc.set_peer_count(unique_peers)?;
+                        rpc.peer_disconnected(&peer_id.to_string(), peer_connections)?;
                         log_info!("{}", NetworkEvent::PeerDisconnected {
                             peer_id,
                             remote_address,

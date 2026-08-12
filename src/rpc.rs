@@ -57,6 +57,7 @@ struct RpcState {
     keystore: Keystore,
     state_store: StateStore,
     peer_count: usize,
+    peers: HashMap<String, RpcPeerInfo>,
     sync_current: u64,
     sync_highest: u64,
     sync_active: bool,
@@ -70,6 +71,15 @@ struct RpcState {
     locked_addresses: HashSet<String>,
     finality_history: VecDeque<FinalityCertificate>,
     audit_log_path: PathBuf,
+}
+
+#[derive(Clone, Debug)]
+struct RpcPeerInfo {
+    address: String,
+    remote_ip: Option<String>,
+    direction: String,
+    connections: usize,
+    connected_at: u64,
 }
 
 /// 기존 geth 스크립트에서 자주 쓰는 계정·잔액·송금 API를 제공하는 호환 계층입니다.
@@ -204,6 +214,50 @@ impl RpcNodeHandle {
             .map_err(|_| "RPC 상태 쓰기 잠금이 손상되었습니다.".into())
     }
 
+    pub fn peer_connected(
+        &self,
+        peer_id: &str,
+        address: &str,
+        remote_ip: Option<&str>,
+        direction: &str,
+        connections: usize,
+    ) -> Result<(), String> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| "RPC 상태 쓰기 잠금이 손상되었습니다.".to_string())?;
+        state.peers.insert(
+            peer_id.to_string(),
+            RpcPeerInfo {
+                address: address.to_string(),
+                remote_ip: remote_ip.map(str::to_owned),
+                direction: direction.to_string(),
+                connections,
+                connected_at: unix_timestamp().unwrap_or_default(),
+            },
+        );
+        state.peer_count = state.peers.len();
+        Ok(())
+    }
+
+    pub fn peer_disconnected(
+        &self,
+        peer_id: &str,
+        remaining_connections: usize,
+    ) -> Result<(), String> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| "RPC 상태 쓰기 잠금이 손상되었습니다.".to_string())?;
+        if remaining_connections == 0 {
+            state.peers.remove(peer_id);
+        } else if let Some(peer) = state.peers.get_mut(peer_id) {
+            peer.connections = remaining_connections;
+        }
+        state.peer_count = state.peers.len();
+        Ok(())
+    }
+
     pub fn begin_sync(&self, highest: u64) -> Result<(), String> {
         self.state
             .write()
@@ -320,6 +374,7 @@ impl RpcServer {
                 keystore,
                 state_store,
                 peer_count: 0,
+                peers: HashMap::new(),
                 sync_current: initial_height,
                 sync_highest: initial_height,
                 sync_active: false,
@@ -820,6 +875,31 @@ fn dispatch(
                 "syncCurrent": state.sync_current,
                 "syncHighest": state.sync_highest,
                 "uptimeSeconds": state.started_at.elapsed().as_secs()
+            }))
+        }
+        "ieum_peerInfo" => {
+            let state = read_state(state)?;
+            let mut peers = state
+                .peers
+                .iter()
+                .map(|(peer_id, peer)| {
+                    json!({
+                        "peerId": peer_id,
+                        "address": peer.address,
+                        "remoteIp": peer.remote_ip,
+                        "direction": peer.direction,
+                        "connections": peer.connections,
+                        "connectedAt": peer.connected_at,
+                        "connectedSeconds": unix_timestamp().unwrap_or_default().saturating_sub(peer.connected_at)
+                    })
+                })
+                .collect::<Vec<_>>();
+            peers.sort_by(|left, right| left["peerId"].as_str().cmp(&right["peerId"].as_str()));
+            Ok(json!({
+                "version": 1,
+                "count": peers.len(),
+                "height": state.chain.tip_height(),
+                "peers": peers
             }))
         }
         "ieum_syncStatus" => {
@@ -1356,5 +1436,31 @@ mod tests {
         assert_eq!(sync["readyForTransactions"], true);
         let recovery = dispatch(&shared, "ieum_recoveryStatus", &[]).unwrap();
         assert_eq!(recovery["active"], false);
+    }
+
+    #[test]
+    fn peer_info_reports_and_removes_live_connections() {
+        let server = RpcServer::new(test_rpc_config("peer-info"));
+        let handle = RpcNodeHandle {
+            state: server.state.clone(),
+        };
+        handle
+            .peer_connected(
+                "peer-a",
+                "/ip4/10.0.0.2/udp/7001/quic-v1",
+                Some("10.0.0.2"),
+                "발신",
+                1,
+            )
+            .unwrap();
+        let info = dispatch(&server.state, "ieum_peerInfo", &[]).unwrap();
+        assert_eq!(info["count"], 1);
+        assert_eq!(info["peers"][0]["peerId"], "peer-a");
+        assert_eq!(info["peers"][0]["direction"], "발신");
+        handle.peer_disconnected("peer-a", 0).unwrap();
+        assert_eq!(
+            dispatch(&server.state, "ieum_peerInfo", &[]).unwrap()["count"],
+            0
+        );
     }
 }
