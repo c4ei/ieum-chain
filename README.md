@@ -1,4 +1,7 @@
-# IEUM Chain v0.22.5 쉬운 실행 안내
+# IEUM Chain v0.22.6 쉬운 실행 안내
+
+v0.22.6은 연결 유지 중 놓친 확정 블록을 5초 주기로 다시 동기화합니다. 자세한 내용은
+[`docs/VERSION_0.22.6_PERIODIC_SYNC_BALANCE_FIX.md`](docs/VERSION_0.22.6_PERIODIC_SYNC_BALANCE_FIX.md)를 참고하세요.
 
 설치, systemd, 계정, 백업, 자동 업데이트와 익스플로러 연동은
 [`docs/IEUM_USER_MANUAL_FIRST_RELEASE.md`](docs/IEUM_USER_MANUAL_FIRST_RELEASE.md)에,
@@ -13,7 +16,7 @@ v0.22.5의 검증자 2/3 인증 스냅샷, 최근 6개 보관, 악성 snapshot �
 릴리스 빌드 후 설치 가능한 노드 압축을 한 번에 만듭니다.
 
 ```bash
-scripts/make-node-package.sh 0.20.9
+scripts/make-node-package.sh 0.22.6
 ```
 
 위 명령은 포맷·Clippy·전체 테스트·릴리스 빌드까지 통과한 경우에만 압축을

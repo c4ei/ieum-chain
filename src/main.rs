@@ -815,6 +815,9 @@ async fn main() -> Result<(), String> {
         log_info!("[BFT 인증서 복원] {imported}개");
     }
     let mut consensus_tick = tokio::time::interval(Duration::from_millis(100));
+    // 연결이 유지된 채 새 확정 블록 공지를 놓쳐도 뒤처진 상태로 멈추지 않도록
+    // 주기적으로 독립 피어들의 tip을 다시 교차검증합니다.
+    let mut sync_tick = tokio::time::interval(Duration::from_secs(5));
     let mut snapshot_tick = tokio::time::interval(Duration::from_secs(30));
     let block_interval = Duration::from_millis(args.block_time_ms);
     let mut observed_tip_height = consensus.chain.tip_height();
@@ -866,6 +869,11 @@ async fn main() -> Result<(), String> {
 
     loop {
         tokio::select! {
+            _ = sync_tick.tick() => {
+                commands.send(NetworkCommand::RequestSync {
+                    from_height: consensus.chain.tip_height() + 1,
+                }).await.map_err(|error| error.to_string())?;
+            }
             _ = update_tick.tick(), if auto_update.is_some() => {
                 let (_, config) = auto_update.as_ref().expect("guarded by is_some");
                 log_info!("[자동 업데이트 확인] 서명된 최신 manifest를 확인합니다.");
