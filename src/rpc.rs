@@ -1,8 +1,9 @@
+use crate::archive::StateSnapshot;
 use crate::consensus::{FinalityCertificate, Validator};
 use crate::model::{Block, Transaction};
 use crate::{
     ArchiveStore, Blockchain, CommunicationEnvelope, CommunicationInbox, GenesisConfig, Keystore,
-    Mempool, StateStore, account::AccountWallet,
+    Mempool, SnapshotCertificate, StateStore, account::AccountWallet,
 };
 use axum::{Json, Router, routing::post};
 use serde_json::{Value, json};
@@ -101,6 +102,29 @@ pub struct RpcNodeHandle {
 }
 
 impl RpcNodeHandle {
+    pub fn pending_snapshot_certification(&self) -> Result<Option<StateSnapshot>, String> {
+        self.state
+            .read()
+            .map_err(|_| "RPC 상태 읽기 잠금이 손상되었습니다.".to_string())?
+            .archive
+            .pending_certification()
+    }
+
+    pub fn certify_snapshot(&self, certificate: SnapshotCertificate) -> Result<(), String> {
+        let state = self
+            .state
+            .write()
+            .map_err(|_| "RPC 상태 쓰기 잠금이 손상되었습니다.".to_string())?;
+        let snapshot = state
+            .archive
+            .load_latest_snapshot()?
+            .ok_or("인증할 로컬 snapshot이 없습니다.")?;
+        certificate.verify_snapshot(&snapshot, &state.validators)?;
+        state
+            .archive
+            .persist_certified_snapshot(snapshot, certificate)?;
+        Ok(())
+    }
     pub fn record_finality(&self, certificate: FinalityCertificate) -> Result<(), String> {
         let mut state = self
             .state

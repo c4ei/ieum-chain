@@ -1,4 +1,7 @@
 use crate::archive::StateSnapshot;
+use crate::consensus::Validator;
+use crate::signer::ValidatorSigner;
+use crate::wallet::verify_signature;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -7,6 +10,129 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 pub const DEFAULT_CHUNK_BYTES: usize = 512 * 1024;
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SnapshotAttestation {
+    pub validator_id: String,
+    pub height: u64,
+    pub block_hash: String,
+    pub state_root: String,
+    pub signature: String,
+}
+
+impl SnapshotAttestation {
+    pub fn sign(snapshot: &StateSnapshot, signer: &ValidatorSigner) -> Result<Self, String> {
+        let validator_id = signer.address();
+        let payload =
+            snapshot_attestation_bytes(snapshot.height, &snapshot.block_hash, &snapshot.state_hash);
+        Ok(Self {
+            validator_id,
+            height: snapshot.height,
+            block_hash: snapshot.block_hash.clone(),
+            state_root: snapshot.state_hash.clone(),
+            signature: signer.sign_bytes(&payload)?,
+        })
+    }
+
+    pub fn verify(&self) -> Result<(), String> {
+        verify_signature(
+            &self.validator_id,
+            &snapshot_attestation_bytes(self.height, &self.block_hash, &self.state_root),
+            &self.signature,
+        )
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SnapshotCertificate {
+    pub height: u64,
+    pub block_hash: String,
+    pub state_root: String,
+    pub attestations: Vec<SnapshotAttestation>,
+}
+
+impl SnapshotCertificate {
+    pub fn from_attestations(attestations: Vec<SnapshotAttestation>) -> Result<Self, String> {
+        let first = attestations
+            .first()
+            .ok_or("snapshot 인증 투표가 없습니다.")?;
+        if attestations.iter().any(|vote| {
+            vote.height != first.height
+                || vote.block_hash != first.block_hash
+                || vote.state_root != first.state_root
+        }) {
+            return Err("서로 다른 snapshot 투표를 하나의 인증서로 묶을 수 없습니다.".into());
+        }
+        Ok(Self {
+            height: first.height,
+            block_hash: first.block_hash.clone(),
+            state_root: first.state_root.clone(),
+            attestations,
+        })
+    }
+
+    pub fn verify(&self, validators: &[Validator]) -> Result<(), String> {
+        let total_power: u128 = validators
+            .iter()
+            .map(|value| value.voting_power as u128)
+            .sum();
+        if total_power == 0 {
+            return Err("snapshot 검증자 총 투표권이 0입니다.".into());
+        }
+        let powers = validators
+            .iter()
+            .map(|value| (value.id.as_str(), value.voting_power as u128))
+            .collect::<HashMap<_, _>>();
+        let mut voters = HashSet::new();
+        let mut signed_power = 0u128;
+        for vote in &self.attestations {
+            if vote.height != self.height
+                || vote.block_hash != self.block_hash
+                || vote.state_root != self.state_root
+            {
+                return Err("snapshot 인증서에 다른 상태 투표가 섞였습니다.".into());
+            }
+            vote.verify()?;
+            let power = powers
+                .get(vote.validator_id.as_str())
+                .ok_or("등록되지 않은 검증자의 snapshot 투표입니다.")?;
+            if voters.insert(vote.validator_id.as_str()) {
+                signed_power = signed_power
+                    .checked_add(*power)
+                    .ok_or("snapshot 투표권 합계가 범위를 넘었습니다.")?;
+            }
+        }
+        if signed_power * 3 <= total_power * 2 {
+            return Err("snapshot 인증에 필요한 2/3 초과 서명이 없습니다.".into());
+        }
+        Ok(())
+    }
+
+    pub fn verify_snapshot(
+        &self,
+        snapshot: &StateSnapshot,
+        validators: &[Validator],
+    ) -> Result<(), String> {
+        self.verify(validators)?;
+        if self.height != snapshot.height
+            || self.block_hash != snapshot.block_hash
+            || self.state_root != snapshot.state_hash
+        {
+            return Err("snapshot 내용이 2/3 인증서와 일치하지 않습니다.".into());
+        }
+        Ok(())
+    }
+}
+
+fn snapshot_attestation_bytes(height: u64, block_hash: &str, state_root: &str) -> Vec<u8> {
+    let mut bytes = b"IEUM-SNAPSHOT-V1".to_vec();
+    bytes.extend_from_slice(&height.to_be_bytes());
+    bytes.extend_from_slice(&(block_hash.len() as u32).to_be_bytes());
+    bytes.extend_from_slice(block_hash.as_bytes());
+    bytes.extend_from_slice(&(state_root.len() as u32).to_be_bytes());
+    bytes.extend_from_slice(state_root.as_bytes());
+    bytes
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SyncTip {
@@ -283,5 +409,28 @@ mod tests {
         let mut quorum = TipQuorum::new(2).unwrap();
         assert!(quorum.observe("peer-a", tip.clone()).is_none());
         assert_eq!(quorum.observe("peer-b", tip.clone()), Some(tip));
+    }
+
+    #[test]
+    fn certified_snapshot_requires_more_than_two_thirds_voting_power() {
+        use crate::signer::ValidatorSigner;
+        use crate::wallet::Wallet;
+
+        let wallets = (1u8..=4)
+            .map(|seed| Wallet::from_seed([seed; 32]))
+            .collect::<Vec<_>>();
+        let validators = wallets
+            .iter()
+            .map(|wallet| Validator::new(wallet.address(), 1))
+            .collect::<Vec<_>>();
+        let snapshot = sample();
+        let mut votes = Vec::new();
+        for wallet in wallets.into_iter().take(3) {
+            votes.push(
+                SnapshotAttestation::sign(&snapshot, &ValidatorSigner::from(wallet)).unwrap(),
+            );
+        }
+        let certificate = SnapshotCertificate::from_attestations(votes).unwrap();
+        certificate.verify_snapshot(&snapshot, &validators).unwrap();
     }
 }

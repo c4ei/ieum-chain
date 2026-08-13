@@ -1,3 +1,4 @@
+use crate::archive::StateSnapshot;
 use crate::chain::Blockchain;
 use crate::consensus::{
     BftConsensus, ConsensusMessage, ConsensusPhase, DoubleVoteEvidence, FinalityCertificate,
@@ -6,6 +7,7 @@ use crate::consensus::{
 use crate::model::Block;
 use crate::scheduled_event::{EventSchedule, MAX_CLOCK_DRIFT_SECONDS};
 use crate::signer::ValidatorSigner;
+use crate::snapshot_sync::SnapshotAttestation;
 use crate::wallet::Wallet;
 use std::time::{Duration, Instant};
 
@@ -53,6 +55,20 @@ pub struct ConsensusRuntime {
 }
 
 impl ConsensusRuntime {
+    pub fn sign_snapshot_attestation(
+        &self,
+        snapshot: &StateSnapshot,
+    ) -> Result<SnapshotAttestation, String> {
+        let canonical = self
+            .chain
+            .block_by_height(snapshot.height)
+            .ok_or("snapshot 높이의 확정 블록을 찾을 수 없습니다.")?;
+        if snapshot.block_hash != canonical.hash {
+            return Err("canonical 확정 블록과 다른 snapshot에는 서명할 수 없습니다.".into());
+        }
+        SnapshotAttestation::sign(snapshot, &self.validator)
+    }
+
     pub fn new(
         chain: Blockchain,
         validators: Vec<Validator>,

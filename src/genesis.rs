@@ -23,6 +23,31 @@ pub struct GenesisConfig {
 }
 
 impl GenesisConfig {
+    pub fn validate_production_safety(&self) -> Result<(), String> {
+        const KNOWN_DEVELOPMENT_ADDRESSES: [&str; 4] = [
+            "0xB0E5863D0DDf7e105e409Fee0eCC0123a362e14B",
+            "0x3252b7b65e50B54508974dB8d634134B0bd6be90",
+            "0xf0DCB0Ea878057Ff5C78C4737023f900ECe09e7B",
+            "0xD5ac7674AC15E3Df0B7D737CF8Cb8f2Ea713F329",
+        ];
+        self.validate()?;
+        if self.network_name.to_ascii_lowercase().contains("test") {
+            return Err("mainnet strict 모드에서 test network_name을 사용할 수 없습니다.".into());
+        }
+        if self.initial_balances.iter().any(|(address, balance)| {
+            *balance > 0
+                && KNOWN_DEVELOPMENT_ADDRESSES
+                    .iter()
+                    .any(|known| address.eq_ignore_ascii_case(known))
+        }) {
+            return Err(
+                "공개된 개발 개인키 주소에 genesis 잔액이 있어 mainnet strict 시작을 거부합니다."
+                    .into(),
+            );
+        }
+        Ok(())
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         if self.chain_id == 0 {
             return Err("chain_id는 0일 수 없습니다.".into());

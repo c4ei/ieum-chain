@@ -2,7 +2,7 @@ use crate::communication::{CommunicationAck, CommunicationEnvelope};
 use crate::consensus::{ConsensusMessage, DoubleVoteEvidence, FinalityCertificate, SignedProposal};
 use crate::model::{Block, Transaction};
 use crate::peer_guard::{PeerDecision, PeerGuard};
-use crate::snapshot_sync::SyncTip;
+use crate::snapshot_sync::{SnapshotAttestation, SyncTip};
 use futures::StreamExt;
 use libp2p::core::ConnectedPoint;
 use libp2p::{
@@ -189,6 +189,7 @@ pub enum WireMessage {
         tip: SyncTip,
         certificates: Vec<FinalityCertificate>,
     },
+    SnapshotAttestation(SnapshotAttestation),
 }
 
 /// 노드 코어가 비동기 P2P 작업에 보내는 명령입니다.
@@ -211,6 +212,11 @@ pub enum NetworkCommand {
         requester: String,
         tip: SyncTip,
         certificates: Vec<FinalityCertificate>,
+    },
+    PublishSnapshotAttestation(SnapshotAttestation),
+    PenalizePeer {
+        peer_id: PeerId,
+        points: i32,
     },
     Dial(Multiaddr),
     SendCommunication(CommunicationEnvelope),
@@ -287,6 +293,10 @@ pub enum NetworkEvent {
         source: PeerId,
         tip: SyncTip,
         certificates: Vec<FinalityCertificate>,
+    },
+    SnapshotAttestationReceived {
+        source: PeerId,
+        attestation: SnapshotAttestation,
     },
     CommunicationReceived {
         source: PeerId,
@@ -412,6 +422,14 @@ impl fmt::Display for NetworkEvent {
                 formatter,
                 "[P2P 동기화 응답] PeerId: {source}, 확정 블록: {}개",
                 certificates.len()
+            ),
+            Self::SnapshotAttestationReceived {
+                source,
+                attestation,
+            } => write!(
+                formatter,
+                "[snapshot 인증 투표] PeerId: {source}, 높이: {}, 검증자: {}",
+                attestation.height, attestation.validator_id
             ),
             Self::CommunicationReceived { source, envelope } => write!(
                 formatter,
@@ -706,6 +724,20 @@ impl P2pNode {
                                         certificates,
                                     },
                                 );
+                            }
+                            Some(NetworkCommand::PublishSnapshotAttestation(attestation)) => {
+                                publish(
+                                    &mut swarm,
+                                    CONSENSUS_TOPIC,
+                                    &WireMessage::SnapshotAttestation(attestation),
+                                );
+                            }
+                            Some(NetworkCommand::PenalizePeer { peer_id, points }) => {
+                                if guard.penalize(&peer_id.to_string(), points)
+                                    == PeerDecision::TemporarilyBlocked
+                                {
+                                    let _ = swarm.disconnect_peer_id(peer_id);
+                                }
                             }
                             Some(NetworkCommand::Dial(address)) => {
                                 if let Err(error) = dial_address(&mut swarm, address).await {
@@ -1153,6 +1185,12 @@ async fn handle_swarm_event(
                         source: propagation_source,
                         tip,
                         certificates,
+                    }
+                }
+                WireMessage::SnapshotAttestation(attestation) => {
+                    NetworkEvent::SnapshotAttestationReceived {
+                        source: propagation_source,
+                        attestation,
                     }
                 }
             };

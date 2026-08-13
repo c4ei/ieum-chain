@@ -3,14 +3,14 @@ use ieum_chain::{
     AccountWallet, ConsensusRuntime, ConsensusTimeouts, EventSchedule, EvidenceStore,
     ExternalSigner, FinalityStore, GenesisConfig, Keystore, NetworkCommand, NetworkConfig,
     NetworkEvent, NodeRewardRegistration, NodeWalletKeystore, P2pNode, RpcConfig, RpcServer,
-    ScheduledEvent, ScheduledEventAction, SyncTip, TipQuorum, Transaction, UpgradeSchedule,
-    Validator, ValidatorRegistration, ValidatorSigner, Wallet, log_error, log_info,
-    logger::init_server_log, node_key::load_or_create_node_key,
+    ScheduledEvent, ScheduledEventAction, SnapshotAttestation, SnapshotCertificate, SyncTip,
+    TipQuorum, Transaction, UpgradeSchedule, Validator, ValidatorRegistration, ValidatorSigner,
+    Wallet, log_error, log_info, logger::init_server_log, node_key::load_or_create_node_key,
 };
 use libp2p::{Multiaddr, multiaddr::Protocol};
 use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::net::{IpAddr, Ipv4Addr, TcpListener, TcpStream, UdpSocket};
@@ -360,6 +360,10 @@ struct NodeArgs {
     #[arg(long, default_value_t = false)]
     allow_insecure_test_keys: bool,
 
+    /// 공개 개발키와 테스트 네트워크 이름이 없는 production genesis만 허용합니다.
+    #[arg(long, default_value_t = false)]
+    mainnet_strict: bool,
+
     /// 개인키를 노드 밖에 두는 signer 실행 파일(HSM/Vault adapter)
     #[arg(long, requires = "validator_public_key")]
     validator_signer_command: Option<PathBuf>,
@@ -420,6 +424,7 @@ fn default_node_args() -> NodeArgs {
         update_manifest_url: None,
         release_public_key: None,
         allow_insecure_test_keys: false,
+        mainnet_strict: false,
         validator_signer_command: None,
         validator_public_key: None,
         propose_timeout_ms: 3_000,
@@ -676,6 +681,12 @@ async fn main() -> Result<(), String> {
         ]);
     }
     genesis.validate()?;
+    if args.mainnet_strict {
+        genesis.validate_production_safety()?;
+        if args.allow_insecure_test_keys || args.git_action_test {
+            return Err("--mainnet-strict는 테스트 키 옵션과 함께 사용할 수 없습니다.".into());
+        }
+    }
     let mut validators = load_validators(&args.validators_config)?;
     let rpc_config = RpcConfig {
         listen_ip: args.rpc_host,
@@ -804,6 +815,7 @@ async fn main() -> Result<(), String> {
         log_info!("[BFT 인증서 복원] {imported}개");
     }
     let mut consensus_tick = tokio::time::interval(Duration::from_millis(100));
+    let mut snapshot_tick = tokio::time::interval(Duration::from_secs(30));
     let block_interval = Duration::from_millis(args.block_time_ms);
     let mut observed_tip_height = consensus.chain.tip_height();
     let mut next_block_at = std::time::Instant::now() + block_interval;
@@ -835,6 +847,7 @@ async fn main() -> Result<(), String> {
         .unwrap_or(24 * 60 * 60);
     let mut update_tick = tokio::time::interval(Duration::from_secs(update_interval));
     let mut sync_quorum = TipQuorum::new(args.sync_quorum_peers)?;
+    let mut snapshot_votes = HashMap::<(u64, String, String), Vec<SnapshotAttestation>>::new();
 
     log_info!("IEUM {mode} 노드 시작: {peer_id}");
     log_info!("영구 노드 키: {}", args.node_key.display());
@@ -891,6 +904,24 @@ async fn main() -> Result<(), String> {
                     ))
                     .await
                     .map_err(|error| error.to_string())?;
+            }
+            _ = snapshot_tick.tick() => {
+                if local_is_validator
+                    && let Some(snapshot) = rpc.pending_snapshot_certification()?
+                {
+                    let attestation = consensus.sign_snapshot_attestation(&snapshot)?;
+                    let votes = snapshot_votes
+                        .entry((attestation.height, attestation.block_hash.clone(), attestation.state_root.clone()))
+                        .or_default();
+                    if !votes.iter().any(|known| known.validator_id == attestation.validator_id) {
+                        votes.push(attestation.clone());
+                    }
+                    commands
+                        .send(NetworkCommand::PublishSnapshotAttestation(attestation))
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    log_info!("[snapshot 인증] 높이 {} 로컬 검증자 서명 전파", snapshot.height);
+                }
             }
             _ = consensus_tick.tick() => {
                 if consensus.chain.tip_height() != observed_tip_height {
@@ -1295,6 +1326,34 @@ async fn main() -> Result<(), String> {
                             commands.send(NetworkCommand::RequestSync {
                                 from_height: consensus.chain.tip_height() + 1,
                             }).await.map_err(|e| e.to_string())?;
+                        }
+                    }
+                    Some(NetworkEvent::SnapshotAttestationReceived { source, attestation }) => {
+                        if let Err(error) = attestation.verify() {
+                            log_error!("[snapshot 투표 거부] PeerId: {source} · {error}");
+                            commands.send(NetworkCommand::PenalizePeer { peer_id: source, points: 100 })
+                                .await.map_err(|error| error.to_string())?;
+                            continue;
+                        }
+                        let key = (attestation.height, attestation.block_hash.clone(), attestation.state_root.clone());
+                        let votes = snapshot_votes.entry(key).or_default();
+                        if !votes.iter().any(|known| known.validator_id == attestation.validator_id) {
+                            votes.push(attestation);
+                        }
+                        let certificate = SnapshotCertificate::from_attestations(votes.clone())?;
+                        match certificate.verify(&validators) {
+                            Ok(()) => {
+                                let height = certificate.height;
+                                rpc.certify_snapshot(certificate)?;
+                                snapshot_votes.retain(|(candidate, _, _), _| *candidate > height);
+                                log_info!("[snapshot 인증 완료] 높이 {height} · 검증자 2/3 초과 서명 저장");
+                            }
+                            Err(error) if error.contains("2/3 초과") => {}
+                            Err(error) => {
+                                log_error!("[snapshot 인증서 거부] PeerId: {source} · {error}");
+                                commands.send(NetworkCommand::PenalizePeer { peer_id: source, points: 100 })
+                                    .await.map_err(|error| error.to_string())?;
+                            }
                         }
                     }
                     Some(NetworkEvent::PeerDisconnected { peer_id, remote_address, remote_ip, direction, connection_id, connected_for, unique_peers, peer_connections, cause }) => {

@@ -1,5 +1,6 @@
 use crate::Blockchain;
 use crate::model::Block;
+use crate::snapshot_sync::SnapshotCertificate;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
@@ -7,6 +8,7 @@ use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 
 pub const MAX_ACTIVE_BLOCK_BYTES: u64 = 100_000_000;
+pub const RETAIN_CERTIFIED_SNAPSHOTS: usize = 6;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StateSnapshot {
@@ -40,7 +42,16 @@ pub struct ArchiveStatus {
     pub max_active_bytes: u64,
     pub active_period: String,
     pub latest_checkpoint: Option<PathBuf>,
+    pub latest_checkpoint_height: Option<u64>,
+    pub certified_snapshot_count: usize,
+    pub latest_certified_snapshot_height: Option<u64>,
     pub backups: Vec<PathBuf>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CertifiedSnapshot {
+    pub snapshot: StateSnapshot,
+    pub certificate: SnapshotCertificate,
 }
 
 /// 활성 블록의 총합을 제한하고 월별 체크포인트/백업을 만드는 저장소입니다.
@@ -66,6 +77,7 @@ impl ArchiveStore {
         fs::create_dir_all(store.active_dir()).map_err(|error| error.to_string())?;
         fs::create_dir_all(store.backup_dir()).map_err(|error| error.to_string())?;
         fs::create_dir_all(store.checkpoint_dir()).map_err(|error| error.to_string())?;
+        fs::create_dir_all(store.certified_dir()).map_err(|error| error.to_string())?;
         Ok(store)
     }
 
@@ -126,13 +138,55 @@ impl ArchiveStore {
         checkpoints.sort();
         let mut backups = list_files(&self.backup_dir())?;
         backups.sort();
+        let mut certified = list_files(&self.certified_dir())?;
+        certified.sort();
+        let latest_checkpoint_height = checkpoints.last().and_then(|path| checkpoint_height(path));
+        let latest_certified_snapshot_height =
+            certified.last().and_then(|path| checkpoint_height(path));
         Ok(ArchiveStatus {
             active_bytes: directory_bytes(&self.active_dir())?,
             max_active_bytes: self.max_active_bytes,
             active_period: self.read_active_period()?.unwrap_or_default(),
             latest_checkpoint: checkpoints.pop(),
+            latest_checkpoint_height,
+            certified_snapshot_count: certified.len(),
+            latest_certified_snapshot_height,
             backups,
         })
+    }
+
+    pub fn pending_certification(&self) -> Result<Option<StateSnapshot>, String> {
+        let Some(snapshot) = self.load_latest_snapshot()? else {
+            return Ok(None);
+        };
+        let certified_height = self.status()?.latest_certified_snapshot_height;
+        Ok((certified_height != Some(snapshot.height)).then_some(snapshot))
+    }
+
+    pub fn persist_certified_snapshot(
+        &self,
+        snapshot: StateSnapshot,
+        certificate: SnapshotCertificate,
+    ) -> Result<PathBuf, String> {
+        let path = self.certified_dir().join(format!(
+            "h{:012}-{}.json",
+            snapshot.height,
+            &snapshot.state_hash[..snapshot.state_hash.len().min(12)]
+        ));
+        atomic_json(
+            &path,
+            &CertifiedSnapshot {
+                snapshot,
+                certificate,
+            },
+        )?;
+        let mut certified = list_files(&self.certified_dir())?;
+        certified.sort();
+        let remove_count = certified.len().saturating_sub(RETAIN_CERTIFIED_SNAPSHOTS);
+        for old in certified.into_iter().take(remove_count) {
+            fs::remove_file(old).map_err(|error| error.to_string())?;
+        }
+        Ok(path)
     }
 
     pub fn load_latest_snapshot(&self) -> Result<Option<StateSnapshot>, String> {
@@ -278,6 +332,10 @@ impl ArchiveStore {
         self.root.join("checkpoints")
     }
 
+    fn certified_dir(&self) -> PathBuf {
+        self.root.join("certified-snapshots")
+    }
+
     fn read_active_period(&self) -> Result<Option<String>, String> {
         let path = self.active_dir().join("period");
         match fs::read_to_string(path) {
@@ -286,6 +344,16 @@ impl ArchiveStore {
             Err(error) => Err(error.to_string()),
         }
     }
+}
+
+fn checkpoint_height(path: &Path) -> Option<u64> {
+    let name = path.file_name()?.to_str()?;
+    let marker = name.find('h')? + 1;
+    let digits = name[marker..]
+        .chars()
+        .take_while(|value| value.is_ascii_digit())
+        .collect::<String>();
+    digits.parse().ok()
 }
 
 fn atomic_json(path: &Path, value: &impl Serialize) -> Result<(), String> {

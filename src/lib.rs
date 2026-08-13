@@ -88,7 +88,10 @@ pub use scheduled_event::{
 };
 pub use signer::{ExternalSigner, ValidatorSigner};
 pub use snapshot_scheduler::{ChunkAssignment, SnapshotScheduler};
-pub use snapshot_sync::{SnapshotChunk, SnapshotDownload, SnapshotManifest, SyncTip, TipQuorum};
+pub use snapshot_sync::{
+    SnapshotAttestation, SnapshotCertificate, SnapshotChunk, SnapshotDownload, SnapshotManifest,
+    SyncTip, TipQuorum,
+};
 pub use state_store::{CanonicalState, StateStore};
 pub use traffic_rewards::{
     ContributionLedger, EligibleNode, LotteryPayment, PeerCandidate, RelayReceipt, RewardPolicy,
