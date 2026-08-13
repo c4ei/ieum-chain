@@ -1182,7 +1182,9 @@ async fn handle_swarm_event(
                         return Ok(());
                     }
                     NetworkEvent::SyncReceived {
-                        source: propagation_source,
+                        // quorum은 메시지를 전달한 릴레이가 아니라 서명된 gossipsub
+                        // 원 작성자 기준으로 독립 피어를 집계해야 합니다.
+                        source: message_source,
                         tip,
                         certificates,
                     }

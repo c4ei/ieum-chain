@@ -1,7 +1,10 @@
-# IEUM Chain v0.22.6 쉬운 실행 안내
+# IEUM Chain v0.22.7 쉬운 실행 안내
 
 v0.22.6은 연결 유지 중 놓친 확정 블록을 5초 주기로 다시 동기화합니다. 자세한 내용은
 [`docs/VERSION_0.22.6_PERIODIC_SYNC_BALANCE_FIX.md`](docs/VERSION_0.22.6_PERIODIC_SYNC_BALANCE_FIX.md)를 참고하세요.
+
+v0.22.7은 릴레이를 거친 sync 응답도 실제 작성자별 독립 quorum으로 집계합니다.
+[`docs/VERSION_0.22.7_SYNC_QUORUM_ORIGIN_FIX.md`](docs/VERSION_0.22.7_SYNC_QUORUM_ORIGIN_FIX.md)를 참고하세요.
 
 설치, systemd, 계정, 백업, 자동 업데이트와 익스플로러 연동은
 [`docs/IEUM_USER_MANUAL_FIRST_RELEASE.md`](docs/IEUM_USER_MANUAL_FIRST_RELEASE.md)에,
