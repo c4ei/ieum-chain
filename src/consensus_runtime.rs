@@ -52,6 +52,7 @@ pub struct ConsensusRuntime {
     finalized: Vec<FinalityCertificate>,
     pending_finalized: Vec<FinalityCertificate>,
     event_schedule: EventSchedule,
+    validator_interest_policy: crate::validator_interest::ValidatorInterestPolicy,
 }
 
 impl ConsensusRuntime {
@@ -116,12 +117,23 @@ impl ConsensusRuntime {
             finalized: Vec::new(),
             pending_finalized: Vec::new(),
             event_schedule: EventSchedule::default(),
+            validator_interest_policy: crate::validator_interest::ValidatorInterestPolicy::default(
+            ),
         })
     }
 
     pub fn set_event_schedule(&mut self, schedule: EventSchedule) -> Result<(), String> {
         schedule.validate()?;
         self.event_schedule = schedule;
+        Ok(())
+    }
+
+    pub fn set_validator_interest_policy(
+        &mut self,
+        policy: crate::validator_interest::ValidatorInterestPolicy,
+    ) -> Result<(), String> {
+        policy.validate()?;
+        self.validator_interest_policy = policy;
         Ok(())
     }
 
@@ -550,6 +562,7 @@ impl ConsensusRuntime {
                     &event.action,
                     crate::scheduled_event::ScheduledEventAction::BootstrapValidatorReward { .. }
                         | crate::scheduled_event::ScheduledEventAction::NodeMilestoneReward { .. }
+                        | crate::scheduled_event::ScheduledEventAction::ValidatorDailyInterest { .. }
                 )
             })
             .cloned()
@@ -584,11 +597,33 @@ impl ConsensusRuntime {
                 }
                 crate::scheduled_event::ScheduledEventAction::NodeMilestoneReward { .. }
                     if event.id == "ieum-node-100-reward-v1" => {}
+                crate::scheduled_event::ScheduledEventAction::ValidatorDailyInterest {
+                    snapshot_height,
+                    policy_hash,
+                    annual_rate_bps,
+                    payments,
+                } if event.id == crate::validator_interest::event_id(block.timestamp) => {
+                    if *snapshot_height != self.chain.tip_height()
+                        || policy_hash != &self.validator_interest_policy.hash()
+                        || *annual_rate_bps != self.validator_interest_policy.annual_rate_bps
+                        || payments
+                            != &crate::validator_interest::calculate_payments(
+                                &self.validator_interest_policy,
+                                &self.validators,
+                                &self.chain.balances_snapshot(),
+                            )
+                    {
+                        return Err("검증자 일일 이자가 로컬 정책과 snapshot 계산 결과에 일치하지 않습니다.".into());
+                    }
+                }
                 crate::scheduled_event::ScheduledEventAction::BootstrapValidatorReward {
                     ..
                 }
                 | crate::scheduled_event::ScheduledEventAction::NodeMilestoneReward { .. } => {
                     return Err("내장 최초 보상 이벤트 ID가 올바르지 않습니다.".into());
+                }
+                crate::scheduled_event::ScheduledEventAction::ValidatorDailyInterest { .. } => {
+                    return Err("검증자 일일 이자 이벤트 ID가 올바르지 않습니다.".into());
                 }
                 _ => continue,
             }

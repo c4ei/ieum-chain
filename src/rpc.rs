@@ -30,6 +30,7 @@ pub struct RpcConfig {
     pub validators: Vec<Validator>,
     pub locked_addresses: Vec<String>,
     pub block_time_ms: u64,
+    pub validator_interest_policy: crate::validator_interest::ValidatorInterestPolicy,
 }
 
 impl Default for RpcConfig {
@@ -44,6 +45,8 @@ impl Default for RpcConfig {
             validators: Vec::new(),
             locked_addresses: Vec::new(),
             block_time_ms: 5_000,
+            validator_interest_policy: crate::validator_interest::ValidatorInterestPolicy::default(
+            ),
         }
     }
 }
@@ -75,6 +78,7 @@ struct RpcState {
     finality_history: VecDeque<FinalityCertificate>,
     audit_log_path: PathBuf,
     block_time_ms: u64,
+    validator_interest_policy: crate::validator_interest::ValidatorInterestPolicy,
 }
 
 #[derive(Clone, Debug)]
@@ -441,6 +445,7 @@ impl RpcServer {
                 finality_history: VecDeque::new(),
                 audit_log_path: config.data_dir.join("audit/admin-actions.jsonl"),
                 block_time_ms: config.block_time_ms,
+                validator_interest_policy: config.validator_interest_policy.clone(),
             })),
             config,
         }
@@ -843,25 +848,80 @@ fn dispatch(
         "ieum_supplyStatus" => {
             let state = read_state(state)?;
             let balances = state.chain.balances_snapshot();
-            let total_issued = balances
+            let bal_all = balances
                 .values()
                 .try_fold(0_u128, |sum, value| sum.checked_add(*value))
                 .ok_or_else(|| (-32603, "총발행량 합계가 u128 범위를 넘었습니다.".into()))?;
-            let locked_balance = state
+            let bal_lock_all = state
                 .locked_addresses
                 .iter()
                 .try_fold(0_u128, |sum, address| {
                     sum.checked_add(balances.get(address).copied().unwrap_or(0))
                 })
                 .ok_or_else(|| (-32603, "잠금 잔액 합계가 u128 범위를 넘었습니다.".into()))?;
+            let bal_genesis_all = state
+                .chain
+                .initial_balances
+                .values()
+                .try_fold(0_u128, |sum, value| sum.checked_add(*value))
+                .ok_or_else(|| (-32603, "최초 발행량 합계가 u128 범위를 넘었습니다.".into()))?;
+            let bal_ija_paid_all = state.chain.blocks.iter().try_fold(
+                0_u128,
+                |total, block| {
+                    block.system_events.iter().try_fold(total, |subtotal, event| {
+                        if let crate::scheduled_event::ScheduledEventAction::ValidatorDailyInterest {
+                            payments,
+                            ..
+                        } = &event.action
+                        {
+                            payments.iter().try_fold(subtotal, |sum, payment| {
+                                sum.checked_add(payment.amount)
+                            })
+                        } else {
+                            Some(subtotal)
+                        }
+                    })
+                },
+            ).ok_or_else(|| (-32603, "검증자 이자 누계가 u128 범위를 넘었습니다.".into()))?;
+            let bal_foundation = balances
+                .get(crate::FOUNDATION_FEE_ADDRESS)
+                .copied()
+                .unwrap_or(0);
             Ok(json!({
-                "totalIssued": total_issued.to_string(),
-                "circulating": total_issued.saturating_sub(locked_balance).to_string(),
-                "locked": locked_balance.to_string(),
+                "Bal_All": bal_all.to_string(),
+                "Bal_Utong_All": bal_all.saturating_sub(bal_lock_all).to_string(),
+                "Bal_Lock_All": bal_lock_all.to_string(),
+                "Bal_Genesis_All": bal_genesis_all.to_string(),
+                "Bal_Ija_Paid_All": bal_ija_paid_all.to_string(),
+                "Bal_Ija_Minted_All": "0",
+                "Bal_NodeReward_Minted_All": "0",
+                "Bal_Foundation": bal_foundation.to_string(),
                 "unit": "wei",
                 "decimals": 18,
                 "lockedAddressCount": state.locked_addresses.len(),
                 "height": state.chain.tip_height()
+            }))
+        }
+        "ieum_validatorInterestStatus" => {
+            let state = read_state(state)?;
+            let policy = &state.validator_interest_policy;
+            let balances = state.chain.balances_snapshot();
+            let payments =
+                crate::validator_interest::calculate_payments(policy, &state.validators, &balances);
+            let total: u128 = payments.iter().map(|p| p.amount).sum();
+            Ok(json!({
+                "height": state.chain.tip_height(),
+                "snapshotTimestamp": SystemTime::now().duration_since(UNIX_EPOCH).map(|v| v.as_secs()).unwrap_or(0),
+                "enabled": policy.enabled,
+                "annualRateBps": policy.annual_rate_bps,
+                "annualRatePercent": f64::from(policy.annual_rate_bps) / 100.0,
+                "minimumBalance": policy.minimum_balance.to_string(),
+                "maximumDailyTotal": policy.maximum_daily_total.to_string(),
+                "policyHash": policy.hash(),
+                "nextEventId": crate::validator_interest::event_id(SystemTime::now().duration_since(UNIX_EPOCH).map(|v| v.as_secs()).unwrap_or(0)),
+                "eligibleValidators": payments.len(),
+                "estimatedDailyTotal": total.to_string(),
+                "payments": payments.iter().map(|p| json!({"address": p.address, "amount": p.amount.to_string()})).collect::<Vec<_>>()
             }))
         }
         "ieum_addressBalances" => {

@@ -41,6 +41,13 @@ pub enum ScheduledEventAction {
         #[serde(with = "crate::model::decimal_u128")]
         amount: u128,
     },
+    /// KST 날짜별 검증자 보유 잔액 snapshot을 기준으로 계산한 일일 이자입니다.
+    ValidatorDailyInterest {
+        snapshot_height: u64,
+        policy_hash: String,
+        annual_rate_bps: u32,
+        payments: Vec<EventPayment>,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -166,6 +173,26 @@ impl ScheduledEvent {
                         ),
                         &registration.signature_hex,
                     )?;
+                }
+                return Ok(());
+            }
+            ScheduledEventAction::ValidatorDailyInterest {
+                snapshot_height: _,
+                policy_hash,
+                annual_rate_bps,
+                payments,
+            } => {
+                if policy_hash.len() != 64 || !policy_hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    return Err("검증자 이자 정책 hash가 올바르지 않습니다.".into());
+                }
+                if *annual_rate_bps > 5_000 || payments.is_empty() {
+                    return Err("검증자 이자율 또는 지급 대상이 올바르지 않습니다.".into());
+                }
+                for payment in payments {
+                    validate_reward_address(&payment.address)?;
+                    if payment.amount == 0 {
+                        return Err("검증자 이자 지급액은 0보다 커야 합니다.".into());
+                    }
                 }
                 return Ok(());
             }

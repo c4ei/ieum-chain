@@ -1,0 +1,6 @@
+{
+  "enabled": true,
+  "annual_rate_bps": 500,
+  "minimum_balance": "1000000000000000000",
+  "maximum_daily_total": "1000000000000000000000"
+}

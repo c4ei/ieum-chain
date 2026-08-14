@@ -104,6 +104,31 @@ enum Command {
         #[command(subcommand)]
         command: RecoveryCommand,
     },
+    /// PoS 검증자 일일 이자 정책을 조회하거나 변경합니다.
+    ValidatorInterest {
+        #[command(subcommand)]
+        command: ValidatorInterestCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ValidatorInterestCommand {
+    Show {
+        #[arg(long, default_value = "config/validator-interest.json")]
+        config: PathBuf,
+    },
+    Set {
+        #[arg(long, default_value = "config/validator-interest.json")]
+        config: PathBuf,
+        #[arg(long)]
+        annual_rate_bps: u32,
+        #[arg(long, default_value = "1")]
+        minimum_balance_ieum: u128,
+        #[arg(long, default_value = "1000")]
+        maximum_daily_total_ieum: u128,
+        #[arg(long, default_value_t = true)]
+        enabled: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -348,6 +373,10 @@ struct NodeArgs {
     #[arg(long, default_value = "config/events.json")]
     events_config: PathBuf,
 
+    /// 검증자 전원이 동일하게 사용하는 일일 이자 정책
+    #[arg(long, default_value = "config/validator-interest.json")]
+    validator_interest_config: PathBuf,
+
     /// 서명된 업데이트 manifest URL. 지정한 경우 시작할 때 새 버전을 확인합니다.
     #[arg(long, requires = "release_public_key")]
     update_manifest_url: Option<String>,
@@ -421,6 +450,7 @@ fn default_node_args() -> NodeArgs {
         validator_key: PathBuf::from("data/keys/consensus_signing.key"),
         validators_config: PathBuf::from("config/validators.json"),
         events_config: PathBuf::from("config/events.json"),
+        validator_interest_config: PathBuf::from("config/validator-interest.json"),
         update_manifest_url: None,
         release_public_key: None,
         allow_insecure_test_keys: false,
@@ -540,6 +570,9 @@ async fn main() -> Result<(), String> {
         Some(Command::Node { command }) => return run_node_command(command),
         Some(Command::Network { command }) => return run_network_command(command),
         Some(Command::Recovery { command }) => return run_recovery_command(command),
+        Some(Command::ValidatorInterest { command }) => {
+            return run_validator_interest_command(command);
+        }
         Some(Command::Update {
             manifest_url,
             release_public_key,
@@ -688,6 +721,8 @@ async fn main() -> Result<(), String> {
         }
     }
     let mut validators = load_validators(&args.validators_config)?;
+    let validator_interest_policy =
+        ieum_chain::ValidatorInterestPolicy::load(&args.validator_interest_config)?;
     let rpc_config = RpcConfig {
         listen_ip: args.rpc_host,
         port: args.rpc_port,
@@ -696,6 +731,7 @@ async fn main() -> Result<(), String> {
         validators: validators.clone(),
         locked_addresses: genesis.locked_addresses.clone(),
         block_time_ms: args.block_time_ms,
+        validator_interest_policy: validator_interest_policy.clone(),
         ..RpcConfig::default()
     };
     let rpc_server = RpcServer::new(rpc_config);
@@ -800,6 +836,14 @@ async fn main() -> Result<(), String> {
     )?;
     let event_schedule = EventSchedule::load(&args.events_config)?;
     consensus.set_event_schedule(event_schedule.clone())?;
+    consensus.set_validator_interest_policy(validator_interest_policy.clone())?;
+    log_info!(
+        "[검증자 일일 이자] enabled={} APR={:.2}% 최소={} wei 정책={}",
+        validator_interest_policy.enabled,
+        f64::from(validator_interest_policy.annual_rate_bps) / 100.0,
+        validator_interest_policy.minimum_balance,
+        validator_interest_policy.hash()
+    );
     let finality_store = FinalityStore::new(&args.rpc_data_dir)?;
     let evidence_store = EvidenceStore::new(&args.rpc_data_dir);
     let evidence_count = evidence_store.load()?.len();
@@ -1026,6 +1070,29 @@ async fn main() -> Result<(), String> {
                                 amount: 10u128.pow(18),
                             },
                         });
+                    }
+                    let validator_interest_id = ieum_chain::validator_interest::event_id(timestamp);
+                    if validator_interest_policy.enabled
+                        && !consensus.chain.executed_events().contains(&validator_interest_id)
+                        && consensus.chain.executed_events().contains("ieum-bootstrap-validator-reward-v1")
+                    {
+                        let payments = ieum_chain::calculate_validator_interest_payments(
+                            &validator_interest_policy,
+                            &validators,
+                            &consensus.chain.balances_snapshot(),
+                        );
+                        if !payments.is_empty() {
+                            due_events.push(ScheduledEvent {
+                                id: validator_interest_id,
+                                execute_at: ieum_chain::validator_interest::execute_at(timestamp),
+                                action: ScheduledEventAction::ValidatorDailyInterest {
+                                    snapshot_height: consensus.chain.tip_height(),
+                                    policy_hash: validator_interest_policy.hash(),
+                                    annual_rate_bps: validator_interest_policy.annual_rate_bps,
+                                    payments,
+                                },
+                            });
+                        }
                     }
                     if consensus.can_make_proposal()
                         && std::time::Instant::now() >= next_block_at
@@ -1727,6 +1794,47 @@ fn run_reward_command(command: RewardCommand) -> Result<(), String> {
                 ));
             }
             println!("노드 지갑 주소를 유지한 채 암호를 변경했습니다.");
+            Ok(())
+        }
+    }
+}
+
+fn run_validator_interest_command(command: ValidatorInterestCommand) -> Result<(), String> {
+    match command {
+        ValidatorInterestCommand::Show { config } => {
+            let policy = ieum_chain::ValidatorInterestPolicy::load(config)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&policy).map_err(|e| e.to_string())?
+            );
+            println!("policyHash={}", policy.hash());
+            Ok(())
+        }
+        ValidatorInterestCommand::Set {
+            config,
+            annual_rate_bps,
+            minimum_balance_ieum,
+            maximum_daily_total_ieum,
+            enabled,
+        } => {
+            let ieum = 10u128.pow(18);
+            let policy = ieum_chain::ValidatorInterestPolicy {
+                enabled,
+                annual_rate_bps,
+                minimum_balance: minimum_balance_ieum
+                    .checked_mul(ieum)
+                    .ok_or("최소 보유액이 너무 큽니다.")?,
+                maximum_daily_total: maximum_daily_total_ieum
+                    .checked_mul(ieum)
+                    .ok_or("일일 상한이 너무 큽니다.")?,
+            };
+            policy.save(&config)?;
+            println!(
+                "검증자 이자 정책 저장: {} (hash={})",
+                config.display(),
+                policy.hash()
+            );
+            println!("모든 PoS 검증자에 같은 파일을 배포한 뒤 함께 재시작하십시오.");
             Ok(())
         }
     }

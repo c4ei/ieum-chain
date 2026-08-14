@@ -329,6 +329,11 @@ fn apply_system_events(
                     transfer_from_foundation(balances, &registration.reward_address, *amount)?;
                 }
             }
+            ScheduledEventAction::ValidatorDailyInterest { payments, .. } => {
+                for payment in payments {
+                    transfer_from_foundation(balances, &payment.address, payment.amount)?;
+                }
+            }
         }
     }
     Ok(())

@@ -36,6 +36,7 @@ pub mod storage;
 pub mod traffic_rewards;
 pub mod updater;
 pub mod upgrade;
+pub mod validator_interest;
 pub mod validator_key;
 pub mod validator_policy;
 pub mod wallet;
@@ -98,6 +99,9 @@ pub use traffic_rewards::{
     TrafficPolicy, draw_lottery, select_balanced_peers,
 };
 pub use upgrade::{ProtocolUpgrade, UpgradeSchedule};
+pub use validator_interest::{
+    ValidatorInterestPolicy, calculate_payments as calculate_validator_interest_payments,
+};
 pub use wallet::Wallet;
 
 #[cfg(test)]
