@@ -1,4 +1,4 @@
-use crate::model::Transaction;
+use crate::model::{Transaction, TransactionAction};
 use k256::ecdsa::{RecoveryId, Signature, VerifyingKey};
 use sha3::{Digest, Keccak256};
 
@@ -19,9 +19,7 @@ pub fn decode_legacy(raw_hex: &str, expected_chain_id: u64) -> Result<Transactio
         return Err("현재는 20바이트 수신 주소 송금만 지원합니다.".into());
     }
     let amount = value_u128(fields[4], "value")?;
-    if !fields[5].is_empty() {
-        return Err("EVM calldata는 아직 지원하지 않습니다.".into());
-    }
+    let action = decode_action(to, fields[5])?;
     let v = value_u64(fields[6], "v")?;
     if v < 35 {
         return Err("EIP-155 체인 ID가 없는 거래는 재생 공격 방지를 위해 거부합니다.".into());
@@ -44,7 +42,7 @@ pub fn decode_legacy(raw_hex: &str, expected_chain_id: u64) -> Result<Transactio
         encode_u64(gas_limit),
         encode_bytes(to),
         encode_u128(amount),
-        encode_bytes(&[]),
+        encode_bytes(fields[5]),
         encode_u64(chain_id),
         encode_bytes(&[]),
         encode_bytes(&[]),
@@ -64,8 +62,35 @@ pub fn decode_legacy(raw_hex: &str, expected_chain_id: u64) -> Result<Transactio
         amount,
         fee,
         nonce,
+        action,
         signature: format!("ethraw:{}", hex::encode(raw)),
     })
+}
+
+fn decode_action(to: &[u8], data: &[u8]) -> Result<TransactionAction, String> {
+    if data.is_empty() {
+        return Ok(TransactionAction::Transfer);
+    }
+    if format!("0x{}", hex::encode(to)) != crate::staking::STAKING_SYSTEM_ADDRESS {
+        return Err("EVM calldata는 스테이킹 시스템 주소에서만 지원합니다.".into());
+    }
+    let text = std::str::from_utf8(data).map_err(|_| "스테이킹 calldata는 UTF-8이어야 합니다.")?;
+    if text == "claim" {
+        return Ok(TransactionAction::ClaimUnbonded);
+    }
+    if let Some(v) = text.strip_prefix("delegate:") {
+        crate::staking::validate_validator(v)?;
+        return Ok(TransactionAction::Delegate {
+            validator: v.into(),
+        });
+    }
+    if let Some(v) = text.strip_prefix("undelegate:") {
+        crate::staking::validate_validator(v)?;
+        return Ok(TransactionAction::Undelegate {
+            validator: v.into(),
+        });
+    }
+    Err("지원하지 않는 스테이킹 calldata입니다.".into())
 }
 
 pub fn transaction_hash(raw_hex: &str) -> Result<String, String> {
@@ -227,6 +252,56 @@ fn encode_length(length: usize, short_base: u8, long_base: u8) -> Vec<u8> {
 mod tests {
     use super::*;
     use k256::ecdsa::SigningKey;
+
+    fn signed_raw(to: [u8; 20], amount: u128, data: &[u8], chain_id: u64) -> String {
+        let fields = [
+            encode_u64(0),
+            encode_u64(1),
+            encode_u64(50_000),
+            encode_bytes(&to),
+            encode_u128(amount),
+            encode_bytes(data),
+            encode_u64(chain_id),
+            encode_bytes(&[]),
+            encode_bytes(&[]),
+        ];
+        let signing = encode_list(&fields);
+        let key = SigningKey::from_bytes((&[1u8; 32]).into()).unwrap();
+        let (signature, recovery_id) = key
+            .sign_digest_recoverable(Keccak256::new_with_prefix(&signing))
+            .unwrap();
+        let bytes = signature.to_bytes();
+        hex::encode(encode_list(&[
+            encode_u64(0),
+            encode_u64(1),
+            encode_u64(50_000),
+            encode_bytes(&to),
+            encode_u128(amount),
+            encode_bytes(data),
+            encode_u64(35 + chain_id * 2 + u64::from(recovery_id.to_byte())),
+            encode_bytes(&bytes[..32]),
+            encode_bytes(&bytes[32..]),
+        ]))
+    }
+
+    #[test]
+    fn staking_calldata_decodes_only_at_system_address() {
+        let to: [u8; 20] =
+            hex::decode(crate::staking::STAKING_SYSTEM_ADDRESS.trim_start_matches("0x"))
+                .unwrap()
+                .try_into()
+                .unwrap();
+        let validator = "11".repeat(32);
+        let raw = signed_raw(
+            to,
+            crate::staking::MINIMUM_DELEGATION,
+            format!("delegate:{validator}").as_bytes(),
+            21_004,
+        );
+        let tx = decode_legacy(&raw, 21_004).unwrap();
+        assert_eq!(tx.action, TransactionAction::Delegate { validator });
+        verify_embedded(&tx, 21_004).unwrap();
+    }
 
     #[test]
     fn eip155_legacy_transfer_recovers_sender_and_fields() {

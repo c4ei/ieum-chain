@@ -1,4 +1,9 @@
-# IEUM Chain v0.22.7 쉬운 실행 안내
+# IEUM Chain v0.23.0 쉬운 실행 안내
+
+v0.23.0은 실제 잠금형 `delegate / undelegate / claim`, 합의 시각 기준 7일 해제 대기,
+위임자별 일일 보상, 이중투표 증거 기반 5% 페널티와 상태·스냅샷 회계를 추가합니다.
+운영 활성화 전 반드시 [`docs/VERSION_0.23.0.md`](docs/VERSION_0.23.0.md)의
+프로토콜 v3 공동 전환 절차를 따르세요.
 
 v0.22.6은 연결 유지 중 놓친 확정 블록을 5초 주기로 다시 동기화합니다. 자세한 내용은
 [`docs/VERSION_0.22.6_PERIODIC_SYNC_BALANCE_FIX.md`](docs/VERSION_0.22.6_PERIODIC_SYNC_BALANCE_FIX.md)를 참고하세요.

@@ -1,4 +1,5 @@
-use crate::model::{Address, Block, Transaction};
+use crate::model::{Address, Block, Transaction, TransactionAction};
+use crate::staking::StakingState;
 use crate::wallet::verify_transaction;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -24,6 +25,8 @@ pub struct Blockchain {
     next_nonces: HashMap<Address, u64>,
     #[serde(default)]
     executed_events: HashSet<String>,
+    #[serde(default)]
+    staking: StakingState,
 }
 
 impl Blockchain {
@@ -42,6 +45,7 @@ impl Blockchain {
             initial_balances,
             next_nonces: HashMap::new(),
             executed_events: HashSet::new(),
+            staking: StakingState::default(),
         }
     }
 
@@ -106,7 +110,32 @@ impl Blockchain {
             balances,
             next_nonces,
             executed_events,
+            staking: StakingState::default(),
         })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_snapshot_with_staking(
+        chain_id: u64,
+        genesis_commitment: String,
+        height: u64,
+        block_hash: String,
+        balances: HashMap<Address, u128>,
+        next_nonces: HashMap<Address, u64>,
+        executed_events: HashSet<String>,
+        staking: StakingState,
+    ) -> Result<Self, String> {
+        let mut chain = Self::from_snapshot_with_events(
+            chain_id,
+            genesis_commitment,
+            height,
+            block_hash,
+            balances,
+            next_nonces,
+            executed_events,
+        )?;
+        chain.staking = staking;
+        Ok(chain)
     }
 
     pub fn balance_of(&self, address: &str) -> u128 {
@@ -134,6 +163,12 @@ impl Blockchain {
 
     pub fn executed_events(&self) -> &HashSet<String> {
         &self.executed_events
+    }
+    pub fn staking(&self) -> &StakingState {
+        &self.staking
+    }
+    pub fn staking_snapshot(&self) -> StakingState {
+        self.staking.clone()
     }
 
     pub fn block_by_height(&self, height: u64) -> Option<&Block> {
@@ -194,12 +229,15 @@ impl Blockchain {
         }
         let mut balances = self.balances.clone();
         let mut nonces = self.next_nonces.clone();
+        let mut staking = self.staking.clone();
         apply_transactions(
             self.chain_id,
             &block.transactions,
             &block.producer,
             &mut balances,
             &mut nonces,
+            &mut staking,
+            block.timestamp,
         )?;
         let mut executed_events = self.executed_events.clone();
         apply_system_events(
@@ -207,11 +245,13 @@ impl Blockchain {
             block.timestamp,
             &mut balances,
             &mut executed_events,
+            &mut staking,
         )?;
         self.blocks.push(block);
         self.balances = balances;
         self.next_nonces = nonces;
         self.executed_events = executed_events;
+        self.staking = staking;
         Ok(self.blocks.last().unwrap())
     }
 
@@ -220,6 +260,7 @@ impl Blockchain {
         let mut balances = self.initial_balances.clone();
         let mut nonces = HashMap::new();
         let mut executed_events = HashSet::new();
+        let mut staking = StakingState::default();
         let Some(genesis) = self.blocks.first() else {
             return Err("제네시스 블록이 없습니다.".into());
         };
@@ -246,18 +287,22 @@ impl Blockchain {
                     &block.producer,
                     &mut balances,
                     &mut nonces,
+                    &mut staking,
+                    block.timestamp,
                 )?;
                 apply_system_events(
                     &block.system_events,
                     block.timestamp,
                     &mut balances,
                     &mut executed_events,
+                    &mut staking,
                 )?;
             }
         }
         self.balances = balances;
         self.next_nonces = nonces;
         self.executed_events = executed_events;
+        self.staking = staking;
         Ok(())
     }
 
@@ -277,6 +322,13 @@ impl Blockchain {
             hasher.update(b"event:");
             hasher.update(event_id.as_bytes());
         }
+        if !self.staking.delegations.is_empty()
+            || !self.staking.unbonding.is_empty()
+            || !self.staking.applied_slashes.is_empty()
+        {
+            hasher.update(b"staking-v1:");
+            hasher.update(self.staking.state_bytes());
+        }
         hex::encode(hasher.finalize())
     }
 }
@@ -286,6 +338,7 @@ fn apply_system_events(
     block_timestamp: u64,
     balances: &mut HashMap<Address, u128>,
     executed: &mut HashSet<String>,
+    staking: &mut StakingState,
 ) -> Result<(), String> {
     use crate::scheduled_event::ScheduledEventAction;
     for event in events {
@@ -339,6 +392,24 @@ fn apply_system_events(
                     transfer_from_foundation(balances, &payment.address, payment.amount)?;
                 }
             }
+            ScheduledEventAction::DoubleVoteSlash {
+                evidence,
+                penalty_bps,
+            } => {
+                let slashed =
+                    staking.slash(&event.id, &evidence.first.validator_id, *penalty_bps)?;
+                credit_balance(
+                    balances,
+                    FOUNDATION_FEE_ADDRESS,
+                    slashed,
+                    "재단 페널티 잔액이 u128 범위를 넘습니다.",
+                )?;
+            }
+            ScheduledEventAction::DelegationDailyReward { payments, .. } => {
+                for payment in payments {
+                    transfer_from_foundation(balances, &payment.address, payment.amount)?;
+                }
+            }
         }
     }
     Ok(())
@@ -368,6 +439,8 @@ fn apply_transactions(
     producer: &str,
     balances: &mut HashMap<Address, u128>,
     nonces: &mut HashMap<Address, u64>,
+    staking: &mut StakingState,
+    block_timestamp: u64,
 ) -> Result<(), String> {
     // 블록 하나를 원자적으로 처리하기 위해 복제된 상태에 먼저 적용합니다.
     // 하나라도 실패하면 호출자가 원래 balances/nonces를 그대로 유지합니다.
@@ -377,7 +450,23 @@ fn apply_transactions(
         } else {
             verify_transaction(tx)?;
         }
-        if tx.amount == 0 {
+        if !tx.action.is_transfer()
+            && normalize_address(&tx.to) != crate::staking::STAKING_SYSTEM_ADDRESS
+        {
+            return Err("위임 거래의 수신 주소는 스테이킹 시스템 주소여야 합니다.".into());
+        }
+        if tx.action.is_transfer()
+            && normalize_address(&tx.to) == crate::staking::STAKING_SYSTEM_ADDRESS
+        {
+            return Err(
+                "스테이킹 시스템 주소로 일반 송금할 수 없습니다. 위임 calldata가 필요합니다."
+                    .into(),
+            );
+        }
+        if matches!(&tx.action, TransactionAction::ClaimUnbonded) && tx.amount != 0 {
+            return Err("해제 청구 거래의 amount는 0이어야 합니다.".into());
+        }
+        if tx.amount == 0 && !matches!(&tx.action, TransactionAction::ClaimUnbonded) {
             return Err("송금액은 0보다 커야 합니다.".into());
         }
         let expected_nonce = nonces.get(&tx.from).copied().unwrap_or(0);
@@ -387,8 +476,15 @@ fn apply_transactions(
                 tx.nonce
             ));
         }
-        let total = tx
-            .amount
+        let debit_amount = if matches!(
+            &tx.action,
+            TransactionAction::Transfer | TransactionAction::Delegate { .. }
+        ) {
+            tx.amount
+        } else {
+            0
+        };
+        let total = debit_amount
             .checked_add(tx.fee)
             .ok_or("송금액과 수수료 합계가 너무 큽니다.")?;
         let sender = balances.get(&tx.from).copied().unwrap_or(0);
@@ -396,13 +492,29 @@ fn apply_transactions(
             return Err("수수료를 포함한 잔액이 부족합니다.".into());
         }
         balances.insert(tx.from.clone(), sender - total);
-        let receiver = balances.get(&tx.to).copied().unwrap_or(0);
-        balances.insert(
-            tx.to.clone(),
-            receiver
-                .checked_add(tx.amount)
-                .ok_or("받는 계정 잔액이 u128 범위를 넘습니다.")?,
-        );
+        match &tx.action {
+            TransactionAction::Transfer => credit_balance(
+                balances,
+                &tx.to,
+                tx.amount,
+                "받는 계정 잔액이 u128 범위를 넘습니다.",
+            )?,
+            TransactionAction::Delegate { validator } => {
+                staking.delegate(&tx.from, validator, tx.amount)?
+            }
+            TransactionAction::Undelegate { validator } => {
+                staking.undelegate(&tx.from, validator, tx.amount, block_timestamp)?;
+            }
+            TransactionAction::ClaimUnbonded => {
+                let claimed = staking.claim(&tx.from, block_timestamp)?;
+                credit_balance(
+                    balances,
+                    &tx.from,
+                    claimed,
+                    "해제 청구 잔액이 u128 범위를 넘습니다.",
+                )?;
+            }
+        }
         // 재단 몫을 먼저 내림 계산하고 나머지 전부를 생성자에게 지급합니다.
         // 따라서 아주 작은 수수료의 나머지도 소각되거나 유실되지 않습니다.
         let foundation_fee = tx
@@ -522,5 +634,83 @@ mod initial_reward_tests {
         )
         .with_system_events(vec![event]);
         assert!(chain.apply_block(second).is_err());
+    }
+}
+
+#[cfg(test)]
+mod staking_transaction_tests {
+    use super::*;
+    use crate::staking::{MINIMUM_DELEGATION, STAKING_SYSTEM_ADDRESS, UNBONDING_SECONDS};
+    use crate::{TransactionAction, Wallet};
+
+    #[test]
+    fn delegation_is_locked_then_claimed_after_wait() {
+        let alice = Wallet::from_seed([7; 32]);
+        let validator = Wallet::from_seed([8; 32]).address();
+        let producer = Wallet::from_seed([9; 32]).address();
+        let initial = 20 * MINIMUM_DELEGATION;
+        let mut chain = Blockchain::new(vec![(alice.address(), initial)]);
+        let delegate = alice.sign_action(
+            STAKING_SYSTEM_ADDRESS.into(),
+            10 * MINIMUM_DELEGATION,
+            1,
+            0,
+            TransactionAction::Delegate {
+                validator: validator.clone(),
+            },
+        );
+        chain.add_block(vec![delegate], producer.clone()).unwrap();
+        assert_eq!(
+            chain.balance_of(&alice.address()),
+            10 * MINIMUM_DELEGATION - 1
+        );
+        assert_eq!(
+            chain.staking().delegated_to(&alice.address(), &validator),
+            10 * MINIMUM_DELEGATION
+        );
+        let undelegate = alice.sign_action(
+            STAKING_SYSTEM_ADDRESS.into(),
+            4 * MINIMUM_DELEGATION,
+            1,
+            1,
+            TransactionAction::Undelegate {
+                validator: validator.clone(),
+            },
+        );
+        chain.add_block(vec![undelegate], producer.clone()).unwrap();
+        let claim_too_early = alice.sign_action(
+            STAKING_SYSTEM_ADDRESS.into(),
+            0,
+            1,
+            2,
+            TransactionAction::ClaimUnbonded,
+        );
+        assert!(
+            chain
+                .add_block(vec![claim_too_early], producer.clone())
+                .is_err()
+        );
+        let entry = chain.staking().unbonding[0].clone();
+        assert!(entry.release_at >= UNBONDING_SECONDS);
+        let claim = alice.sign_action(
+            STAKING_SYSTEM_ADDRESS.into(),
+            0,
+            1,
+            2,
+            TransactionAction::ClaimUnbonded,
+        );
+        let previous = chain.blocks.last().unwrap();
+        let claim_block = Block::new(
+            previous.height + 1,
+            previous.hash.clone(),
+            entry.release_at,
+            producer,
+            vec![claim],
+        );
+        chain.apply_block(claim_block).unwrap();
+        assert_eq!(
+            chain.balance_of(&alice.address()),
+            14 * MINIMUM_DELEGATION - 3
+        );
     }
 }

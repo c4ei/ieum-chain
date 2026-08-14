@@ -16,7 +16,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const PROTOCOL_VERSION: &str = "2";
+const PROTOCOL_VERSION: &str = "3";
 const MIN_COMPATIBLE_PROTOCOL_VERSION: &str = "2";
 
 /// geth/web3 도구가 접속할 HTTP JSON-RPC 설정입니다.
@@ -32,6 +32,7 @@ pub struct RpcConfig {
     pub block_time_ms: u64,
     pub validator_interest_policy: crate::validator_interest::ValidatorInterestPolicy,
     pub holder_reward_policy: crate::holder_rewards::HolderRewardPolicy,
+    pub upgrade_schedule: crate::upgrade::UpgradeSchedule,
 }
 
 impl Default for RpcConfig {
@@ -49,6 +50,7 @@ impl Default for RpcConfig {
             validator_interest_policy: crate::validator_interest::ValidatorInterestPolicy::default(
             ),
             holder_reward_policy: crate::holder_rewards::HolderRewardPolicy::default(),
+            upgrade_schedule: crate::upgrade::UpgradeSchedule::default(),
         }
     }
 }
@@ -82,6 +84,7 @@ struct RpcState {
     block_time_ms: u64,
     validator_interest_policy: crate::validator_interest::ValidatorInterestPolicy,
     holder_reward_policy: crate::holder_rewards::HolderRewardPolicy,
+    upgrade_schedule: crate::upgrade::UpgradeSchedule,
 }
 
 #[derive(Clone, Debug)]
@@ -221,7 +224,16 @@ impl RpcNodeHandle {
         state.sync_active = state.sync_current < state.sync_highest;
         let chain = state.chain.clone();
         state.pool.retain_valid(|transaction| {
-            let total = transaction.amount.checked_add(transaction.fee);
+            let debit = if matches!(
+                &transaction.action,
+                crate::model::TransactionAction::Transfer
+                    | crate::model::TransactionAction::Delegate { .. }
+            ) {
+                transaction.amount
+            } else {
+                0
+            };
+            let total = debit.checked_add(transaction.fee);
             transaction.nonce >= chain.next_nonce(&transaction.from)
                 && total.is_some_and(|value| chain.balance_of(&transaction.from) >= value)
                 && crate::wallet::verify_transaction(transaction).is_ok()
@@ -349,7 +361,7 @@ impl RpcServer {
             .expect("embedded 상태 DB를 읽을 수 있어야 합니다.");
         if let Some(state) = stored_state {
             assert_eq!(state.chain_id, chain_id, "embedded DB chain ID 불일치");
-            chain = Blockchain::from_snapshot_with_events(
+            chain = Blockchain::from_snapshot_with_staking(
                 chain_id,
                 chain.genesis_commitment.clone(),
                 state.height,
@@ -357,6 +369,7 @@ impl RpcServer {
                 state.balances,
                 state.nonces,
                 state.executed_events,
+                state.staking,
             )
             .expect("embedded DB 상태를 복원할 수 있어야 합니다.");
             assert_eq!(
@@ -369,7 +382,7 @@ impl RpcServer {
             .expect("상태 체크포인트를 읽을 수 있어야 합니다.")
         {
             assert_eq!(snapshot.chain_id, chain_id, "체크포인트 chain ID 불일치");
-            chain = Blockchain::from_snapshot_with_events(
+            chain = Blockchain::from_snapshot_with_staking(
                 chain_id,
                 chain.genesis_commitment.clone(),
                 snapshot.height,
@@ -377,6 +390,7 @@ impl RpcServer {
                 snapshot.balances,
                 snapshot.next_nonces,
                 snapshot.executed_events,
+                snapshot.staking,
             )
             .expect("체크포인트 상태를 복원할 수 있어야 합니다.");
             assert_eq!(
@@ -450,6 +464,7 @@ impl RpcServer {
                 block_time_ms: config.block_time_ms,
                 validator_interest_policy: config.validator_interest_policy.clone(),
                 holder_reward_policy: config.holder_reward_policy.clone(),
+                upgrade_schedule: config.upgrade_schedule.clone(),
             })),
             config,
         }
@@ -852,17 +867,32 @@ fn dispatch(
         "ieum_supplyStatus" => {
             let state = read_state(state)?;
             let balances = state.chain.balances_snapshot();
-            let bal_all = balances
+            let liquid_all = balances
                 .values()
                 .try_fold(0_u128, |sum, value| sum.checked_add(*value))
                 .ok_or_else(|| (-32603, "총발행량 합계가 u128 범위를 넘었습니다.".into()))?;
-            let bal_lock_all = state
+            let genesis_locked = state
                 .locked_addresses
                 .iter()
                 .try_fold(0_u128, |sum, address| {
                     sum.checked_add(balances.get(address).copied().unwrap_or(0))
                 })
                 .ok_or_else(|| (-32603, "잠금 잔액 합계가 u128 범위를 넘었습니다.".into()))?;
+            let staking_locked = state
+                .chain
+                .staking()
+                .delegations
+                .iter()
+                .map(|p| p.amount)
+                .chain(state.chain.staking().unbonding.iter().map(|e| e.amount))
+                .try_fold(0u128, |sum, value| sum.checked_add(value))
+                .ok_or_else(|| (-32603, "위임 잠금 합계가 u128 범위를 넘었습니다.".into()))?;
+            let bal_lock_all = genesis_locked
+                .checked_add(staking_locked)
+                .ok_or_else(|| (-32603, "전체 잠금 합계가 u128 범위를 넘었습니다.".into()))?;
+            let bal_all = liquid_all
+                .checked_add(staking_locked)
+                .ok_or_else(|| (-32603, "총발행량 합계가 u128 범위를 넘었습니다.".into()))?;
             let bal_genesis_all = state
                 .chain
                 .initial_balances
@@ -873,11 +903,8 @@ fn dispatch(
                 0_u128,
                 |total, block| {
                     block.system_events.iter().try_fold(total, |subtotal, event| {
-                        if let crate::scheduled_event::ScheduledEventAction::ValidatorDailyInterest {
-                            payments,
-                            ..
-                        } = &event.action
-                        {
+                        if let crate::scheduled_event::ScheduledEventAction::ValidatorDailyInterest { payments,.. }
+                            | crate::scheduled_event::ScheduledEventAction::DelegationDailyReward { payments,.. } = &event.action {
                             payments.iter().try_fold(subtotal, |sum, payment| {
                                 sum.checked_add(payment.amount)
                             })
@@ -903,6 +930,7 @@ fn dispatch(
                 "unit": "wei",
                 "decimals": 18,
                 "lockedAddressCount": state.locked_addresses.len(),
+                "stakingLocked": staking_locked.to_string(),
                 "height": state.chain.tip_height()
             }))
         }
@@ -964,6 +992,44 @@ fn dispatch(
                 "friendlyDelegationName": "이음 맡기기",
                 "communityName": "이음마당"
             }))
+        }
+        "ieum_stakingStatus" => {
+            let wanted = params
+                .first()
+                .and_then(Value::as_str)
+                .map(normalize_address);
+            let state = read_state(state)?;
+            let staking = state.chain.staking();
+            let delegations:Vec<_>=staking.delegations.iter().filter(|p|wanted.as_ref().is_none_or(|a|&p.delegator==a)).map(|p|json!({"delegator":p.delegator,"validator":p.validator,"amount":p.amount.to_string()})).collect();
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|v| v.as_secs())
+                .unwrap_or(0);
+            let unbonding:Vec<_>=staking.unbonding.iter().filter(|e|wanted.as_ref().is_none_or(|a|&e.delegator==a)).map(|e|json!({"delegator":e.delegator,"validator":e.validator,"amount":e.amount.to_string(),"releaseAt":e.release_at,"claimable":e.release_at<=now})).collect();
+            let validators:Vec<_>=state.validators.iter().map(|v|json!({"id":v.id,"consensusVotingPower":v.voting_power,"delegated":staking.total_delegated_to(&v.id).to_string()})).collect();
+            Ok(
+                json!({"height":state.chain.tip_height(),"systemAddress":crate::staking::STAKING_SYSTEM_ADDRESS,"minimumDelegation":crate::staking::MINIMUM_DELEGATION.to_string(),"unbondingSeconds":crate::staking::UNBONDING_SECONDS,"doubleVoteSlashBps":crate::staking::DOUBLE_VOTE_SLASH_BPS,"delegations":delegations,"unbonding":unbonding,"validators":validators,"votingPowerAffected":false}),
+            )
+        }
+        "ieum_encodeStakingCall" => {
+            let action = string_param(params, 0)?;
+            let payload = match action {
+                "claim" => "claim".to_string(),
+                "delegate" | "undelegate" => {
+                    let validator = string_param(params, 1)?;
+                    crate::staking::validate_validator(validator).map_err(|m| (-32602, m))?;
+                    format!("{action}:{validator}")
+                }
+                _ => {
+                    return Err((
+                        -32602,
+                        "action은 delegate, undelegate, claim 중 하나여야 합니다.".into(),
+                    ));
+                }
+            };
+            Ok(
+                json!({"to":crate::staking::STAKING_SYSTEM_ADDRESS,"data":format!("0x{}",hex::encode(payload)),"amountRule":if action=="claim"{"0"}else{"요청 수량(wei)"}}),
+            )
         }
         "ieum_addressBalances" => {
             let offset = params.first().and_then(Value::as_u64).unwrap_or(0) as usize;
@@ -1199,6 +1265,34 @@ fn dispatch(
             let transaction: Transaction = serde_json::from_value(value)
                 .map_err(|error| (-32602, format!("서명 거래 형식 오류: {error}")))?;
             crate::wallet::verify_transaction(&transaction).map_err(|message| (-32000, message))?;
+            {
+                let guard = read_state(state)?;
+                if !transaction.action.is_transfer()
+                    && guard
+                        .upgrade_schedule
+                        .version_at(guard.chain.tip_height().saturating_add(1))
+                        < 3
+                {
+                    return Err((
+                        -32000,
+                        "프로토콜 v3 활성화 높이 전에는 위임 거래를 제출할 수 없습니다.".into(),
+                    ));
+                }
+            }
+            {
+                let guard = read_state(state)?;
+                if let crate::model::TransactionAction::Delegate { validator } = &transaction.action
+                    && !guard
+                        .validators
+                        .iter()
+                        .any(|active| active.id == validator.as_str())
+                {
+                    return Err((
+                        -32000,
+                        "현재 활성 이음지기에게만 새 위임을 할 수 있습니다.".into(),
+                    ));
+                }
+            }
             let transaction_id = transaction.id();
             write_state(state)?
                 .pool
@@ -1253,6 +1347,28 @@ fn send_raw_transaction(
     let mut state = write_state(shared)?;
     let transaction = crate::raw_transaction::decode_legacy(raw, state.chain_id)
         .map_err(|message| (-32000, message))?;
+    if !transaction.action.is_transfer()
+        && state
+            .upgrade_schedule
+            .version_at(state.chain.tip_height().saturating_add(1))
+            < 3
+    {
+        return Err((
+            -32000,
+            "프로토콜 v3 활성화 높이 전에는 위임 거래를 제출할 수 없습니다.".into(),
+        ));
+    }
+    if let crate::model::TransactionAction::Delegate { validator } = &transaction.action
+        && !state
+            .validators
+            .iter()
+            .any(|active| active.id == validator.as_str())
+    {
+        return Err((
+            -32000,
+            "현재 활성 이음지기에게만 새 위임을 할 수 있습니다.".into(),
+        ));
+    }
     let transaction_hash =
         crate::raw_transaction::transaction_hash(raw).map_err(|message| (-32602, message))?;
     state
@@ -1445,7 +1561,11 @@ fn transaction_json(block: &Block, index: usize, transaction: &Transaction) -> V
         "to": transaction.to,
         "value": quantity_u128(transaction.amount),
         "gasPrice": quantity_u128(transaction.fee),
-        "input": "0x"
+        "input": match &transaction.action {
+            crate::model::TransactionAction::Transfer=>"0x".into(),
+            action=>format!("0x{}",hex::encode(serde_json::to_vec(action).unwrap_or_default()))
+        },
+        "ieumAction": &transaction.action
     })
 }
 
@@ -1571,6 +1691,7 @@ mod tests {
             amount: 10,
             fee: 21_000,
             nonce: 0,
+            action: crate::model::TransactionAction::Transfer,
             signature: "raw-signature-must-not-be-exposed".into(),
         };
         let block = Block::new(

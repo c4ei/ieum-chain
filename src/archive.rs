@@ -20,6 +20,8 @@ pub struct StateSnapshot {
     pub next_nonces: HashMap<String, u64>,
     #[serde(default)]
     pub executed_events: HashSet<String>,
+    #[serde(default)]
+    pub staking: crate::staking::StakingState,
 }
 
 impl StateSnapshot {
@@ -32,6 +34,7 @@ impl StateSnapshot {
             balances: chain.balances_snapshot(),
             next_nonces: chain.nonces_snapshot(),
             executed_events: chain.executed_events().clone(),
+            staking: chain.staking_snapshot(),
         }
     }
 }

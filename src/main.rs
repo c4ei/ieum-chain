@@ -29,7 +29,7 @@ const DEFAULT_BOOTSTRAP_PEERS: [&str; 4] = [
 ];
 const SERVER_INSTANCE_PORT: u16 = 49_889;
 const CLIENT_INSTANCE_PORT: u16 = 49_890;
-const SUPPORTED_PROTOCOL_VERSION: u32 = 2;
+const SUPPORTED_PROTOCOL_VERSION: u32 = 3;
 
 mod installation;
 
@@ -729,6 +729,7 @@ async fn main() -> Result<(), String> {
     let validator_interest_policy =
         ieum_chain::ValidatorInterestPolicy::load(&args.validator_interest_config)?;
     let holder_reward_policy = ieum_chain::HolderRewardPolicy::load(&args.holder_rewards_config)?;
+    let upgrades = UpgradeSchedule::load("config/upgrades.json")?;
     let rpc_config = RpcConfig {
         listen_ip: args.rpc_host,
         port: args.rpc_port,
@@ -739,6 +740,7 @@ async fn main() -> Result<(), String> {
         block_time_ms: args.block_time_ms,
         validator_interest_policy: validator_interest_policy.clone(),
         holder_reward_policy: holder_reward_policy.clone(),
+        upgrade_schedule: upgrades.clone(),
         ..RpcConfig::default()
     };
     let rpc_server = RpcServer::new(rpc_config);
@@ -826,7 +828,6 @@ async fn main() -> Result<(), String> {
         local_reward_registration.peer_id.clone(),
         local_reward_registration.clone(),
     );
-    let upgrades = UpgradeSchedule::load("config/upgrades.json")?;
     upgrades.ensure_supported(
         rpc.chain()?.tip_height().saturating_add(1),
         SUPPORTED_PROTOCOL_VERSION,
@@ -843,6 +844,7 @@ async fn main() -> Result<(), String> {
     )?;
     let event_schedule = EventSchedule::load(&args.events_config)?;
     consensus.set_event_schedule(event_schedule.clone())?;
+    consensus.set_upgrade_schedule(upgrades.clone());
     consensus.set_validator_interest_policy(validator_interest_policy.clone())?;
     consensus.set_holder_reward_policy(holder_reward_policy.clone())?;
     log_info!(
@@ -1121,6 +1123,19 @@ async fn main() -> Result<(), String> {
                                     payments,
                                 },
                             });
+                        }
+                    }
+                    if upgrades.version_at(consensus.chain.tip_height().saturating_add(1))>=3 {
+                        for evidence in evidence_store.load()? {
+                            let slash_id=ieum_chain::staking::slash_event_id(&evidence);
+                            if !consensus.chain.executed_events().contains(&slash_id) {
+                                due_events.push(ScheduledEvent { id:slash_id, execute_at:timestamp, action:ScheduledEventAction::DoubleVoteSlash { evidence, penalty_bps:ieum_chain::staking::DOUBLE_VOTE_SLASH_BPS } });
+                            }
+                        }
+                        let delegation_reward_id=ieum_chain::staking::reward_event_id(timestamp);
+                        if validator_interest_policy.enabled && !consensus.chain.executed_events().contains(&delegation_reward_id) {
+                            let payments=ieum_chain::staking::calculate_rewards(consensus.chain.staking(),validator_interest_policy.annual_rate_bps,validator_interest_policy.maximum_daily_total);
+                            if !payments.is_empty(){due_events.push(ScheduledEvent{id:delegation_reward_id,execute_at:ieum_chain::validator_interest::execute_at(timestamp),action:ScheduledEventAction::DelegationDailyReward{snapshot_height:consensus.chain.tip_height(),policy_hash:validator_interest_policy.hash(),annual_rate_bps:validator_interest_policy.annual_rate_bps,payments}});}
                         }
                     }
                     if consensus.can_make_proposal()

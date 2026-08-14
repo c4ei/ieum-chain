@@ -54,6 +54,7 @@ pub struct ConsensusRuntime {
     event_schedule: EventSchedule,
     validator_interest_policy: crate::validator_interest::ValidatorInterestPolicy,
     holder_reward_policy: crate::holder_rewards::HolderRewardPolicy,
+    upgrade_schedule: crate::upgrade::UpgradeSchedule,
 }
 
 impl ConsensusRuntime {
@@ -121,7 +122,11 @@ impl ConsensusRuntime {
             validator_interest_policy: crate::validator_interest::ValidatorInterestPolicy::default(
             ),
             holder_reward_policy: crate::holder_rewards::HolderRewardPolicy::default(),
+            upgrade_schedule: crate::upgrade::UpgradeSchedule::default(),
         })
+    }
+    pub fn set_upgrade_schedule(&mut self, schedule: crate::upgrade::UpgradeSchedule) {
+        self.upgrade_schedule = schedule;
     }
 
     pub fn set_event_schedule(&mut self, schedule: EventSchedule) -> Result<(), String> {
@@ -565,6 +570,20 @@ impl ConsensusRuntime {
         if block.timestamp > now.saturating_add(MAX_CLOCK_DRIFT_SECONDS) {
             return Err("블록 시각이 허용된 미래 오차를 넘었습니다.".into());
         }
+        let protocol = self.upgrade_schedule.version_at(block.height);
+        if protocol<3 && (block.transactions.iter().any(|tx|!tx.action.is_transfer()) || block.system_events.iter().any(|event|matches!(&event.action,crate::scheduled_event::ScheduledEventAction::DoubleVoteSlash{..}|crate::scheduled_event::ScheduledEventAction::DelegationDailyReward{..}))) {
+            return Err("위임·페널티 기능은 프로토콜 v3 활성화 높이 이전에 사용할 수 없습니다.".into());
+        }
+        for transaction in &block.transactions {
+            if let crate::model::TransactionAction::Delegate { validator } = &transaction.action
+                && !self
+                    .validators
+                    .iter()
+                    .any(|active| active.id == validator.as_str())
+            {
+                return Err("현재 활성 이음지기에게만 새 위임을 할 수 있습니다.".into());
+            }
+        }
         let configured_events: Vec<_> = block
             .system_events
             .iter()
@@ -575,6 +594,8 @@ impl ConsensusRuntime {
                         | crate::scheduled_event::ScheduledEventAction::NodeMilestoneReward { .. }
                         | crate::scheduled_event::ScheduledEventAction::ValidatorDailyInterest { .. }
                         | crate::scheduled_event::ScheduledEventAction::HolderDailyReward { .. }
+                        | crate::scheduled_event::ScheduledEventAction::DoubleVoteSlash { .. }
+                        | crate::scheduled_event::ScheduledEventAction::DelegationDailyReward { .. }
                 )
             })
             .cloned()
@@ -653,6 +674,42 @@ impl ConsensusRuntime {
                         );
                     }
                 }
+                crate::scheduled_event::ScheduledEventAction::DoubleVoteSlash {
+                    evidence,
+                    penalty_bps,
+                } if event.id == crate::staking::slash_event_id(evidence) => {
+                    if *penalty_bps != crate::staking::DOUBLE_VOTE_SLASH_BPS
+                        || !self
+                            .validators
+                            .iter()
+                            .any(|v| v.id == evidence.first.validator_id)
+                    {
+                        return Err("이중투표 페널티 대상 또는 비율이 올바르지 않습니다.".into());
+                    }
+                    evidence.verify()?;
+                }
+                crate::scheduled_event::ScheduledEventAction::DelegationDailyReward {
+                    snapshot_height,
+                    policy_hash,
+                    annual_rate_bps,
+                    payments,
+                } if event.id == crate::staking::reward_event_id(block.timestamp) => {
+                    if *snapshot_height != self.chain.tip_height()
+                        || policy_hash != &self.validator_interest_policy.hash()
+                        || *annual_rate_bps != self.validator_interest_policy.annual_rate_bps
+                        || payments
+                            != &crate::staking::calculate_rewards(
+                                self.chain.staking(),
+                                *annual_rate_bps,
+                                self.validator_interest_policy.maximum_daily_total,
+                            )
+                    {
+                        return Err(
+                            "위임 보상이 로컬 정책과 snapshot 계산 결과에 일치하지 않습니다."
+                                .into(),
+                        );
+                    }
+                }
                 crate::scheduled_event::ScheduledEventAction::BootstrapValidatorReward {
                     ..
                 }
@@ -664,6 +721,12 @@ impl ConsensusRuntime {
                 }
                 crate::scheduled_event::ScheduledEventAction::HolderDailyReward { .. } => {
                     return Err("보유 응원 보상 이벤트 ID가 올바르지 않습니다.".into());
+                }
+                crate::scheduled_event::ScheduledEventAction::DoubleVoteSlash { .. } => {
+                    return Err("이중투표 페널티 이벤트 ID가 올바르지 않습니다.".into());
+                }
+                crate::scheduled_event::ScheduledEventAction::DelegationDailyReward { .. } => {
+                    return Err("위임 보상 이벤트 ID가 올바르지 않습니다.".into());
                 }
                 _ => continue,
             }

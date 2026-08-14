@@ -55,6 +55,17 @@ pub enum ScheduledEventAction {
         annual_rate_bps: u32,
         payments: Vec<EventPayment>,
     },
+    /// 서명된 이중투표 증거가 합의 블록에 포함될 때 위임·해제대기 자금에 적용합니다.
+    DoubleVoteSlash {
+        evidence: crate::consensus::DoubleVoteEvidence,
+        penalty_bps: u32,
+    },
+    DelegationDailyReward {
+        snapshot_height: u64,
+        policy_hash: String,
+        annual_rate_bps: u32,
+        payments: Vec<EventPayment>,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -220,6 +231,40 @@ impl ScheduledEvent {
                     validate_address(&payment.address)?;
                     if payment.amount == 0 {
                         return Err("보유 응원 보상액은 0보다 커야 합니다.".into());
+                    }
+                }
+                return Ok(());
+            }
+            ScheduledEventAction::DoubleVoteSlash {
+                evidence,
+                penalty_bps,
+            } => {
+                evidence.verify()?;
+                if *penalty_bps != crate::staking::DOUBLE_VOTE_SLASH_BPS {
+                    return Err("이중투표 페널티는 합의 상수 5%여야 합니다.".into());
+                }
+                if self.id != crate::staking::slash_event_id(evidence) {
+                    return Err("이중투표 페널티 이벤트 ID가 증거와 일치하지 않습니다.".into());
+                }
+                return Ok(());
+            }
+            ScheduledEventAction::DelegationDailyReward {
+                policy_hash,
+                annual_rate_bps,
+                payments,
+                ..
+            } => {
+                if policy_hash.len() != 64
+                    || !policy_hash.bytes().all(|b| b.is_ascii_hexdigit())
+                    || *annual_rate_bps > 5_000
+                    || payments.is_empty()
+                {
+                    return Err("위임 보상 정책 또는 지급 대상이 올바르지 않습니다.".into());
+                }
+                for payment in payments {
+                    validate_reward_address(&payment.address)?;
+                    if payment.amount == 0 {
+                        return Err("위임 보상액은 0보다 커야 합니다.".into());
                     }
                 }
                 return Ok(());

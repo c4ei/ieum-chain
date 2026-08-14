@@ -380,6 +380,7 @@ mod tests {
             balances: HashMap::from([("alice".into(), 10)]),
             next_nonces: HashMap::new(),
             executed_events: std::collections::HashSet::new(),
+            staking: crate::staking::StakingState::default(),
         }
     }
 

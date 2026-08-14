@@ -32,6 +32,7 @@ pub mod scheduled_event;
 pub mod signer;
 pub mod snapshot_scheduler;
 pub mod snapshot_sync;
+pub mod staking;
 pub mod state_store;
 pub mod storage;
 pub mod traffic_rewards;
@@ -68,7 +69,7 @@ pub use holder_rewards::HolderRewardPolicy;
 pub use keystore::Keystore;
 pub use mempool::Mempool;
 pub use metrics::{NodeMetrics, prometheus_router};
-pub use model::{Block, Transaction};
+pub use model::{Block, Transaction, TransactionAction};
 pub use modules::{AppModule, ModuleContext, ModuleRouter, StateMigration};
 pub use network::{
     NetworkCommand, NetworkConfig, NetworkEvent, NodeRewardRegistration, P2pNode,
@@ -95,6 +96,7 @@ pub use snapshot_sync::{
     SnapshotAttestation, SnapshotCertificate, SnapshotChunk, SnapshotDownload, SnapshotManifest,
     SyncTip, TipQuorum,
 };
+pub use staking::{DelegationPosition, StakingState, UnbondingEntry};
 pub use state_store::{CanonicalState, StateStore};
 pub use traffic_rewards::{
     ContributionLedger, EligibleNode, LotteryPayment, PeerCandidate, RelayReceipt, RewardPolicy,

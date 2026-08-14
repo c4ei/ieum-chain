@@ -35,12 +35,30 @@ impl Wallet {
     }
 
     pub fn sign_transfer(&self, to: Address, amount: u128, fee: u128, nonce: u64) -> Transaction {
+        self.sign_action(
+            to,
+            amount,
+            fee,
+            nonce,
+            crate::model::TransactionAction::Transfer,
+        )
+    }
+
+    pub fn sign_action(
+        &self,
+        to: Address,
+        amount: u128,
+        fee: u128,
+        nonce: u64,
+        action: crate::model::TransactionAction,
+    ) -> Transaction {
         let mut tx = Transaction {
             from: self.address(),
             to,
             amount,
             fee,
             nonce,
+            action,
             signature: String::new(),
         };
         tx.signature = self.sign_bytes(&tx.signing_bytes());

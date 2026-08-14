@@ -1632,6 +1632,7 @@ mod connection_log_tests {
                 amount: 1,
                 fee: 21_000,
                 nonce: 0,
+                action: crate::model::TransactionAction::Transfer,
                 signature: "ethraw:secret-signature".into(),
             }],
         );

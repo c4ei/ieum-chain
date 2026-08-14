@@ -4,6 +4,20 @@ use sha2::{Digest, Sha256};
 
 pub type Address = String;
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum TransactionAction {
+    #[default]
+    Transfer,
+    Delegate {
+        validator: Address,
+    },
+    Undelegate {
+        validator: Address,
+    },
+    ClaimUnbonded,
+}
+
 /// 사용자가 서명해 네트워크에 제출하는 가장 기본적인 코인 송금 거래입니다.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Transaction {
@@ -15,7 +29,32 @@ pub struct Transaction {
     #[serde(with = "decimal_u128")]
     pub fee: u128,
     pub nonce: u64,
+    /// v0.23.0 이전 거래에는 필드가 없으며 일반 송금으로 해석합니다.
+    #[serde(default, skip_serializing_if = "TransactionAction::is_transfer")]
+    pub action: TransactionAction,
     pub signature: String,
+}
+
+impl TransactionAction {
+    pub fn is_transfer(&self) -> bool {
+        matches!(self, Self::Transfer)
+    }
+    fn consensus_bytes(&self) -> Vec<u8> {
+        match self {
+            Self::Transfer => vec![0],
+            Self::Delegate { validator } => {
+                let mut out = vec![1];
+                push_text(&mut out, validator);
+                out
+            }
+            Self::Undelegate { validator } => {
+                let mut out = vec![2];
+                push_text(&mut out, validator);
+                out
+            }
+            Self::ClaimUnbonded => vec![3],
+        }
+    }
 }
 
 /// JSON 구현의 128비트 숫자 지원 여부와 무관한 고정 표현입니다.
@@ -81,6 +120,10 @@ impl Transaction {
         bytes.extend_from_slice(&self.amount.to_be_bytes());
         bytes.extend_from_slice(&self.fee.to_be_bytes());
         bytes.extend_from_slice(&self.nonce.to_be_bytes());
+        if !self.action.is_transfer() {
+            bytes.extend_from_slice(b"IEUM-TX-ACTION-V1");
+            bytes.extend_from_slice(&self.action.consensus_bytes());
+        }
         bytes
     }
 

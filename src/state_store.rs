@@ -16,6 +16,8 @@ pub struct CanonicalState {
     pub nonces: HashMap<String, u64>,
     #[serde(default)]
     pub executed_events: HashSet<String>,
+    #[serde(default)]
+    pub staking: crate::staking::StakingState,
     pub height_to_hash: HashMap<u64, String>,
     pub transaction_index: HashMap<String, (u64, usize)>,
 }
@@ -34,7 +36,7 @@ impl CanonicalState {
             }
         }
         Self {
-            schema_version: 1,
+            schema_version: 2,
             chain_id: chain.chain_id,
             height: chain.tip_height(),
             block_hash: chain.tip_hash().to_string(),
@@ -42,6 +44,7 @@ impl CanonicalState {
             balances: chain.balances_snapshot(),
             nonces: chain.nonces_snapshot(),
             executed_events: chain.executed_events().clone(),
+            staking: chain.staking_snapshot(),
             height_to_hash,
             transaction_index,
         }
@@ -111,7 +114,7 @@ impl StateStore {
 }
 
 fn validate_schema(state: &CanonicalState) -> Result<(), String> {
-    if state.schema_version != 1 {
+    if !matches!(state.schema_version, 1 | 2) {
         return Err("지원하지 않는 상태 저장소 버전입니다.".into());
     }
     Ok(())
