@@ -1,0 +1,9 @@
+{
+  "enabled": false,
+  "campaign_name": "이음 첫 보유 응원 이벤트",
+  "starts_at": 0,
+  "ends_at": 0,
+  "annual_rate_bps": 500,
+  "minimum_balance": "1000000000000000000",
+  "maximum_daily_total": "100000000000000000000"
+}

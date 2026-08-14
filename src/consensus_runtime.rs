@@ -53,6 +53,7 @@ pub struct ConsensusRuntime {
     pending_finalized: Vec<FinalityCertificate>,
     event_schedule: EventSchedule,
     validator_interest_policy: crate::validator_interest::ValidatorInterestPolicy,
+    holder_reward_policy: crate::holder_rewards::HolderRewardPolicy,
 }
 
 impl ConsensusRuntime {
@@ -119,12 +120,22 @@ impl ConsensusRuntime {
             event_schedule: EventSchedule::default(),
             validator_interest_policy: crate::validator_interest::ValidatorInterestPolicy::default(
             ),
+            holder_reward_policy: crate::holder_rewards::HolderRewardPolicy::default(),
         })
     }
 
     pub fn set_event_schedule(&mut self, schedule: EventSchedule) -> Result<(), String> {
         schedule.validate()?;
         self.event_schedule = schedule;
+        Ok(())
+    }
+
+    pub fn set_holder_reward_policy(
+        &mut self,
+        policy: crate::holder_rewards::HolderRewardPolicy,
+    ) -> Result<(), String> {
+        policy.validate()?;
+        self.holder_reward_policy = policy;
         Ok(())
     }
 
@@ -563,6 +574,7 @@ impl ConsensusRuntime {
                     crate::scheduled_event::ScheduledEventAction::BootstrapValidatorReward { .. }
                         | crate::scheduled_event::ScheduledEventAction::NodeMilestoneReward { .. }
                         | crate::scheduled_event::ScheduledEventAction::ValidatorDailyInterest { .. }
+                        | crate::scheduled_event::ScheduledEventAction::HolderDailyReward { .. }
                 )
             })
             .cloned()
@@ -616,6 +628,31 @@ impl ConsensusRuntime {
                         return Err("검증자 일일 이자가 로컬 정책과 snapshot 계산 결과에 일치하지 않습니다.".into());
                     }
                 }
+                crate::scheduled_event::ScheduledEventAction::HolderDailyReward {
+                    snapshot_height,
+                    policy_hash,
+                    annual_rate_bps,
+                    payments,
+                } if event.id == crate::holder_rewards::event_id(block.timestamp) => {
+                    let mut excluded = std::collections::HashSet::new();
+                    excluded.insert(crate::FOUNDATION_FEE_ADDRESS.to_string());
+                    if *snapshot_height != self.chain.tip_height()
+                        || !self.holder_reward_policy.active(block.timestamp)
+                        || policy_hash != &self.holder_reward_policy.hash()
+                        || *annual_rate_bps != self.holder_reward_policy.annual_rate_bps
+                        || payments
+                            != &crate::holder_rewards::calculate_payments(
+                                &self.holder_reward_policy,
+                                &self.chain.balances_snapshot(),
+                                &excluded,
+                            )
+                    {
+                        return Err(
+                            "보유 응원 보상이 로컬 정책과 snapshot 계산 결과에 일치하지 않습니다."
+                                .into(),
+                        );
+                    }
+                }
                 crate::scheduled_event::ScheduledEventAction::BootstrapValidatorReward {
                     ..
                 }
@@ -624,6 +661,9 @@ impl ConsensusRuntime {
                 }
                 crate::scheduled_event::ScheduledEventAction::ValidatorDailyInterest { .. } => {
                     return Err("검증자 일일 이자 이벤트 ID가 올바르지 않습니다.".into());
+                }
+                crate::scheduled_event::ScheduledEventAction::HolderDailyReward { .. } => {
+                    return Err("보유 응원 보상 이벤트 ID가 올바르지 않습니다.".into());
                 }
                 _ => continue,
             }

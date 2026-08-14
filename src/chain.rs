@@ -334,6 +334,11 @@ fn apply_system_events(
                     transfer_from_foundation(balances, &payment.address, payment.amount)?;
                 }
             }
+            ScheduledEventAction::HolderDailyReward { payments, .. } => {
+                for payment in payments {
+                    transfer_from_foundation(balances, &payment.address, payment.amount)?;
+                }
+            }
         }
     }
     Ok(())

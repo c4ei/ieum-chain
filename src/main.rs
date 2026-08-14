@@ -377,6 +377,10 @@ struct NodeArgs {
     #[arg(long, default_value = "config/validator-interest.json")]
     validator_interest_config: PathBuf,
 
+    /// 기간형 일반 지갑 보유 응원 이벤트 정책
+    #[arg(long, default_value = "config/holder-rewards.json")]
+    holder_rewards_config: PathBuf,
+
     /// 서명된 업데이트 manifest URL. 지정한 경우 시작할 때 새 버전을 확인합니다.
     #[arg(long, requires = "release_public_key")]
     update_manifest_url: Option<String>,
@@ -451,6 +455,7 @@ fn default_node_args() -> NodeArgs {
         validators_config: PathBuf::from("config/validators.json"),
         events_config: PathBuf::from("config/events.json"),
         validator_interest_config: PathBuf::from("config/validator-interest.json"),
+        holder_rewards_config: PathBuf::from("config/holder-rewards.json"),
         update_manifest_url: None,
         release_public_key: None,
         allow_insecure_test_keys: false,
@@ -723,6 +728,7 @@ async fn main() -> Result<(), String> {
     let mut validators = load_validators(&args.validators_config)?;
     let validator_interest_policy =
         ieum_chain::ValidatorInterestPolicy::load(&args.validator_interest_config)?;
+    let holder_reward_policy = ieum_chain::HolderRewardPolicy::load(&args.holder_rewards_config)?;
     let rpc_config = RpcConfig {
         listen_ip: args.rpc_host,
         port: args.rpc_port,
@@ -732,6 +738,7 @@ async fn main() -> Result<(), String> {
         locked_addresses: genesis.locked_addresses.clone(),
         block_time_ms: args.block_time_ms,
         validator_interest_policy: validator_interest_policy.clone(),
+        holder_reward_policy: holder_reward_policy.clone(),
         ..RpcConfig::default()
     };
     let rpc_server = RpcServer::new(rpc_config);
@@ -837,6 +844,7 @@ async fn main() -> Result<(), String> {
     let event_schedule = EventSchedule::load(&args.events_config)?;
     consensus.set_event_schedule(event_schedule.clone())?;
     consensus.set_validator_interest_policy(validator_interest_policy.clone())?;
+    consensus.set_holder_reward_policy(holder_reward_policy.clone())?;
     log_info!(
         "[검증자 일일 이자] enabled={} APR={:.2}% 최소={} wei 정책={}",
         validator_interest_policy.enabled,
@@ -1089,6 +1097,27 @@ async fn main() -> Result<(), String> {
                                     snapshot_height: consensus.chain.tip_height(),
                                     policy_hash: validator_interest_policy.hash(),
                                     annual_rate_bps: validator_interest_policy.annual_rate_bps,
+                                    payments,
+                                },
+                            });
+                        }
+                    }
+                    let holder_event_id = ieum_chain::holder_rewards::event_id(timestamp);
+                    if holder_reward_policy.active(timestamp)
+                        && !consensus.chain.executed_events().contains(&holder_event_id)
+                    {
+                        let mut excluded = std::collections::HashSet::new();
+                        excluded.insert(ieum_chain::FOUNDATION_FEE_ADDRESS.to_string());
+                        let payments = ieum_chain::holder_rewards::calculate_payments(
+                            &holder_reward_policy, &consensus.chain.balances_snapshot(), &excluded);
+                        if !payments.is_empty() {
+                            due_events.push(ScheduledEvent {
+                                id: holder_event_id,
+                                execute_at: ieum_chain::holder_rewards::execute_at(timestamp),
+                                action: ScheduledEventAction::HolderDailyReward {
+                                    snapshot_height: consensus.chain.tip_height(),
+                                    policy_hash: holder_reward_policy.hash(),
+                                    annual_rate_bps: holder_reward_policy.annual_rate_bps,
                                     payments,
                                 },
                             });

@@ -7,6 +7,13 @@ pub const BPS_DENOMINATOR: u128 = 10_000;
 pub const DAYS_PER_YEAR: u128 = 365;
 pub const KST_OFFSET_SECONDS: u64 = 9 * 60 * 60;
 pub const DAY_SECONDS: u64 = 24 * 60 * 60;
+/// 18자리 원시 수량을 화면 기준 소수점 12자리에서 반올림합니다.
+pub const INTEREST_ROUNDING_UNIT: u128 = 1_000_000;
+
+fn round_to_twelve_decimals(value: u128) -> u128 {
+    value.saturating_add(INTEREST_ROUNDING_UNIT / 2) / INTEREST_ROUNDING_UNIT
+        * INTEREST_ROUNDING_UNIT
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
@@ -107,10 +114,12 @@ pub fn calculate_payments(
         if balance < policy.minimum_balance || remaining == 0 {
             continue;
         }
-        let amount = (balance.saturating_mul(u128::from(policy.annual_rate_bps))
-            / BPS_DENOMINATOR
-            / DAYS_PER_YEAR)
-            .min(remaining);
+        let amount = round_to_twelve_decimals(
+            balance.saturating_mul(u128::from(policy.annual_rate_bps))
+                / BPS_DENOMINATOR
+                / DAYS_PER_YEAR,
+        )
+        .min(remaining);
         if amount > 0 {
             payments.push(EventPayment {
                 address: validator.id,
@@ -132,7 +141,7 @@ mod tests {
         let payments = calculate_payments(&ValidatorInterestPolicy::default(), &[v], &balances);
         assert_eq!(payments.len(), 1);
         // 10 IEUM × 5.00% APR ÷ 365일 = 약 0.001369863 IEUM/일
-        assert_eq!(payments[0].amount, 1_369_863_013_698_630);
+        assert_eq!(payments[0].amount, 1_369_863_014_000_000);
     }
     #[test]
     fn one_event_id_per_kst_day() {

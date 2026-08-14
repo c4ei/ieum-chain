@@ -48,6 +48,13 @@ pub enum ScheduledEventAction {
         annual_rate_bps: u32,
         payments: Vec<EventPayment>,
     },
+    /// 기간형 일반 0x 지갑 보유 응원 이벤트의 하루 지급분입니다.
+    HolderDailyReward {
+        snapshot_height: u64,
+        policy_hash: String,
+        annual_rate_bps: u32,
+        payments: Vec<EventPayment>,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -192,6 +199,27 @@ impl ScheduledEvent {
                     validate_reward_address(&payment.address)?;
                     if payment.amount == 0 {
                         return Err("검증자 이자 지급액은 0보다 커야 합니다.".into());
+                    }
+                }
+                return Ok(());
+            }
+            ScheduledEventAction::HolderDailyReward {
+                snapshot_height: _,
+                policy_hash,
+                annual_rate_bps,
+                payments,
+            } => {
+                if policy_hash.len() != 64
+                    || !policy_hash.bytes().all(|b| b.is_ascii_hexdigit())
+                    || *annual_rate_bps > 5_000
+                    || payments.is_empty()
+                {
+                    return Err("보유 응원 보상 정책 또는 지급 대상이 올바르지 않습니다.".into());
+                }
+                for payment in payments {
+                    validate_address(&payment.address)?;
+                    if payment.amount == 0 {
+                        return Err("보유 응원 보상액은 0보다 커야 합니다.".into());
                     }
                 }
                 return Ok(());

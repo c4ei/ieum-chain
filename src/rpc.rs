@@ -31,6 +31,7 @@ pub struct RpcConfig {
     pub locked_addresses: Vec<String>,
     pub block_time_ms: u64,
     pub validator_interest_policy: crate::validator_interest::ValidatorInterestPolicy,
+    pub holder_reward_policy: crate::holder_rewards::HolderRewardPolicy,
 }
 
 impl Default for RpcConfig {
@@ -47,6 +48,7 @@ impl Default for RpcConfig {
             block_time_ms: 5_000,
             validator_interest_policy: crate::validator_interest::ValidatorInterestPolicy::default(
             ),
+            holder_reward_policy: crate::holder_rewards::HolderRewardPolicy::default(),
         }
     }
 }
@@ -79,6 +81,7 @@ struct RpcState {
     audit_log_path: PathBuf,
     block_time_ms: u64,
     validator_interest_policy: crate::validator_interest::ValidatorInterestPolicy,
+    holder_reward_policy: crate::holder_rewards::HolderRewardPolicy,
 }
 
 #[derive(Clone, Debug)]
@@ -446,6 +449,7 @@ impl RpcServer {
                 audit_log_path: config.data_dir.join("audit/admin-actions.jsonl"),
                 block_time_ms: config.block_time_ms,
                 validator_interest_policy: config.validator_interest_policy.clone(),
+                holder_reward_policy: config.holder_reward_policy.clone(),
             })),
             config,
         }
@@ -922,6 +926,43 @@ fn dispatch(
                 "eligibleValidators": payments.len(),
                 "estimatedDailyTotal": total.to_string(),
                 "payments": payments.iter().map(|p| json!({"address": p.address, "amount": p.amount.to_string()})).collect::<Vec<_>>()
+            }))
+        }
+        "ieum_holderRewardStatus" => {
+            let address = params
+                .first()
+                .and_then(Value::as_str)
+                .map(normalize_address);
+            let state = read_state(state)?;
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|v| v.as_secs())
+                .unwrap_or(0);
+            let policy = &state.holder_reward_policy;
+            let balances = state.chain.balances_snapshot();
+            let mut excluded = HashSet::new();
+            excluded.insert(crate::FOUNDATION_FEE_ADDRESS.to_string());
+            let payments = crate::holder_rewards::calculate_payments(policy, &balances, &excluded);
+            let selected = address
+                .as_ref()
+                .and_then(|wanted| payments.iter().find(|p| &p.address == wanted));
+            Ok(json!({
+                "campaignName": policy.campaign_name,
+                "enabled": policy.enabled,
+                "active": policy.active(now),
+                "startsAt": policy.starts_at,
+                "endsAt": policy.ends_at,
+                "annualRateBps": policy.annual_rate_bps,
+                "annualRatePercent": f64::from(policy.annual_rate_bps) / 100.0,
+                "minimumBalance": policy.minimum_balance.to_string(),
+                "policyHash": policy.hash(),
+                "eligibleWallets": payments.len(),
+                "address": address,
+                "eligible": selected.is_some(),
+                "estimatedDailyReward": selected.map(|p| p.amount.to_string()).unwrap_or_else(|| "0".into()),
+                "friendlyValidatorName": "이음지기",
+                "friendlyDelegationName": "이음 맡기기",
+                "communityName": "이음마당"
             }))
         }
         "ieum_addressBalances" => {
