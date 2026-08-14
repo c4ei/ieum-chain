@@ -1,3 +1,9 @@
 {
-  "upgrades": []
+  "upgrades": [
+    {
+      "name": "staking-v1",
+      "activation_height": 23,
+      "protocol_version": 3
+    }
+  ]
 }
