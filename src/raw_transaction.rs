@@ -93,12 +93,6 @@ fn decode_action(to: &[u8], data: &[u8]) -> Result<TransactionAction, String> {
     Err("지원하지 않는 스테이킹 calldata입니다.".into())
 }
 
-pub fn transaction_hash(raw_hex: &str) -> Result<String, String> {
-    let raw = hex::decode(raw_hex.trim_start_matches("0x"))
-        .map_err(|_| "raw transaction이 올바른 hex가 아닙니다.")?;
-    Ok(format!("0x{}", hex::encode(Keccak256::digest(raw))))
-}
-
 pub fn verify_embedded(transaction: &Transaction, expected_chain_id: u64) -> Result<(), String> {
     let raw = transaction
         .signature

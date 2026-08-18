@@ -1369,8 +1369,8 @@ fn send_raw_transaction(
             "현재 활성 이음지기에게만 새 위임을 할 수 있습니다.".into(),
         ));
     }
-    let transaction_hash =
-        crate::raw_transaction::transaction_hash(raw).map_err(|message| (-32602, message))?;
+    // 반환 해시를 확정 블록과 eth_getTransactionByHash가 사용하는 원장 거래 ID로 통일합니다.
+    let transaction_hash = format!("0x{}", transaction.id());
     state
         .pool
         .add(transaction)

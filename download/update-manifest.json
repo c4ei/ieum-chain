@@ -1,14 +1,14 @@
 {
-  "version": "0.23.0",
+  "version": "0.23.1",
   "protocol_version": 3,
   "mandatory": false,
-  "published_at": 1786695535,
-  "notes": "IEUM Chain v0.23.0 signed release",
+  "published_at": 1787015817,
+  "notes": "IEUM Chain v0.23.1 signed release",
   "artifacts": {
     "linux-x86_64": {
-      "url": "https://raw.githubusercontent.com/c4ei/ieum-chain/main/download/ieum-chain_linux_x86_64_v0.23.0",
-      "sha256": "94333a910bb155dc1c09cf558a2101a3656c76a564aef27a956dffa9a34fe55d"
+      "url": "https://raw.githubusercontent.com/c4ei/ieum-chain/main/download/ieum-chain_linux_x86_64_v0.23.1",
+      "sha256": "d694b90b4f276fba95c337276c12812d931c0e2ca5c6d7198eb1d7f32b78fd4d"
     }
   },
-  "signature": "c184c4766ab210b9a92f47fb6bdae10cdac769a8c513ee7da4d90b1891d05ad2b28619d5800845447bb4c0c631eda735b6f2b0a879230f525bfa5550c245a107"
+  "signature": "d71d902c5cd5ae53f9541e8037153b0fb413f307cb2c2ceeae37d0bd49db8073f6d1a0752b6e120caf94d336b72406102a3c59a5c6d71a1d06eb31069dbf8607"
 }
