@@ -1,0 +1,129 @@
+name: Build and release IEUM Chain
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Existing tag to build, for example v0.23.1"
+        required: true
+        type: string
+
+env:
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.asset }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            binary: ieum-chain
+            asset: ieum-chain-linux-x86_64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            binary: ieum-chain.exe
+            asset: ieum-chain-windows-x86_64.exe
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            binary: ieum-chain
+            asset: ieum-chain-macos-x86_64
+          - os: macos-14
+            target: aarch64-apple-darwin
+            binary: ieum-chain
+            asset: ieum-chain-macos-aarch64
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+
+      - name: Install Rust target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Verify tag matches Cargo version
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo_version="$(cargo metadata --no-deps --format-version 1 | python -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')"
+          tag_version="${RELEASE_TAG#v}"
+          test "$cargo_version" = "$tag_version" || {
+            echo "Cargo version ($cargo_version) does not match tag ($tag_version)." >&2
+            exit 1
+          }
+
+      - name: Test
+        run: cargo test --all-targets --all-features --locked
+
+      - name: Build release binary
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Prepare asset and checksum
+        shell: bash
+        env:
+          SOURCE: target/${{ matrix.target }}/release/${{ matrix.binary }}
+          ASSET: ${{ matrix.asset }}
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          cp "$SOURCE" "release/$ASSET"
+          python - "$ASSET" <<'PY'
+          import hashlib
+          import pathlib
+          import sys
+
+          name = sys.argv[1]
+          path = pathlib.Path("release") / name
+          digest = hashlib.sha256(path.read_bytes()).hexdigest()
+          (path.parent / f"{name}.sha256").write_text(
+              f"{digest}  {name}\n", encoding="utf-8"
+          )
+          PY
+
+      - name: Upload release assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: release/*
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all assets
+        uses: actions/download-artifact@v4
+        with:
+          path: release
+          merge-multiple: true
+
+      - name: Verify checksums
+        working-directory: release
+        run: sha256sum --check *.sha256
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create "$RELEASE_TAG" release/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "IEUM Chain $RELEASE_TAG" \
+            --generate-notes \
+            --verify-tag
