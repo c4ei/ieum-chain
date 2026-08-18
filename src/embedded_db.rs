@@ -448,10 +448,14 @@ mod tests {
     use super::*;
 
     fn test_root(name: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+
         std::env::temp_dir().join(format!(
             "ieum-sqlite-{name}-{}-{}",
             std::process::id(),
-            std::thread::current().name().unwrap_or("thread")
+            NEXT_ID.fetch_add(1, Ordering::Relaxed)
         ))
     }
 
