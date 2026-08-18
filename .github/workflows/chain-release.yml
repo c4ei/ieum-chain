@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: "Existing tag to build, for example v0.23.2"
+        description: "Existing tag to build, for example v0.23.4"
         required: true
         type: string
 
@@ -24,7 +24,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             binary: ieum-chain
             asset: ieum-chain-linux-x86_64
@@ -63,6 +63,10 @@ jobs:
             "installed\x64-windows-static\lib"
           "RUSTFLAGS=-Ctarget-feature=+crt-static -Lnative=$sqliteLib" |
             Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Install SQLite on Linux
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev
 
       - name: Verify tag matches Cargo version
         shell: bash
@@ -112,12 +116,17 @@ jobs:
           retention-days: 7
 
   release:
-    name: Publish GitHub Release
+    name: Publish signed GitHub Release
     needs: build
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
+      - name: Check out tagged source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+
       - name: Download all assets
         uses: actions/download-artifact@v4
         with:
@@ -127,6 +136,90 @@ jobs:
       - name: Verify checksums
         working-directory: release
         run: sha256sum --check *.sha256
+
+      - name: Create and verify signed update manifest
+        shell: bash
+        env:
+          RELEASE_PRIVATE_KEY: ${{ secrets.IEUM_RELEASE_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          test -n "$RELEASE_PRIVATE_KEY" || {
+            echo "IEUM_RELEASE_PRIVATE_KEY secret is missing." >&2
+            exit 1
+          }
+
+          private_key="$RUNNER_TEMP/ieum-release-private.pem"
+          unsigned="$RUNNER_TEMP/update-manifest.unsigned.json"
+          signature="$RUNNER_TEMP/update-manifest.signature"
+          public_key="$RUNNER_TEMP/ieum-release-public.pem"
+          cleanup() { rm -f "$private_key" "$unsigned" "$signature" "$public_key"; }
+          trap cleanup EXIT
+          umask 077
+          printf '%s\n' "$RELEASE_PRIVATE_KEY" > "$private_key"
+
+          openssl pkey -in "$private_key" -check -noout
+          openssl pkey -in "$private_key" -pubout -out "$public_key"
+
+          expected_key="$(python -c 'import json; print(json.load(open("config/update.json"))["release_public_key"])')"
+          actual_key="$(openssl pkey -in "$private_key" -pubout -outform DER 2>/dev/null | tail -c 32 | python -c 'import sys; print(sys.stdin.buffer.read().hex())')"
+          test "$expected_key" = "$actual_key" || {
+            echo "Release secret does not match config/update.json public key." >&2
+            exit 1
+          }
+
+          version="${RELEASE_TAG#v}"
+          protocol_version="$(sed -n 's/^const SUPPORTED_PROTOCOL_VERSION: u32 = \([0-9][0-9]*\);/\1/p' src/main.rs | head -n1)"
+          artifact_sha256="$(awk '{print $1}' release/ieum-chain-linux-x86_64.sha256)"
+          published_at="$(date +%s)"
+          test -n "$protocol_version"
+          test "${#artifact_sha256}" -eq 64
+
+          VERSION="$version" \
+          PROTOCOL_VERSION="$protocol_version" \
+          PUBLISHED_AT="$published_at" \
+          ARTIFACT_SHA256="$artifact_sha256" \
+          UNSIGNED_MANIFEST="$unsigned" \
+          python - <<'PY'
+          import json
+          import os
+
+          manifest = {
+              "version": os.environ["VERSION"],
+              "protocol_version": int(os.environ["PROTOCOL_VERSION"]),
+              "mandatory": False,
+              "published_at": int(os.environ["PUBLISHED_AT"]),
+              "notes": f"IEUM Chain v{os.environ['VERSION']} signed release",
+              "artifacts": {
+                  "linux-x86_64": {
+                      "url": "https://github.com/c4ei/ieum-chain/releases/latest/download/ieum-chain-linux-x86_64",
+                      "sha256": os.environ["ARTIFACT_SHA256"],
+                  }
+              },
+          }
+          with open(os.environ["UNSIGNED_MANIFEST"], "w", encoding="utf-8") as file:
+              json.dump(manifest, file, ensure_ascii=False, separators=(",", ":"))
+          PY
+
+          openssl pkeyutl -sign -rawin -inkey "$private_key" \
+            -in "$unsigned" -out "$signature"
+          openssl pkeyutl -verify -rawin -pubin -inkey "$public_key" \
+            -in "$unsigned" -sigfile "$signature"
+
+          UNSIGNED_MANIFEST="$unsigned" \
+          SIGNATURE_FILE="$signature" \
+          SIGNED_MANIFEST="release/update-manifest.json" \
+          python - <<'PY'
+          import json
+          import os
+          import pathlib
+
+          with open(os.environ["UNSIGNED_MANIFEST"], encoding="utf-8") as file:
+              manifest = json.load(file)
+          manifest["signature"] = pathlib.Path(os.environ["SIGNATURE_FILE"]).read_bytes().hex()
+          with open(os.environ["SIGNED_MANIFEST"], "w", encoding="utf-8") as file:
+              json.dump(manifest, file, ensure_ascii=False, indent=2)
+              file.write("\n")
+          PY
 
       - name: Create release
         env:
