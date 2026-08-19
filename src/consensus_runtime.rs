@@ -4,11 +4,13 @@ use crate::consensus::{
     BftConsensus, ConsensusMessage, ConsensusPhase, DoubleVoteEvidence, FinalityCertificate,
     SignedProposal, Validator, VoteType,
 };
+use crate::consensus_era::SignedRoundChange;
 use crate::model::Block;
 use crate::scheduled_event::{EventSchedule, MAX_CLOCK_DRIFT_SECONDS};
 use crate::signer::ValidatorSigner;
 use crate::snapshot_sync::SnapshotAttestation;
 use crate::wallet::Wallet;
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy, Debug)]
@@ -49,6 +51,7 @@ pub struct ConsensusRuntime {
     validators: Vec<Validator>,
     precommits: Vec<ConsensusMessage>,
     deferred_votes: Vec<ConsensusMessage>,
+    round_change_votes: HashMap<(u64, u32), Vec<SignedRoundChange>>,
     finalized: Vec<FinalityCertificate>,
     pending_finalized: Vec<FinalityCertificate>,
     event_schedule: EventSchedule,
@@ -116,6 +119,7 @@ impl ConsensusRuntime {
             validators,
             precommits: Vec::new(),
             deferred_votes: Vec::new(),
+            round_change_votes: HashMap::new(),
             finalized: Vec::new(),
             pending_finalized: Vec::new(),
             event_schedule: EventSchedule::default(),
@@ -273,6 +277,86 @@ impl ConsensusRuntime {
         Ok(None)
     }
 
+    /// Tendermint 계열의 라운드 catch-up 규칙입니다.
+    ///
+    /// - 등록 검증자 투표권 1/3 초과가 더 높은 라운드에서 관측되면 해당 라운드로
+    ///   따라가서 시간차로 영구 분리되지 않게 합니다.
+    /// - 2/3 초과 round-change이면 그 라운드는 종료된 것으로 보고 다음 라운드로
+    ///   이동합니다.
+    pub fn receive_round_change(&mut self, vote: SignedRoundChange) -> Result<bool, String> {
+        const MAX_FUTURE_ROUND_DISTANCE: u32 = 4_096;
+        const MAX_TRACKED_ROUNDS: usize = 128;
+        vote.verify()?;
+        if vote.chain_id != self.chain.chain_id
+            || vote.genesis_commitment != self.chain.genesis_commitment
+        {
+            return Err("다른 체인의 round-change 메시지입니다.".into());
+        }
+        if vote.height != self.consensus.height() {
+            return Err("현재 높이와 다른 round-change 메시지입니다.".into());
+        }
+        if !self
+            .validators
+            .iter()
+            .any(|validator| validator.id == vote.validator_id)
+        {
+            return Err("등록되지 않은 검증자의 round-change 메시지입니다.".into());
+        }
+        let current_round = self.consensus.round();
+        if vote.round > current_round.saturating_add(MAX_FUTURE_ROUND_DISTANCE) {
+            return Err("round-change 메시지가 허용된 미래 범위를 넘었습니다.".into());
+        }
+        let key = (vote.height, vote.round);
+        let votes = self.round_change_votes.entry(key).or_default();
+        if !votes
+            .iter()
+            .any(|known| known.validator_id == vote.validator_id)
+        {
+            votes.push(vote);
+        }
+        let signed_power: u64 = votes
+            .iter()
+            .filter_map(|message| {
+                self.validators
+                    .iter()
+                    .find(|validator| validator.id == message.validator_id)
+                    .map(|validator| validator.voting_power)
+            })
+            .sum();
+        let total_power: u64 = self
+            .validators
+            .iter()
+            .map(|validator| validator.voting_power)
+            .sum();
+        if self.round_change_votes.len() > MAX_TRACKED_ROUNDS
+            && let Some(oldest) = self.round_change_votes.keys().min().copied()
+        {
+            self.round_change_votes.remove(&oldest);
+        }
+        let catch_up = signed_power.saturating_mul(3) > total_power;
+        let round_change_quorum = signed_power.saturating_mul(3) > total_power.saturating_mul(2);
+        let target_round = if round_change_quorum {
+            key.1
+                .checked_add(1)
+                .ok_or("합의 라운드 번호가 범위를 넘었습니다.")?
+        } else {
+            key.1
+        };
+        if catch_up && target_round > self.consensus.round() {
+            self.consensus.start_round(key.0, target_round)?;
+            self.pending = None;
+            self.precommits.clear();
+            self.deferred_votes
+                .retain(|message| message.height == key.0 && message.round >= target_round);
+            self.round_change_votes.retain(|&(height, round), _| {
+                height == key.0 && round.saturating_add(1) >= target_round
+            });
+            self.reset_deadline();
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
     /// GossipSub에서 제안보다 먼저 도착한 정상 투표를 단계 전환 때까지 보관합니다.
     pub fn defer_vote(&mut self, vote: ConsensusMessage) {
         const MAX_DEFERRED_VOTES: usize = 1_024;
@@ -318,14 +402,61 @@ impl ConsensusRuntime {
     }
 
     pub fn timeout_if_due(&mut self, now: Instant) -> Result<bool, String> {
+        self.timeout_if_due_with_round_change(now)
+            .map(|(timed_out, _)| timed_out)
+    }
+
+    /// 각 단계는 설정된 deadline까지만 기다립니다. timeout 시 현재 라운드의 서명된
+    /// 별도 도메인 서명 메시지를 반환하여 다른 검증자도 라운드 변경을 확인하게 합니다.
+    pub fn timeout_if_due_with_round_change(
+        &mut self,
+        now: Instant,
+    ) -> Result<(bool, Option<SignedRoundChange>), String> {
         if now < self.deadline || self.consensus.phase() == ConsensusPhase::Finalized {
-            return Ok(false);
+            return Ok((false, None));
         }
-        self.consensus.on_timeout()?;
+        let height = self.consensus.height();
+        let round = self.consensus.round();
+        let validator_id = self.validator.address();
+        let signature = self
+            .validator
+            .sign_bytes(&SignedRoundChange::bytes_to_sign(
+                self.chain.chain_id,
+                &self.chain.genesis_commitment,
+                height,
+                round,
+                &validator_id,
+            ))?;
+        let round_change = SignedRoundChange::from_signature(
+            self.chain.chain_id,
+            self.chain.genesis_commitment.clone(),
+            height,
+            round,
+            validator_id,
+            signature,
+        )?;
+        self.receive_round_change(round_change.clone())?;
+        if self.consensus.round() == round_change.round {
+            self.consensus.on_timeout()?;
+        }
         self.pending = None;
         self.precommits.clear();
         self.deadline = now + self.timeouts.propose;
-        Ok(true)
+        Ok((true, Some(round_change)))
+    }
+
+    /// 피어 재연결 시 최근 서명된 round-change 투표를 다시 전파하기 위한 제한된
+    /// snapshot입니다. 오래된 높이는 보관하지 않습니다.
+    pub fn round_change_snapshot(&self) -> Vec<SignedRoundChange> {
+        let height = self.consensus.height();
+        let mut votes: Vec<_> = self
+            .round_change_votes
+            .iter()
+            .filter(|((known_height, _), _)| *known_height == height)
+            .flat_map(|(_, votes)| votes.iter().cloned())
+            .collect();
+        votes.sort_by_key(|message| message.round);
+        votes.into_iter().rev().take(64).collect()
     }
 
     /// 거래가 없는 동안 합의 라운드를 쉬었다가 다시 활성화할 때, 노드 시작 시점의
@@ -475,6 +606,7 @@ impl ConsensusRuntime {
             self.pending = None;
             self.valid_block = None;
             self.precommits.clear();
+            self.round_change_votes.clear();
             self.reset_deadline();
         }
         Ok(applied)
@@ -490,6 +622,7 @@ impl ConsensusRuntime {
         self.pending = None;
         self.valid_block = None;
         self.precommits.clear();
+        self.round_change_votes.clear();
         self.reset_deadline();
         Ok(())
     }
@@ -542,6 +675,7 @@ impl ConsensusRuntime {
         self.validators = validators;
         self.valid_block = None;
         self.precommits.clear();
+        self.round_change_votes.clear();
         self.reset_deadline();
         Ok(())
     }
@@ -835,5 +969,156 @@ mod tests {
                 .timeout_if_due(work_arrived + Duration::from_millis(10))
                 .unwrap()
         );
+    }
+
+    #[test]
+    fn higher_round_messages_catch_up_then_quorum_advances() {
+        let keys: Vec<_> = (1..=4)
+            .map(|value| Wallet::from_seed([value; 32]))
+            .collect();
+        let validators = keys
+            .iter()
+            .map(|key| Validator::new(key.address(), 100))
+            .collect();
+        let chain = Blockchain::new(vec![(keys[0].address(), 1_000)]);
+        let mut runtime = ConsensusRuntime::new(
+            chain,
+            validators,
+            Wallet::from_seed([1; 32]),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        let chain_id = runtime.chain.chain_id;
+        let genesis_commitment = runtime.chain.genesis_commitment.clone();
+
+        runtime
+            .receive_round_change(SignedRoundChange::new(
+                chain_id,
+                genesis_commitment.clone(),
+                1,
+                7,
+                &keys[1],
+            ))
+            .unwrap();
+        assert_eq!(runtime.round(), 0);
+
+        runtime
+            .receive_round_change(SignedRoundChange::new(
+                chain_id,
+                genesis_commitment.clone(),
+                1,
+                7,
+                &keys[2],
+            ))
+            .unwrap();
+        assert_eq!(runtime.round(), 7);
+
+        runtime
+            .receive_round_change(SignedRoundChange::new(
+                chain_id,
+                genesis_commitment,
+                1,
+                7,
+                &keys[3],
+            ))
+            .unwrap();
+        assert_eq!(runtime.round(), 8);
+    }
+
+    #[test]
+    fn unregistered_round_change_cannot_force_a_jump() {
+        let keys: Vec<_> = (1..=4)
+            .map(|value| Wallet::from_seed([value; 32]))
+            .collect();
+        let validators = keys
+            .iter()
+            .map(|key| Validator::new(key.address(), 100))
+            .collect();
+        let chain = Blockchain::new(vec![(keys[0].address(), 1_000)]);
+        let mut runtime = ConsensusRuntime::new(
+            chain,
+            validators,
+            Wallet::from_seed([1; 32]),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        let outsider = Wallet::from_seed([99; 32]);
+        let chain_id = runtime.chain.chain_id;
+        let genesis_commitment = runtime.chain.genesis_commitment.clone();
+
+        let error = runtime
+            .receive_round_change(SignedRoundChange::new(
+                chain_id,
+                genesis_commitment,
+                1,
+                50,
+                &outsider,
+            ))
+            .unwrap_err();
+
+        assert_eq!(error, "등록되지 않은 검증자의 round-change 메시지입니다.");
+        assert_eq!(runtime.round(), 0);
+    }
+
+    #[test]
+    fn round_change_from_another_chain_is_rejected() {
+        let keys: Vec<_> = (1..=4)
+            .map(|value| Wallet::from_seed([value; 32]))
+            .collect();
+        let validators = keys
+            .iter()
+            .map(|key| Validator::new(key.address(), 100))
+            .collect();
+        let chain = Blockchain::new(vec![(keys[0].address(), 1_000)]);
+        let mut runtime = ConsensusRuntime::new(
+            chain,
+            validators,
+            Wallet::from_seed([1; 32]),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        let message = SignedRoundChange::new(
+            runtime.chain.chain_id + 1,
+            runtime.chain.genesis_commitment.clone(),
+            1,
+            7,
+            &keys[1],
+        );
+
+        let error = runtime.receive_round_change(message).unwrap_err();
+
+        assert_eq!(error, "다른 체인의 round-change 메시지입니다.");
+        assert_eq!(runtime.round(), 0);
+    }
+
+    #[test]
+    fn timeout_is_bounded_and_emits_signed_round_change() {
+        let keys: Vec<_> = (1..=4)
+            .map(|value| Wallet::from_seed([value; 32]))
+            .collect();
+        let validators = keys
+            .iter()
+            .map(|key| Validator::new(key.address(), 100))
+            .collect();
+        let chain = Blockchain::new(vec![(keys[0].address(), 1_000)]);
+        let mut runtime = ConsensusRuntime::new(
+            chain,
+            validators,
+            Wallet::from_seed([1; 32]),
+            Duration::from_millis(10),
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        runtime.restart_phase_timeout(deadline);
+
+        let (timed_out, vote) = runtime
+            .timeout_if_due_with_round_change(deadline + Duration::from_millis(10))
+            .unwrap();
+        let vote = vote.unwrap();
+
+        assert!(timed_out);
+        assert_eq!(runtime.round(), 1);
+        assert_eq!(vote.round, 0);
+        vote.verify().unwrap();
     }
 }

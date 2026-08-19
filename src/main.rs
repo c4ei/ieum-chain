@@ -1015,15 +1015,23 @@ async fn main() -> Result<(), String> {
                 if consensus_is_active && !consensus_was_active {
                     consensus.restart_phase_timeout(timeout_now);
                 }
-                if consensus_is_active
-                    && consensus.timeout_if_due(timeout_now)?
-                {
-                    rpc.restore_transactions(timed_out_transactions)?;
-                    print!(
-                        "\r\x1b[2K[BFT 라운드 변경] 단계별 제한 시간 초과, 새 라운드 {}",
-                        consensus.round()
-                    );
-                    io::stdout().flush().map_err(|error| error.to_string())?;
+                if consensus_is_active {
+                    let (timed_out, round_change) =
+                        consensus.timeout_if_due_with_round_change(timeout_now)?;
+                    if timed_out {
+                        rpc.restore_transactions(timed_out_transactions)?;
+                        if let Some(vote) = round_change {
+                            commands
+                                .send(NetworkCommand::PublishRoundChange(vote))
+                                .await
+                                .map_err(|error| error.to_string())?;
+                        }
+                        print!(
+                            "\r\x1b[2K[BFT 라운드 변경] 단계별 제한 시간 초과, 새 라운드 {}",
+                            consensus.round()
+                        );
+                        io::stdout().flush().map_err(|error| error.to_string())?;
+                    }
                 }
                 consensus_was_active = consensus_is_active;
                 if !is_client && local_is_validator {
@@ -1031,24 +1039,23 @@ async fn main() -> Result<(), String> {
                         consensus.chain.tip_height().saturating_add(1),
                         SUPPORTED_PROTOCOL_VERSION,
                     )?;
-                    // RPC가 어느 노드로 들어와도 현재 제안자가 받을 수 있게 읽기 전용으로 전파합니다.
-                    // 비제안자는 drain_transactions를 호출하지 않으므로 원본 거래는 그대로 보존됩니다.
-                    if !consensus.can_make_proposal() {
-                        let now = std::time::Instant::now();
-                        for transaction in rpc.pending_transactions_snapshot(1_000)? {
-                            let transaction_id = transaction.id();
-                            let should_publish = announced_transactions
-                                .get(&transaction_id)
-                                .is_none_or(|last| now.duration_since(*last) >= Duration::from_secs(2));
-                            if !should_publish {
-                                continue;
-                            }
-                            commands
-                                .send(NetworkCommand::PublishTransaction(transaction))
-                                .await
-                                .map_err(|error| error.to_string())?;
-                            announced_transactions.insert(transaction_id, now);
+                    // RPC가 어느 노드로 들어와도 모든 검증자가 거래를 보관하고 현재
+                    // 제안자가 받을 수 있게 2초 간격으로 재전파합니다. 제안자 역시
+                    // proposal 실패·라운드 변경에 대비해 거래를 먼저 gossip합니다.
+                    let now = std::time::Instant::now();
+                    for transaction in rpc.pending_transactions_snapshot(1_000)? {
+                        let transaction_id = transaction.id();
+                        let should_publish = announced_transactions
+                            .get(&transaction_id)
+                            .is_none_or(|last| now.duration_since(*last) >= Duration::from_secs(2));
+                        if !should_publish {
+                            continue;
                         }
+                        commands
+                            .send(NetworkCommand::PublishTransaction(transaction))
+                            .await
+                            .map_err(|error| error.to_string())?;
+                        announced_transactions.insert(transaction_id, now);
                     }
                     let timestamp = unix_timestamp();
                     let mut due_events =
@@ -1216,6 +1223,10 @@ async fn main() -> Result<(), String> {
                         commands.send(NetworkCommand::RequestSync {
                             from_height: consensus.chain.tip_height() + 1,
                         }).await.map_err(|e| e.to_string())?;
+                        for vote in consensus.round_change_snapshot() {
+                            commands.send(NetworkCommand::PublishRoundChange(vote))
+                                .await.map_err(|error| error.to_string())?;
+                        }
                         if let Some(registration) = &local_registration {
                             commands.send(NetworkCommand::PublishValidatorRegistration(registration.clone()))
                                 .await.map_err(|e| e.to_string())?;
@@ -1403,6 +1414,16 @@ async fn main() -> Result<(), String> {
                             &commands,
                         ).await?;
                         finalize_if_ready(&mut consensus, &rpc, &commands, &finality_store).await?;
+                    }
+                    Some(NetworkEvent::RoundChangeReceived { message, .. }) if !is_client && local_is_validator => {
+                        match consensus.receive_round_change(message) {
+                            Ok(true) => log_info!(
+                                "[BFT 라운드 catch-up] 서명 quorum 확인, 현재 라운드 {}",
+                                consensus.round()
+                            ),
+                            Ok(false) => {}
+                            Err(error) => log_error!("[BFT 라운드 변경 거부] {error}"),
+                        }
                     }
                     Some(NetworkEvent::EvidenceReceived { evidence, .. }) => {
                         let registered = validators

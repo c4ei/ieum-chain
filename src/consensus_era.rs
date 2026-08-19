@@ -6,6 +6,101 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 /// IEUM의 nil 값은 빈 문자열 대신 고정 도메인 값을 사용합니다.
 pub const NIL_BLOCK_HASH: &str = "ieum:nil";
 
+/// 블록 prevote/precommit과 분리된 라운드 변경 신호입니다. 같은 라운드의 블록에
+/// 이미 투표한 검증자도 이중투표를 만들지 않고 timeout 사실을 알릴 수 있습니다.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SignedRoundChange {
+    pub chain_id: u64,
+    pub genesis_commitment: String,
+    pub height: u64,
+    pub round: u32,
+    pub validator_id: String,
+    pub signature: String,
+}
+
+impl SignedRoundChange {
+    pub fn new(
+        chain_id: u64,
+        genesis_commitment: impl Into<String>,
+        height: u64,
+        round: u32,
+        validator: &Wallet,
+    ) -> Self {
+        let genesis_commitment = genesis_commitment.into();
+        let validator_id = validator.address();
+        let signature = validator.sign_bytes(&Self::bytes_to_sign(
+            chain_id,
+            &genesis_commitment,
+            height,
+            round,
+            &validator_id,
+        ));
+        Self {
+            chain_id,
+            genesis_commitment,
+            height,
+            round,
+            validator_id,
+            signature,
+        }
+    }
+
+    pub fn from_signature(
+        chain_id: u64,
+        genesis_commitment: String,
+        height: u64,
+        round: u32,
+        validator_id: String,
+        signature: String,
+    ) -> Result<Self, String> {
+        let message = Self {
+            chain_id,
+            genesis_commitment,
+            height,
+            round,
+            validator_id,
+            signature,
+        };
+        message.verify()?;
+        Ok(message)
+    }
+
+    pub fn bytes_to_sign(
+        chain_id: u64,
+        genesis_commitment: &str,
+        height: u64,
+        round: u32,
+        validator_id: &str,
+    ) -> Vec<u8> {
+        let mut bytes = b"IEUM-ROUND-CHANGE-V1".to_vec();
+        bytes.extend_from_slice(&chain_id.to_be_bytes());
+        push_round_change_text(&mut bytes, genesis_commitment);
+        bytes.extend_from_slice(&height.to_be_bytes());
+        bytes.extend_from_slice(&round.to_be_bytes());
+        push_round_change_text(&mut bytes, validator_id);
+        bytes
+    }
+
+    pub fn verify(&self) -> Result<(), String> {
+        crate::wallet::verify_signature(
+            &self.validator_id,
+            &Self::bytes_to_sign(
+                self.chain_id,
+                &self.genesis_commitment,
+                self.height,
+                self.round,
+                &self.validator_id,
+            ),
+            &self.signature,
+        )
+    }
+}
+
+fn push_round_change_text(bytes: &mut Vec<u8>, value: &str) {
+    bytes.extend_from_slice(&(value.len() as u64).to_be_bytes());
+    bytes.extend_from_slice(value.as_bytes());
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct NilVote {
     pub message: ConsensusMessage,
