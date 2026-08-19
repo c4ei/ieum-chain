@@ -23,7 +23,7 @@ use tokio::net::lookup_host;
 use tokio::sync::mpsc;
 
 pub const BLOCK_TOPIC: &str = "ieum-chain/blocks/1";
-pub const CONSENSUS_TOPIC: &str = "ieum-chain/consensus/1";
+pub const CONSENSUS_TOPIC: &str = "ieum-chain/consensus/2";
 pub const SYNC_TOPIC: &str = "ieum-chain/sync/2";
 pub const COMMUNICATION_PROTOCOL: &str = "/ieum-chain/communication/1";
 // The suffix is one binary framing-version byte, not the four text bytes "\x01".
@@ -591,7 +591,7 @@ impl P2pNode {
                     let mut kademlia = kad::Behaviour::new(peer_id, store);
                     kademlia.set_mode(Some(kad::Mode::Server));
                     let identify = identify::Behaviour::new(identify::Config::new(
-                        "/ieum-chain/1.1.0".into(),
+                        "/ieum-chain/1.2.0".into(),
                         key.public(),
                     ));
                     let communication = request_response::cbor::Behaviour::new(
@@ -1509,6 +1509,39 @@ mod connection_log_tests {
         match decoded {
             WireMessage::Proposal(decoded) => assert_eq!(decoded, proposal),
             _ => panic!("제안 WireMessage가 다른 종류로 역직렬화되었습니다."),
+        }
+    }
+
+    #[test]
+    fn p2p_proposal_preserves_valid_round_prevote_certificate() {
+        let validators: Vec<_> = (40..=43)
+            .map(|value| Wallet::from_seed([value; 32]))
+            .collect();
+        let proposer = &validators[3];
+        let block = Block::new(
+            1,
+            Block::genesis().hash,
+            1_785_942_001,
+            proposer.address(),
+            Vec::new(),
+        );
+        let prevotes = validators
+            .iter()
+            .take(3)
+            .map(|validator| crate::ConsensusMessage::prevote(1, 1, validator, &block.hash))
+            .collect();
+        let proposal =
+            SignedProposal::with_valid_round_certificate(1, 2, proposer, block, Some(1), prevotes);
+        let bytes = encode_wire_message(&WireMessage::Proposal(proposal.clone())).unwrap();
+        let decoded = decode_wire_message(&bytes, 2 * 1024 * 1024).unwrap();
+
+        match decoded {
+            WireMessage::Proposal(decoded) => {
+                assert_eq!(decoded, proposal);
+                assert_eq!(decoded.valid_round_prevotes.len(), 3);
+                decoded.verify().unwrap();
+            }
+            _ => panic!("valid_round 인증서 Proposal이 다른 종류로 역직렬화되었습니다."),
         }
     }
 

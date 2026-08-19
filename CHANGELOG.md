@@ -1,5 +1,15 @@
 # 변경 기록
 
+## 0.23.7 - 2026-08-19
+
+- 제안의 `valid_round`에 해당하는 2/3 초과 서명 prevote 인증서를 함께 전파하고 검증
+- 다른 값에 잠긴 노드는 인증서 라운드가 자기 잠금 라운드 이상일 때만 안전하게 전환
+- 제안 서명 도메인을 `IEUM-PROPOSAL-V3`로 올리고 인증서 서명 목록까지 결합
+- 합의 topic을 `ieum-chain/consensus/2`, Identify protocol을 `/ieum-chain/1.2.0`으로 분리
+- 4검증자·5P2P 노드의 의미와 LAN/DNS 광고 주소 운영 기준 문서화
+- 자동 업데이트 manifest를 서명된 최신 GitHub Release 자산에서 조회
+- GitHub Linux release 작업의 APT 재시도·타임아웃을 제한해 무기한 대기 방지
+
 ## 0.23.6 - 2026-08-19
 
 - 합의 단계별 timeout 시 블록 투표와 분리된 검증자 서명 round-change를 P2P로 전파
