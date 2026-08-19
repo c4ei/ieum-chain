@@ -57,7 +57,7 @@ pub use consensus::{
     SignedProposal, Validator,
 };
 pub use consensus_era::{
-    EraConfig, EraManager, NilVote, RoundChangeCertificate, ValidatorSetUpdate,
+    EraConfig, EraManager, NilVote, RoundChangeCertificate, SignedRoundChange, ValidatorSetUpdate,
 };
 pub use consensus_runtime::{ConsensusRuntime, ConsensusTimeouts};
 pub use consensus_wal::ConsensusWal;

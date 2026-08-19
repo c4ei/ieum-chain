@@ -588,6 +588,10 @@ impl BftConsensus {
         self.round
     }
 
+    pub fn height(&self) -> u64 {
+        self.height
+    }
+
     pub fn locked_value(&self) -> Option<(&str, u32)> {
         self.locked_value.as_deref().zip(self.locked_round)
     }

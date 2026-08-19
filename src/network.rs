@@ -1,5 +1,6 @@
 use crate::communication::{CommunicationAck, CommunicationEnvelope};
 use crate::consensus::{ConsensusMessage, DoubleVoteEvidence, FinalityCertificate, SignedProposal};
+use crate::consensus_era::SignedRoundChange;
 use crate::model::{Block, Transaction};
 use crate::peer_guard::{PeerDecision, PeerGuard};
 use crate::snapshot_sync::{SnapshotAttestation, SyncTip};
@@ -190,6 +191,8 @@ pub enum WireMessage {
         certificates: Vec<FinalityCertificate>,
     },
     SnapshotAttestation(SnapshotAttestation),
+    // 새 variant는 bincode enum index 호환성을 위해 항상 기존 variant 뒤에 추가합니다.
+    RoundChange(SignedRoundChange),
 }
 
 /// 노드 코어가 비동기 P2P 작업에 보내는 명령입니다.
@@ -198,6 +201,7 @@ pub enum NetworkCommand {
     PublishBlock(Block),
     PublishTransaction(Transaction),
     PublishConsensus(ConsensusMessage),
+    PublishRoundChange(SignedRoundChange),
     PublishProposal(SignedProposal),
     PublishEvidence(DoubleVoteEvidence),
     PublishValidatorRegistration(ValidatorRegistration),
@@ -263,6 +267,10 @@ pub enum NetworkEvent {
     ConsensusReceived {
         source: PeerId,
         message: ConsensusMessage,
+    },
+    RoundChangeReceived {
+        source: PeerId,
+        message: SignedRoundChange,
     },
     ProposalReceived {
         source: PeerId,
@@ -376,6 +384,11 @@ impl fmt::Display for NetworkEvent {
                     "[P2P 합의 수신] PeerId: {source}, 메시지: {message:?}"
                 )
             }
+            Self::RoundChangeReceived { source, message } => write!(
+                formatter,
+                "[P2P 라운드 변경 수신] PeerId: {source}, 높이: {}, 라운드: {}",
+                message.height, message.round
+            ),
             Self::ProposalReceived { source, proposal } => write!(
                 formatter,
                 "[P2P 제안 수신] PeerId: {source}, 높이: {}, 해시: {}",
@@ -676,6 +689,9 @@ impl P2pNode {
                             }
                             Some(NetworkCommand::PublishConsensus(message)) => {
                                 publish(&mut swarm, CONSENSUS_TOPIC, &WireMessage::Consensus(message));
+                            }
+                            Some(NetworkCommand::PublishRoundChange(message)) => {
+                                publish(&mut swarm, CONSENSUS_TOPIC, &WireMessage::RoundChange(message));
                             }
                             Some(NetworkCommand::PublishProposal(proposal)) => {
                                 publish(&mut swarm, CONSENSUS_TOPIC, &WireMessage::Proposal(proposal));
@@ -1141,6 +1157,10 @@ async fn handle_swarm_event(
                     source: propagation_source,
                     message,
                 },
+                WireMessage::RoundChange(message) => NetworkEvent::RoundChangeReceived {
+                    source: propagation_source,
+                    message,
+                },
                 WireMessage::Proposal(proposal) => NetworkEvent::ProposalReceived {
                     source: propagation_source,
                     proposal,
@@ -1440,8 +1460,27 @@ fn format_duration(duration: Duration) -> String {
 mod connection_log_tests {
     use super::*;
     use crate::{
-        Block, CommunicationKind, ScheduledEvent, ScheduledEventAction, SignedProposal, Wallet,
+        Block, CommunicationKind, ScheduledEvent, ScheduledEventAction, SignedProposal,
+        SignedRoundChange, Wallet,
     };
+
+    #[test]
+    fn signed_round_change_round_trips_on_consensus_wire() {
+        let validator = Wallet::from_seed([30; 32]);
+        let message = SignedRoundChange::new(21_004, "0xgenesis", 9, 117, &validator);
+        let wire = WireMessage::RoundChange(message.clone());
+
+        let bytes = encode_wire_message(&wire).unwrap();
+        let decoded = decode_wire_message(&bytes, 2 * 1024 * 1024).unwrap();
+
+        match decoded {
+            WireMessage::RoundChange(decoded) => {
+                assert_eq!(decoded, message);
+                decoded.verify().unwrap();
+            }
+            _ => panic!("round-change WireMessage가 다른 종류로 역직렬화되었습니다."),
+        }
+    }
 
     #[test]
     fn p2p_proposal_with_u128_transaction_round_trips() {

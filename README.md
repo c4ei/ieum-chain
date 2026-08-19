@@ -1,4 +1,11 @@
-# IEUM Chain v0.23.5 메인넷 실행 안내
+# IEUM Chain v0.23.6 메인넷 실행 안내
+
+v0.23.6은 검증 노드의 합의 라운드가 어긋났을 때 재시작 없이 복구하도록 블록 투표와
+분리된 서명 round-change 기반 catch-up을 실제 런타임에 연결합니다. 모든 합의 단계에는
+기존 제한시간이 적용되며, 1/3 초과 투표권으로 더 높은 라운드를 따라가고 2/3 초과
+round-change로 다음 라운드에 진입합니다. 배포·검증 절차는
+[`docs/VERSION_0.23.6_BFT_ROUND_RECOVERY.md`](docs/VERSION_0.23.6_BFT_ROUND_RECOVERY.md)를
+참고하세요.
 
 v0.23.0은 실제 잠금형 `delegate / undelegate / claim`, 합의 시각 기준 7일 해제 대기,
 위임자별 일일 보상, 이중투표 증거 기반 5% 페널티와 상태·스냅샷 회계를 추가합니다.
