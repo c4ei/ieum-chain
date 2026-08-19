@@ -374,6 +374,7 @@ mod tests {
     fn sample() -> StateSnapshot {
         StateSnapshot {
             chain_id: 21_004,
+            genesis_commitment: "genesis-test-commitment".into(),
             height: 7,
             block_hash: "block".into(),
             state_hash: "state".into(),

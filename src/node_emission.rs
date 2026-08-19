@@ -9,8 +9,13 @@ use sha2::{Digest, Sha256};
 pub const IEUM_DECIMALS: u32 = 18;
 pub const IEUM: u128 = 10u128.pow(IEUM_DECIMALS);
 
-/// Normal 노드에 2040년 말까지 지급할 별도 발행 상한입니다.
-pub const TOTAL_NODE_EMISSION_IEUM: u128 = 210_000_000;
+/// Genesis와 향후 모든 신규 발행을 합한 IEUM 전역 최대 공급량입니다.
+pub const MAX_SUPPLY_IEUM: u128 = 210_000_000;
+pub const MAX_SUPPLY: u128 = MAX_SUPPLY_IEUM * IEUM;
+/// v0.23.5 메인넷 Genesis 공급량입니다.
+pub const MAINNET_GENESIS_SUPPLY_IEUM: u128 = 80_100;
+/// Normal 노드에 2040년 말까지 신규 발행할 수 있는 잔여 상한입니다.
+pub const TOTAL_NODE_EMISSION_IEUM: u128 = MAX_SUPPLY_IEUM - MAINNET_GENESIS_SUPPLY_IEUM;
 pub const TOTAL_NODE_EMISSION: u128 = TOTAL_NODE_EMISSION_IEUM * IEUM;
 
 /// 현재 0번 블록인 운영망에 100블록의 업그레이드 여유를 둡니다.
@@ -159,6 +164,10 @@ mod tests {
         assert_eq!(
             (0..years).map(annual_budget).sum::<u128>(),
             TOTAL_NODE_EMISSION
+        );
+        assert_eq!(
+            TOTAL_NODE_EMISSION + MAINNET_GENESIS_SUPPLY_IEUM * IEUM,
+            MAX_SUPPLY
         );
         for year in 0..years - 2 {
             assert!(annual_budget(year) >= annual_budget(year + 1) * 2);

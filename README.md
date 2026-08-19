@@ -1,9 +1,13 @@
-# IEUM Chain v0.23.0 쉬운 실행 안내
+# IEUM Chain v0.23.5 메인넷 실행 안내
 
 v0.23.0은 실제 잠금형 `delegate / undelegate / claim`, 합의 시각 기준 7일 해제 대기,
 위임자별 일일 보상, 이중투표 증거 기반 5% 페널티와 상태·스냅샷 회계를 추가합니다.
 운영 활성화 전 반드시 [`docs/VERSION_0.23.0.md`](docs/VERSION_0.23.0.md)의
 프로토콜 v3 공동 전환 절차를 따르세요.
+
+v0.23.5의 메인넷 Genesis, 최초 배분 공개 절차, 일반 보유·최초 참여 보상 및
+장애·이중서명·키 탈취 훈련은
+[`docs/VERSION_0.23.5_MAINNET_TOKENOMICS_AND_DRILLS.md`](docs/VERSION_0.23.5_MAINNET_TOKENOMICS_AND_DRILLS.md)를 참고하세요.
 
 v0.22.6은 연결 유지 중 놓친 확정 블록을 5초 주기로 다시 동기화합니다. 자세한 내용은
 [`docs/VERSION_0.22.6_PERIODIC_SYNC_BALANCE_FIX.md`](docs/VERSION_0.22.6_PERIODIC_SYNC_BALANCE_FIX.md)를 참고하세요.
@@ -54,7 +58,7 @@ IEUM Chain은 Ubuntu와 Windows에서 실행할 수 있는 경량 블록체인 �
 첫 노드는 제네시스 상태에서 단독으로 시작할 수 있습니다. 장애 허용 BFT 검증은
 **Ubuntu VM 검증자 3대 + Windows VM 검증자 1대**처럼 4명 이상일 때 활성화합니다.
 
-> 아직 사설 테스트넷 단계입니다. 실제 자산이나 중요한 개인정보를 보관하지 마세요.
+> IEUM 메인넷은 Chain ID `21004`, 네트워크 이름 `ieum-mainnet`을 사용합니다. 운영자는 `--mainnet-strict`와 독립 백업을 사용해야 합니다.
 
 ## 가장 먼저 알아둘 것
 
@@ -68,7 +72,7 @@ IEUM Chain은 Ubuntu와 Windows에서 실행할 수 있는 경량 블록체인 �
 - 후보는 현재 검증자 승인과 다음 epoch 반영 전까지 합의 투표를 하지 않습니다.
 - 개인키 파일은 메일, 메신저, 클라우드 드라이브로 보내지 마세요.
 
-`--allow-insecure-test-keys`를 사용하는 개발망과 CI는 검증자 설정 4개를 자동
+`--allow-insecure-test-keys`를 사용하는 로컬 개발·CI 환경은 검증자 설정 4개를 자동
 생성하므로 `validators.json`을 사람이 만들 필요가 없습니다. 운영망에서는 이 옵션을
 절대 사용하지 않습니다.
 

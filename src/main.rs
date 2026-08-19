@@ -34,7 +34,7 @@ const SUPPORTED_PROTOCOL_VERSION: u32 = 3;
 mod installation;
 
 #[derive(Debug, Parser)]
-#[command(name = "ieum-chain", version, about = "가벼운 IEUM 테스트넷 노드")]
+#[command(name = "ieum-chain", version, about = "가벼운 IEUM 메인넷 노드")]
 struct Args {
     /// 실행 역할. 생략하면 기존 검증자 자격을 안전하게 감지하고 나머지는 일반 노드로
     /// 시작합니다.
@@ -357,7 +357,7 @@ struct NodeArgs {
     #[arg(long, default_value = "data/node.key")]
     node_key: PathBuf,
 
-    /// 4노드 테스트넷 검증자 번호(1~4). server에서만 사용합니다.
+    /// 4노드 초기 검증자 번호(1~4). server에서만 사용합니다.
     #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u8).range(1..=4))]
     validator_index: u8,
 
@@ -520,7 +520,7 @@ fn approved_local_validator(key: &Path, validators_config: &Path) -> bool {
         return false;
     }
     let result = ieum_chain::validator_key::public_key_from_file(key).and_then(|public_key| {
-        Ok(load_validators(validators_config)?
+        Ok(load_validators(validators_config, 21_004)?
             .iter()
             .any(|validator| validator.id.eq_ignore_ascii_case(&public_key)))
     });
@@ -636,6 +636,34 @@ async fn main() -> Result<(), String> {
         }
         None => automatic_or_selected_mode(cli.mode)?,
     };
+    let genesis_source = if args.git_action_test {
+        include_str!("../config/genesis_test.json")
+    } else {
+        include_str!("../config/genesis.json")
+    };
+    let genesis: GenesisConfig = serde_json::from_str(genesis_source).map_err(|error| {
+        format!(
+            "{} Genesis 설정 오류: {error}",
+            if args.git_action_test {
+                "CI"
+            } else {
+                "메인넷"
+            }
+        )
+    })?;
+    genesis.validate()?;
+    if args.git_action_test && genesis.chain_id != 21_005 {
+        return Err("CI Genesis chain_id는 21005여야 합니다.".into());
+    }
+    if !args.git_action_test && genesis.chain_id != 21_004 {
+        return Err("메인넷 Genesis chain_id는 21004여야 합니다.".into());
+    }
+    if args.mainnet_strict {
+        genesis.validate_production_safety()?;
+        if args.allow_insecure_test_keys || args.git_action_test {
+            return Err("--mainnet-strict는 테스트 키 옵션과 함께 사용할 수 없습니다.".into());
+        }
+    }
     // 서버는 P2P/RPC 포트 자체가 인스턴스 경계이므로 같은 장비에서 여러 검증자를
     // 실행할 수 있습니다. 일반 PC 클라이언트만 중복 실행을 차단합니다.
     let _instance_guard = if is_client {
@@ -643,6 +671,19 @@ async fn main() -> Result<(), String> {
     } else {
         None
     };
+    if !args.git_action_test {
+        installation::synchronize_bundled_mainnet_genesis(Path::new("config/genesis.json"))?;
+        let genesis_commitment = genesis.genesis_hash()?;
+        if let Some(backup) = installation::prepare_mainnet_ledger_transition(
+            &args.rpc_data_dir,
+            &genesis_commitment,
+        )? {
+            log_info!(
+                "[새 메인넷 전환] 기존 시험 원장을 보존했습니다: {}",
+                backup.display()
+            );
+        }
+    }
     if !is_client {
         init_server_log("data/logs/ieum-chain.log")?;
         installation::prepare_server_files(
@@ -695,37 +736,7 @@ async fn main() -> Result<(), String> {
     let startup_peers = config.bootstrap_peers.clone();
     let (peer_id, commands, mut events) = P2pNode::new(config).run().await?;
 
-    let mut genesis: GenesisConfig =
-        serde_json::from_str(include_str!("../config/genesis.json"))
-            .map_err(|error| format!("운영망 제네시스 설정 오류: {error}"))?;
-    if args.git_action_test {
-        genesis.initial_balances.extend([
-            (
-                "0xB0E5863D0DDf7e105e409Fee0eCC0123a362e14B".into(),
-                1_000_000_000_000_000_000,
-            ),
-            (
-                "0x3252b7b65e50B54508974dB8d634134B0bd6be90".into(),
-                1_000_000_000_000_000_000,
-            ),
-            (
-                "0xf0DCB0Ea878057Ff5C78C4737023f900ECe09e7B".into(),
-                1_000_000_000_000_000_000,
-            ),
-            (
-                "0xD5ac7674AC15E3Df0B7D737CF8Cb8f2Ea713F329".into(),
-                1_000_000_000_000_000_000,
-            ),
-        ]);
-    }
-    genesis.validate()?;
-    if args.mainnet_strict {
-        genesis.validate_production_safety()?;
-        if args.allow_insecure_test_keys || args.git_action_test {
-            return Err("--mainnet-strict는 테스트 키 옵션과 함께 사용할 수 없습니다.".into());
-        }
-    }
-    let mut validators = load_validators(&args.validators_config)?;
+    let mut validators = load_validators(&args.validators_config, genesis.chain_id)?;
     let validator_interest_policy =
         ieum_chain::ValidatorInterestPolicy::load(&args.validator_interest_config)?;
     let holder_reward_policy = ieum_chain::HolderRewardPolicy::load(&args.holder_rewards_config)?;
@@ -1250,7 +1261,11 @@ async fn main() -> Result<(), String> {
                                 selected.iter().map(|validator| validator.id.clone()).collect();
                             if current_ids != selected_ids {
                                 consensus.replace_bootstrap_validators(selected.clone())?;
-                                save_validators(&args.validators_config, &selected)?;
+                                save_validators(
+                                    &args.validators_config,
+                                    genesis.chain_id,
+                                    &selected,
+                                )?;
                                 validators = selected;
                                 local_is_validator = validators
                                     .iter()
@@ -2268,9 +2283,9 @@ fn verify_validator_registration(registration: &ValidatorRegistration) -> Result
     .map_err(|error| format!("검증자 소유권 서명 오류: {error}"))
 }
 
-fn save_validators(path: &Path, validators: &[Validator]) -> Result<(), String> {
+fn save_validators(path: &Path, chain_id: u64, validators: &[Validator]) -> Result<(), String> {
     let config = ValidatorConfig {
-        chain_id: "21004".into(),
+        chain_id: chain_id.to_string(),
         validators: validators.to_vec(),
     };
     let mut contents = serde_json::to_string_pretty(&config)
@@ -2312,13 +2327,15 @@ fn multiaddr_peer_id(address: &Multiaddr) -> Option<libp2p::PeerId> {
     })
 }
 
-fn load_validators(path: &Path) -> Result<Vec<Validator>, String> {
+fn load_validators(path: &Path, expected_chain_id: u64) -> Result<Vec<Validator>, String> {
     let text = fs::read_to_string(path)
         .map_err(|error| format!("검증자 설정 읽기 실패({}): {error}", path.display()))?;
     let config: ValidatorConfig = serde_json::from_str(&text)
         .map_err(|error| format!("검증자 설정 형식 오류({}): {error}", path.display()))?;
-    if config.chain_id != "21004" {
-        return Err("검증자 설정 chain_id는 21004여야 합니다.".into());
+    if config.chain_id != expected_chain_id.to_string() {
+        return Err(format!(
+            "검증자 설정 chain_id는 {expected_chain_id}여야 합니다."
+        ));
     }
     if config.validators.is_empty() {
         return Err("검증자는 최소 1개가 필요합니다.".into());

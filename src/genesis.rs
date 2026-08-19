@@ -104,16 +104,17 @@ mod tests {
     use crate::account::AccountWallet;
 
     #[test]
-    fn bundled_genesis_includes_transfer_test_balance() {
+    fn bundled_genesis_is_mainnet_safe_and_excludes_public_development_balances() {
         let genesis: GenesisConfig =
             serde_json::from_str(include_str!("../config/genesis.json")).unwrap();
         genesis.validate().unwrap();
+        assert_eq!(genesis.chain_id, 21_004);
         let total: u128 = genesis
             .initial_balances
             .iter()
             .map(|(_, value)| *value)
             .sum();
-        assert_eq!(total, 80_104u128 * 10u128.pow(18));
+        assert_eq!(total, 80_100u128 * 10u128.pow(18));
         for (key_byte, address) in (42u8..=45).zip([
             "0xB0E5863D0DDf7e105e409Fee0eCC0123a362e14B",
             "0x3252b7b65e50B54508974dB8d634134B0bd6be90",
@@ -122,11 +123,47 @@ mod tests {
         ]) {
             let wallet = AccountWallet::from_private_key([key_byte; 32]).unwrap();
             assert!(wallet.address().eq_ignore_ascii_case(address));
+            assert!(
+                !genesis
+                    .initial_balances
+                    .iter()
+                    .any(|(candidate, _)| candidate.eq_ignore_ascii_case(address))
+            );
+        }
+        assert_eq!(genesis.network_name, "ieum-mainnet");
+        genesis.validate_production_safety().unwrap();
+        assert_eq!(genesis.genesis_time, 1_787_065_200);
+        assert_eq!(
+            genesis.genesis_hash().unwrap(),
+            "c7a4f99b113341db7705117dedb240bb3ea3b0b99c115d134ddf505be1ff8a5a"
+        );
+    }
+
+    #[test]
+    fn ci_genesis_keeps_the_four_transfer_test_balances() {
+        let genesis: GenesisConfig =
+            serde_json::from_str(include_str!("../config/genesis_test.json")).unwrap();
+        genesis.validate().unwrap();
+        assert_eq!(genesis.chain_id, 21_005);
+        assert_eq!(genesis.network_name, "ieum-ci");
+        assert_eq!(
+            genesis
+                .initial_balances
+                .iter()
+                .map(|(_, value)| *value)
+                .sum::<u128>(),
+            80_104u128 * 10u128.pow(18)
+        );
+        for address in [
+            "0xB0E5863D0DDf7e105e409Fee0eCC0123a362e14B",
+            "0x3252b7b65e50B54508974dB8d634134B0bd6be90",
+            "0xf0DCB0Ea878057Ff5C78C4737023f900ECe09e7B",
+            "0xD5ac7674AC15E3Df0B7D737CF8Cb8f2Ea713F329",
+        ] {
             assert!(genesis.initial_balances.iter().any(|(candidate, balance)| {
                 candidate.eq_ignore_ascii_case(address) && *balance == 10u128.pow(18)
             }));
         }
-        assert_eq!(genesis.genesis_time, 1_785_942_000);
-        assert_eq!(genesis.genesis_hash().unwrap().len(), 64);
+        assert!(genesis.validate_production_safety().is_err());
     }
 }

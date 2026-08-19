@@ -1,7 +1,7 @@
 {
   "chain_id": 21004,
-  "network_name": "ieum-devnet",
-  "genesis_time": 1785942000,
+  "network_name": "ieum-mainnet",
+  "genesis_time": 1787065200,
   "initial_balances": [
     [
       "0xAda04f6eA65dc31079825e47296d0737A4594696",
@@ -38,22 +38,6 @@
     [
       "0x475e2f4e40Dbd34370e4fce61ddFF5Ff1F2eA817",
       100000000000000000000
-    ],
-    [
-      "0xB0E5863D0DDf7e105e409Fee0eCC0123a362e14B",
-      1000000000000000000
-    ],
-    [
-      "0x3252b7b65e50B54508974dB8d634134B0bd6be90",
-      1000000000000000000
-    ],
-    [
-      "0xf0DCB0Ea878057Ff5C78C4737023f900ECe09e7B",
-      1000000000000000000
-    ],
-    [
-      "0xD5ac7674AC15E3Df0B7D737CF8Cb8f2Ea713F329",
-      1000000000000000000
     ]
   ],
   "locked_addresses": [],

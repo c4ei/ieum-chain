@@ -13,6 +13,8 @@ pub const RETAIN_CERTIFIED_SNAPSHOTS: usize = 6;
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StateSnapshot {
     pub chain_id: u64,
+    #[serde(default)]
+    pub genesis_commitment: String,
     pub height: u64,
     pub block_hash: String,
     pub state_hash: String,
@@ -28,6 +30,7 @@ impl StateSnapshot {
     pub fn from_chain(chain: &Blockchain) -> Self {
         Self {
             chain_id: chain.chain_id,
+            genesis_commitment: chain.genesis_commitment.clone(),
             height: chain.tip_height(),
             block_hash: chain.tip_hash().to_string(),
             state_hash: chain.state_hash(),

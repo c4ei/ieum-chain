@@ -9,6 +9,8 @@ use std::path::{Path, PathBuf};
 pub struct CanonicalState {
     pub schema_version: u32,
     pub chain_id: u64,
+    #[serde(default)]
+    pub genesis_commitment: String,
     pub height: u64,
     pub block_hash: String,
     pub state_root: String,
@@ -36,8 +38,9 @@ impl CanonicalState {
             }
         }
         Self {
-            schema_version: 2,
+            schema_version: 3,
             chain_id: chain.chain_id,
+            genesis_commitment: chain.genesis_commitment.clone(),
             height: chain.tip_height(),
             block_hash: chain.tip_hash().to_string(),
             state_root: chain.state_hash(),
@@ -114,7 +117,7 @@ impl StateStore {
 }
 
 fn validate_schema(state: &CanonicalState) -> Result<(), String> {
-    if !matches!(state.schema_version, 1 | 2) {
+    if !matches!(state.schema_version, 1..=3) {
         return Err("지원하지 않는 상태 저장소 버전입니다.".into());
     }
     Ok(())

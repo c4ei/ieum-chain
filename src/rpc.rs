@@ -361,6 +361,10 @@ impl RpcServer {
             .expect("embedded 상태 DB를 읽을 수 있어야 합니다.");
         if let Some(state) = stored_state {
             assert_eq!(state.chain_id, chain_id, "embedded DB chain ID 불일치");
+            assert_eq!(
+                state.genesis_commitment, chain.genesis_commitment,
+                "embedded DB Genesis hash 불일치: 기존 원장을 백업한 뒤 새 메인넷 원장으로 시작하세요"
+            );
             chain = Blockchain::from_snapshot_with_staking(
                 chain_id,
                 chain.genesis_commitment.clone(),
@@ -382,6 +386,10 @@ impl RpcServer {
             .expect("상태 체크포인트를 읽을 수 있어야 합니다.")
         {
             assert_eq!(snapshot.chain_id, chain_id, "체크포인트 chain ID 불일치");
+            assert_eq!(
+                snapshot.genesis_commitment, chain.genesis_commitment,
+                "체크포인트 Genesis hash 불일치: 다른 네트워크의 체크포인트를 사용할 수 없습니다"
+            );
             chain = Blockchain::from_snapshot_with_staking(
                 chain_id,
                 chain.genesis_commitment.clone(),
@@ -923,6 +931,8 @@ fn dispatch(
                 "Bal_Utong_All": bal_all.saturating_sub(bal_lock_all).to_string(),
                 "Bal_Lock_All": bal_lock_all.to_string(),
                 "Bal_Genesis_All": bal_genesis_all.to_string(),
+                "Bal_MaxSupply": crate::MAX_SUPPLY.to_string(),
+                "Bal_RemainingMintable": crate::MAX_SUPPLY.saturating_sub(bal_all).to_string(),
                 "Bal_Ija_Paid_All": bal_ija_paid_all.to_string(),
                 "Bal_Ija_Minted_All": "0",
                 "Bal_NodeReward_Minted_All": "0",
@@ -992,6 +1002,48 @@ fn dispatch(
                 "friendlyDelegationName": "이음 맡기기",
                 "communityName": "이음마당"
             }))
+        }
+        "ieum_holderRewardHistory" => {
+            let limit = params
+                .first()
+                .and_then(Value::as_u64)
+                .unwrap_or(500)
+                .clamp(1, 10_000) as usize;
+            let state = read_state(state)?;
+            let mut items = Vec::new();
+            for block in state.chain.blocks.iter().rev() {
+                for event in block.system_events.iter().rev() {
+                    if let crate::scheduled_event::ScheduledEventAction::HolderDailyReward {
+                        snapshot_height,
+                        policy_hash,
+                        annual_rate_bps,
+                        payments,
+                    } = &event.action
+                    {
+                        for payment in payments.iter().rev() {
+                            items.push(json!({
+                                "eventId": event.id.clone(),
+                                "blockHeight": block.height,
+                                "blockHash": block.hash.clone(),
+                                "timestamp": block.timestamp,
+                                "executeAt": event.execute_at,
+                                "snapshotHeight": snapshot_height,
+                                "policyHash": policy_hash,
+                                "annualRateBps": annual_rate_bps,
+                                "address": payment.address.clone(),
+                                "amount": payment.amount.to_string(),
+                                "ip": Value::Null,
+                                "country": Value::Null,
+                                "privacyNotice": "온체인 지급 기록에는 IP와 국가를 저장하지 않습니다."
+                            }));
+                            if items.len() >= limit {
+                                return Ok(json!({"items": items, "limited": true}));
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(json!({"items": items, "limited": false}))
         }
         "ieum_stakingStatus" => {
             let wanted = params

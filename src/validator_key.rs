@@ -37,6 +37,15 @@ pub fn create_validators_config(
     public_keys: &[String],
     voting_power: u64,
 ) -> Result<(), String> {
+    create_validators_config_for_chain(path, CHAIN_ID, public_keys, voting_power)
+}
+
+pub fn create_validators_config_for_chain(
+    path: &Path,
+    chain_id: &str,
+    public_keys: &[String],
+    voting_power: u64,
+) -> Result<(), String> {
     if public_keys.is_empty() {
         return Err("검증자 공개키가 최소 1개 필요합니다.".into());
     }
@@ -55,7 +64,7 @@ pub fn create_validators_config(
     }
 
     let config = ValidatorConfig {
-        chain_id: CHAIN_ID,
+        chain_id,
         validators,
     };
     let mut json = serde_json::to_string_pretty(&config)
