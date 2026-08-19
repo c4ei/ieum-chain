@@ -46,6 +46,7 @@ pub struct ConsensusRuntime {
     validator: ValidatorSigner,
     pending: Option<Block>,
     valid_block: Option<Block>,
+    valid_round_prevotes: Vec<ConsensusMessage>,
     deadline: Instant,
     timeouts: ConsensusTimeouts,
     validators: Vec<Validator>,
@@ -114,6 +115,7 @@ impl ConsensusRuntime {
             validator,
             pending: None,
             valid_block: None,
+            valid_round_prevotes: Vec::new(),
             deadline,
             timeouts,
             validators,
@@ -164,14 +166,19 @@ impl ConsensusRuntime {
         if self.validator.address() != self.consensus.expected_proposer() {
             return Err("이 노드는 현재 라운드 제안자가 아닙니다.".into());
         }
-        let (block, valid_round) = match (self.valid_block.as_ref(), self.consensus.valid_value()) {
-            (Some(valid_block), Some((valid_hash, valid_round)))
-                if valid_block.hash == valid_hash =>
-            {
-                (valid_block.clone(), Some(valid_round))
-            }
-            _ => (block, None),
-        };
+        let (block, valid_round, valid_round_prevotes) =
+            match (self.valid_block.as_ref(), self.consensus.valid_value()) {
+                (Some(valid_block), Some((valid_hash, valid_round)))
+                    if valid_block.hash == valid_hash =>
+                {
+                    (
+                        valid_block.clone(),
+                        Some(valid_round),
+                        self.valid_round_prevotes.clone(),
+                    )
+                }
+                _ => (block, None, Vec::new()),
+            };
         let proposer_id = self.validator.address();
         let signature = self.validator.sign_bytes(&SignedProposal::bytes_to_sign(
             block.height,
@@ -179,6 +186,7 @@ impl ConsensusRuntime {
             &proposer_id,
             &block.hash,
             valid_round,
+            &valid_round_prevotes,
         ))?;
         SignedProposal::from_signature(
             block.height,
@@ -186,6 +194,7 @@ impl ConsensusRuntime {
             proposer_id,
             block,
             valid_round,
+            valid_round_prevotes,
             signature,
         )
     }
@@ -236,6 +245,10 @@ impl ConsensusRuntime {
                 && self.consensus.phase() == ConsensusPhase::Precommit
             {
                 self.valid_block = self.pending.clone();
+                if let Some((block_hash, valid_round)) = self.consensus.valid_value() {
+                    self.valid_round_prevotes =
+                        self.consensus.prevote_certificate(block_hash, valid_round);
+                }
             }
             self.reset_deadline();
         }
@@ -271,6 +284,8 @@ impl ConsensusRuntime {
             };
             certificate.verify(&self.validators)?;
             self.chain.apply_block(block)?;
+            self.valid_block = None;
+            self.valid_round_prevotes.clear();
             self.finalized.push(certificate.clone());
             self.pending_finalized.push(certificate);
         }
@@ -605,6 +620,7 @@ impl ConsensusRuntime {
             self.consensus.start_round(next_height, 0)?;
             self.pending = None;
             self.valid_block = None;
+            self.valid_round_prevotes.clear();
             self.precommits.clear();
             self.round_change_votes.clear();
             self.reset_deadline();
@@ -621,6 +637,7 @@ impl ConsensusRuntime {
         self.consensus.start_round(next_height, 0)?;
         self.pending = None;
         self.valid_block = None;
+        self.valid_round_prevotes.clear();
         self.precommits.clear();
         self.round_change_votes.clear();
         self.reset_deadline();
@@ -674,6 +691,7 @@ impl ConsensusRuntime {
         self.consensus = consensus;
         self.validators = validators;
         self.valid_block = None;
+        self.valid_round_prevotes.clear();
         self.precommits.clear();
         self.round_change_votes.clear();
         self.reset_deadline();

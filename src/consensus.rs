@@ -43,13 +43,16 @@ pub struct SignedProposal {
     /// 제안자가 알고 있는 2/3 초과 prevote 라운드입니다.
     #[serde(default)]
     pub valid_round: Option<u32>,
+    /// `valid_round`에서 같은 블록에 서명한 2/3 초과 prevote 증명입니다.
+    #[serde(default)]
+    pub valid_round_prevotes: Vec<ConsensusMessage>,
     pub block: Block,
     pub signature: String,
 }
 
 impl SignedProposal {
     pub fn new(height: u64, round: u32, proposer: &Wallet, block: Block) -> Self {
-        Self::with_valid_round(height, round, proposer, block, None)
+        Self::with_valid_round_certificate(height, round, proposer, block, None, Vec::new())
     }
 
     pub fn with_valid_round(
@@ -59,6 +62,17 @@ impl SignedProposal {
         block: Block,
         valid_round: Option<u32>,
     ) -> Self {
+        Self::with_valid_round_certificate(height, round, proposer, block, valid_round, Vec::new())
+    }
+
+    pub fn with_valid_round_certificate(
+        height: u64,
+        round: u32,
+        proposer: &Wallet,
+        block: Block,
+        valid_round: Option<u32>,
+        valid_round_prevotes: Vec<ConsensusMessage>,
+    ) -> Self {
         let proposer_id = proposer.address();
         let signature = proposer.sign_bytes(&Self::unsigned_bytes(
             height,
@@ -66,12 +80,14 @@ impl SignedProposal {
             &proposer_id,
             &block.hash,
             valid_round,
+            &valid_round_prevotes,
         ));
         Self {
             height,
             round,
             proposer_id,
             valid_round,
+            valid_round_prevotes,
             block,
             signature,
         }
@@ -83,8 +99,16 @@ impl SignedProposal {
         proposer_id: &str,
         block_hash: &str,
         valid_round: Option<u32>,
+        valid_round_prevotes: &[ConsensusMessage],
     ) -> Vec<u8> {
-        Self::unsigned_bytes(height, round, proposer_id, block_hash, valid_round)
+        Self::unsigned_bytes(
+            height,
+            round,
+            proposer_id,
+            block_hash,
+            valid_round,
+            valid_round_prevotes,
+        )
     }
 
     pub fn from_signature(
@@ -93,6 +117,7 @@ impl SignedProposal {
         proposer_id: String,
         block: Block,
         valid_round: Option<u32>,
+        valid_round_prevotes: Vec<ConsensusMessage>,
         signature: String,
     ) -> Result<Self, String> {
         let proposal = Self {
@@ -100,6 +125,7 @@ impl SignedProposal {
             round,
             proposer_id,
             valid_round,
+            valid_round_prevotes,
             block,
             signature,
         };
@@ -113,13 +139,21 @@ impl SignedProposal {
         proposer_id: &str,
         block_hash: &str,
         valid_round: Option<u32>,
+        valid_round_prevotes: &[ConsensusMessage],
     ) -> Vec<u8> {
-        let mut bytes = b"IEUM-PROPOSAL-V2".to_vec();
+        let mut bytes = b"IEUM-PROPOSAL-V3".to_vec();
         bytes.extend_from_slice(&height.to_be_bytes());
         bytes.extend_from_slice(&round.to_be_bytes());
         push_text(&mut bytes, proposer_id);
         push_text(&mut bytes, block_hash);
         bytes.extend_from_slice(&valid_round.unwrap_or(u32::MAX).to_be_bytes());
+        let mut prevotes = valid_round_prevotes.to_vec();
+        prevotes.sort_by(|left, right| left.validator_id.cmp(&right.validator_id));
+        bytes.extend_from_slice(&(prevotes.len() as u64).to_be_bytes());
+        for vote in prevotes {
+            push_text(&mut bytes, &vote.validator_id);
+            push_text(&mut bytes, &vote.signature);
+        }
         bytes
     }
 
@@ -138,6 +172,7 @@ impl SignedProposal {
                 &self.proposer_id,
                 &self.block.hash,
                 self.valid_round,
+                &self.valid_round_prevotes,
             ),
             &self.signature,
         )
@@ -483,20 +518,66 @@ impl BftConsensus {
             return Err("등록되지 않은 검증자의 제안입니다.".into());
         }
         proposal.verify()?;
+        if let Some(valid_round) = proposal.valid_round {
+            self.verify_valid_round_certificate(proposal, valid_round)?;
+        } else if !proposal.valid_round_prevotes.is_empty() {
+            return Err("valid_round 없이 prevote 증명만 제공할 수 없습니다.".into());
+        }
         if let Some(locked_value) = self.locked_value.as_deref()
             && locked_value != proposal.block.hash
         {
             let unlock_allowed = proposal.valid_round.is_some_and(|valid_round| {
                 self.locked_round
                     .is_some_and(|locked_round| valid_round >= locked_round)
-                    && self.valid_round == Some(valid_round)
-                    && self.valid_value.as_deref() == Some(proposal.block.hash.as_str())
             });
             if !unlock_allowed {
                 return Err("잠긴 값과 다른 제안이며 유효한 valid_round 증명이 없습니다.".into());
             }
         }
+        if let Some(valid_round) = proposal.valid_round {
+            self.valid_value = Some(proposal.block.hash.clone());
+            self.valid_round = Some(valid_round);
+        }
         self.propose(&proposal.proposer_id, &proposal.block.hash)
+    }
+
+    fn verify_valid_round_certificate(
+        &self,
+        proposal: &SignedProposal,
+        valid_round: u32,
+    ) -> Result<(), String> {
+        if valid_round >= proposal.round {
+            return Err("valid_round는 제안 라운드보다 과거여야 합니다.".into());
+        }
+        if proposal.valid_round_prevotes.len() > self.validators.len() {
+            return Err("valid_round prevote 수가 검증자 수를 넘었습니다.".into());
+        }
+        let mut voters = HashSet::new();
+        let mut power = 0_u64;
+        for vote in &proposal.valid_round_prevotes {
+            if vote.height != proposal.height
+                || vote.round != valid_round
+                || vote.vote_type != VoteType::Prevote
+                || vote.block_hash != proposal.block.hash
+            {
+                return Err("valid_round prevote 증명의 높이·라운드·블록이 다릅니다.".into());
+            }
+            vote.verify()?;
+            let voting_power = self
+                .validators
+                .get(&vote.validator_id)
+                .ok_or("등록되지 않은 검증자의 valid_round prevote입니다.")?;
+            if !voters.insert(vote.validator_id.as_str()) {
+                return Err("valid_round prevote에 중복 검증자가 있습니다.".into());
+            }
+            power = power
+                .checked_add(*voting_power)
+                .ok_or("valid_round 투표권 합계가 범위를 넘었습니다.")?;
+        }
+        if power.saturating_mul(3) <= self.total_power.saturating_mul(2) {
+            return Err("valid_round에 필요한 2/3 초과 prevote 증명이 없습니다.".into());
+        }
+        Ok(())
     }
 
     pub fn handle(&mut self, message: ConsensusMessage) -> Result<(), String> {
@@ -600,6 +681,22 @@ impl BftConsensus {
         self.valid_value.as_deref().zip(self.valid_round)
     }
 
+    pub fn prevote_certificate(&self, block_hash: &str, round: u32) -> Vec<ConsensusMessage> {
+        let mut votes: Vec<_> = self
+            .vote_messages
+            .values()
+            .filter(|vote| {
+                vote.height == self.height
+                    && vote.round == round
+                    && vote.vote_type == VoteType::Prevote
+                    && vote.block_hash == block_hash
+            })
+            .cloned()
+            .collect();
+        votes.sort_by(|left, right| left.validator_id.cmp(&right.validator_id));
+        votes
+    }
+
     pub fn take_evidence(&mut self) -> Vec<DoubleVoteEvidence> {
         std::mem::take(&mut self.evidence)
     }
@@ -616,5 +713,113 @@ impl BftConsensus {
 
     pub fn finalized_hash(&self) -> Option<&str> {
         self.finalized.as_deref()
+    }
+}
+
+#[cfg(test)]
+mod valid_round_tests {
+    use super::*;
+
+    fn validator_key<'a>(keys: &'a [Wallet], address: &str) -> &'a Wallet {
+        keys.iter()
+            .find(|key| key.address() == address)
+            .expect("expected proposer key")
+    }
+
+    #[test]
+    fn certified_higher_valid_round_unlocks_a_different_value() {
+        let keys: Vec<_> = (1..=4)
+            .map(|value| Wallet::from_seed([value; 32]))
+            .collect();
+        let validators = keys
+            .iter()
+            .map(|key| Validator::new(key.address(), 100))
+            .collect();
+        let mut consensus = BftConsensus::new(validators).unwrap();
+        consensus.start_round(1, 0).unwrap();
+
+        let first_proposer = validator_key(&keys, consensus.expected_proposer());
+        let first_block = Block::new(
+            1,
+            Block::genesis().hash,
+            1_785_942_000,
+            first_proposer.address(),
+            Vec::new(),
+        );
+        let first_proposal = SignedProposal::new(1, 0, first_proposer, first_block.clone());
+        consensus.handle_proposal(&first_proposal).unwrap();
+        for key in keys.iter().take(3) {
+            consensus
+                .handle(ConsensusMessage::prevote(1, 0, key, &first_block.hash))
+                .unwrap();
+        }
+        assert_eq!(
+            consensus.locked_value(),
+            Some((first_block.hash.as_str(), 0))
+        );
+
+        consensus.start_round(1, 2).unwrap();
+        let next_proposer = validator_key(&keys, consensus.expected_proposer());
+        let next_block = Block::new(
+            1,
+            Block::genesis().hash,
+            1_785_942_001,
+            next_proposer.address(),
+            Vec::new(),
+        );
+        let proof: Vec<_> = keys
+            .iter()
+            .take(3)
+            .map(|key| ConsensusMessage::prevote(1, 1, key, &next_block.hash))
+            .collect();
+        let proposal = SignedProposal::with_valid_round_certificate(
+            1,
+            2,
+            next_proposer,
+            next_block.clone(),
+            Some(1),
+            proof,
+        );
+
+        consensus.handle_proposal(&proposal).unwrap();
+        assert_eq!(consensus.valid_value(), Some((next_block.hash.as_str(), 1)));
+        assert_eq!(consensus.phase(), ConsensusPhase::Prevote);
+    }
+
+    #[test]
+    fn valid_round_number_without_two_thirds_proof_is_rejected() {
+        let keys: Vec<_> = (1..=4)
+            .map(|value| Wallet::from_seed([value; 32]))
+            .collect();
+        let validators = keys
+            .iter()
+            .map(|key| Validator::new(key.address(), 100))
+            .collect();
+        let mut consensus = BftConsensus::new(validators).unwrap();
+        consensus.start_round(1, 2).unwrap();
+        let proposer = validator_key(&keys, consensus.expected_proposer());
+        let block = Block::new(
+            1,
+            Block::genesis().hash,
+            1_785_942_001,
+            proposer.address(),
+            Vec::new(),
+        );
+        let proposal = SignedProposal::with_valid_round_certificate(
+            1,
+            2,
+            proposer,
+            block.clone(),
+            Some(1),
+            vec![
+                ConsensusMessage::prevote(1, 1, &keys[0], &block.hash),
+                ConsensusMessage::prevote(1, 1, &keys[1], &block.hash),
+            ],
+        );
+
+        assert_eq!(
+            consensus.handle_proposal(&proposal).unwrap_err(),
+            "valid_round에 필요한 2/3 초과 prevote 증명이 없습니다."
+        );
     }
 }
