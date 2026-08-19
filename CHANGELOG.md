@@ -415,3 +415,13 @@
 - `account import`, `account balance`, `account transaction`, `account receipt`를 추가했습니다.
 - keystore 파일명을 `UTC--timestamp--address` 형식으로 누적하며 기존 `address.json`도 읽습니다.
 - 계정 생성·raw key import·IEUM 전송·잔액 및 트랜잭션/영수증 조회 흐름을 문서화했습니다.
+# 0.23.5
+
+- IEUM 메인넷 이름을 `ieum-mainnet`으로 확정하고 공개 개발키 4개 주소를 Genesis에서 제거했습니다.
+- GitHub Actions는 Chain ID `21005`의 별도 `config/genesis_test.json`을 사용해 기존 송금 테스트 주소 4개의 1 IEUM 잔액을 유지합니다.
+- Genesis 시각을 2026-08-19 00:00 KST, 공급량을 80,100 IEUM, 공식 hash를 `c7a4f99b...ff8a5a`로 고정했습니다.
+- 자동 업데이트된 바이너리가 번들 Genesis 설정을 원자적으로 동기화하고 기존 파일을 백업합니다.
+- 저장 원장과 월별 체크포인트의 Genesis hash가 현재 메인넷과 다르면 시작을 거부합니다.
+- Genesis와 향후 발행을 합한 전역 최대 공급량을 210,000,000 IEUM으로 고정했습니다.
+- 일반 보유 보상의 확정 지급 내역을 조회하는 `ieum_holderRewardHistory` RPC를 추가했습니다.
+- 최초 배분 공개 절차, 참여 보상, 메인넷 전환과 사고 대응 훈련 문서를 추가했습니다.

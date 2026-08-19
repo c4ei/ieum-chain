@@ -4,6 +4,89 @@ use std::path::{Path, PathBuf};
 
 const MARKER_NAME: &str = ".ieum-initialized";
 
+/// 서명된 바이너리에 포함된 메인넷 Genesis를 실행 디렉터리의 설정 파일과 맞춥니다.
+/// 기존 파일은 최초 전환 시 한 번 보존하고, 임시 파일을 rename해 부분 쓰기를 막습니다.
+pub fn synchronize_bundled_mainnet_genesis(path: &Path) -> Result<(), String> {
+    let bundled = include_str!("../config/genesis.json");
+    let genesis: ieum_chain::genesis::GenesisConfig = serde_json::from_str(bundled)
+        .map_err(|error| format!("번들 메인넷 Genesis 읽기 실패: {error}"))?;
+    genesis.validate_production_safety()?;
+    if genesis.chain_id != 21_004
+        || genesis.network_name != "ieum-mainnet"
+        || genesis.genesis_time != 1_787_065_200
+    {
+        return Err("번들 메인넷 Genesis 신원이 v0.23.5 기준과 다릅니다.".into());
+    }
+    if fs::read_to_string(path).ok().as_deref() == Some(bundled) {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("Genesis 설정 폴더 생성 실패: {error}"))?;
+    }
+    if path.exists() {
+        let backup = path.with_file_name("genesis.pre-mainnet-20260819.json");
+        if !backup.exists() {
+            fs::copy(path, &backup).map_err(|error| {
+                format!("기존 Genesis 백업 실패({}): {error}", backup.display())
+            })?;
+        }
+    }
+    let temporary = path.with_file_name(".genesis.json.new");
+    fs::write(&temporary, bundled)
+        .map_err(|error| format!("새 Genesis 임시 저장 실패: {error}"))?;
+    fs::rename(&temporary, path)
+        .map_err(|error| format!("새 Genesis 원자적 교체 실패: {error}"))?;
+    println!("[메인넷 Genesis 동기화] {}", path.display());
+    Ok(())
+}
+
+/// v0.23.5 새 메인넷을 처음 실행할 때 기존 시험 원장을 삭제하지 않고 옆으로 보존합니다.
+/// 같은 Genesis marker가 있으면 이후 Docker 재시작에서는 아무 작업도 하지 않습니다.
+pub fn prepare_mainnet_ledger_transition(
+    ledger_dir: &Path,
+    genesis_commitment: &str,
+) -> Result<Option<PathBuf>, String> {
+    let data_dir = ledger_dir.parent().unwrap_or(ledger_dir);
+    let ledger_name = ledger_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("ledger");
+    let marker = data_dir.join(format!(".ieum-mainnet-genesis-{ledger_name}"));
+    if marker.exists() {
+        let recorded = fs::read_to_string(&marker).map_err(|error| error.to_string())?;
+        if recorded.trim() != genesis_commitment {
+            return Err("메인넷 원장 marker의 Genesis hash가 현재 바이너리와 다릅니다.".into());
+        }
+        return Ok(None);
+    }
+    let has_data = ledger_dir
+        .read_dir()
+        .map(|mut entries| entries.next().is_some())
+        .unwrap_or(false);
+    let backup = data_dir.join(format!("{ledger_name}.pre-mainnet-20260819"));
+    let moved = if has_data {
+        if backup.exists() {
+            return Err(format!(
+                "기존 메인넷 전환 백업이 이미 있습니다: {}",
+                backup.display()
+            ));
+        }
+        fs::rename(ledger_dir, &backup)
+            .map_err(|error| format!("기존 시험 원장 백업 실패: {error}"))?;
+        Some(backup)
+    } else {
+        None
+    };
+    fs::create_dir_all(ledger_dir)
+        .map_err(|error| format!("새 메인넷 원장 폴더 생성 실패: {error}"))?;
+    fs::write(&marker, format!("{genesis_commitment}\n"))
+        .map_err(|error| format!("메인넷 Genesis marker 저장 실패: {error}"))?;
+    Ok(moved)
+}
+
 /// 서버 최초 실행에 필요한 서버별 비밀키와 로컬 원장을 준비합니다.
 ///
 /// 초기화 표시가 생긴 뒤 핵심 파일이 사라진 경우에는 새 신원을 자동 생성하지 않습니다.
@@ -183,11 +266,30 @@ fn prepare_validators_config(
         return Ok(());
     }
     if allow_insecure_test_keys {
-        let public_keys: Vec<_> = (1..=4)
-            .map(|index| ieum_chain::Wallet::from_seed(testnet_validator_seed(index)).address())
-            .collect();
-        ieum_chain::validator_key::create_validators_config(path, &public_keys, 100)?;
-        println!("[개발망 자동 생성] {}", path.display());
+        let config: serde_json::Value =
+            serde_json::from_str(include_str!("../config/validators_test.json"))
+                .map_err(|error| format!("번들 CI 검증자 설정 읽기 실패: {error}"))?;
+        if config["chain_id"] != "21005" {
+            return Err("CI 검증자 설정 chain_id는 21005여야 합니다.".into());
+        }
+        let public_keys = config["validators"]
+            .as_array()
+            .ok_or("CI 검증자 배열이 없습니다.")?
+            .iter()
+            .map(|validator| {
+                validator["id"]
+                    .as_str()
+                    .map(str::to_owned)
+                    .ok_or_else(|| "CI 검증자 ID 형식이 올바르지 않습니다.".to_string())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        ieum_chain::validator_key::create_validators_config_for_chain(
+            path,
+            "21005",
+            &public_keys,
+            100,
+        )?;
+        println!("[CI 검증자 설정 자동 생성] {}", path.display());
         return Ok(());
     }
     let genesis: ieum_chain::genesis::GenesisConfig =
@@ -199,17 +301,18 @@ fn prepare_validators_config(
         .iter()
         .map(|validator| validator.id.clone())
         .collect::<Vec<_>>();
-    ieum_chain::validator_key::create_validators_config(path, &public_keys, 100)?;
+    ieum_chain::validator_key::create_validators_config_for_chain(
+        path,
+        &genesis.chain_id.to_string(),
+        &public_keys,
+        100,
+    )?;
     println!("[제네시스 검증자 설정 복원] {}", path.display());
     println!(
         "[신규 노드 모드] 제네시스 검증자 집합으로 동기화를 시작합니다. \
          로컬 키는 서명 후보로 자동 전송되며 승인 전에는 일반 동기화 노드로 동작합니다."
     );
     Ok(())
-}
-
-fn testnet_validator_seed(index: u8) -> [u8; 32] {
-    [index; 32]
 }
 
 fn marker_path(ledger_dir: &Path) -> PathBuf {
@@ -448,6 +551,45 @@ mod tests {
         assert!(root.join("config/upgrades.json").exists());
         let config = fs::read_to_string(root.join("config/validators.json")).unwrap();
         assert_eq!(config.matches("\"id\"").count(), 4);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn bundled_mainnet_genesis_is_atomically_synchronized_and_backed_up() {
+        let root = temp_root("mainnet-genesis-sync");
+        let path = root.join("config/genesis.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "{\"network_name\":\"ieum-devnet\"}\n").unwrap();
+        synchronize_bundled_mainnet_genesis(&path).unwrap();
+        let installed: ieum_chain::genesis::GenesisConfig =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(installed.chain_id, 21_004);
+        assert_eq!(installed.network_name, "ieum-mainnet");
+        assert_eq!(installed.genesis_time, 1_787_065_200);
+        assert!(
+            root.join("config/genesis.pre-mainnet-20260819.json")
+                .exists()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn mainnet_transition_preserves_old_ledger_once() {
+        let root = temp_root("mainnet-ledger-transition");
+        let ledger = root.join("data/ledger");
+        fs::create_dir_all(&ledger).unwrap();
+        fs::write(ledger.join("old-block"), "test-chain").unwrap();
+        let backup = prepare_mainnet_ledger_transition(&ledger, "new-genesis")
+            .unwrap()
+            .unwrap();
+        assert!(backup.join("old-block").exists());
+        assert!(ledger.is_dir());
+        assert!(
+            prepare_mainnet_ledger_transition(&ledger, "new-genesis")
+                .unwrap()
+                .is_none()
+        );
+        assert!(prepare_mainnet_ledger_transition(&ledger, "other-genesis").is_err());
         fs::remove_dir_all(root).unwrap();
     }
 

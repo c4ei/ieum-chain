@@ -147,6 +147,21 @@ for index in 1 2 3 4; do
   wait_for_rpc "$index"
 done
 
+for index in 1 2 3 4; do
+  port="$((9200 + index))"
+  chain_id_response="$(rpc "$port" eth_chainId '[]')"
+  python3 - "$index" "$chain_id_response" <<'PY'
+import json
+import sys
+
+index, raw = sys.argv[1:]
+chain_id = int(json.loads(raw)["result"], 16)
+if chain_id != 21005:
+    raise SystemExit(f"노드 {index} CI chain ID 불일치: {chain_id}")
+print(f"노드 {index} CI chain ID 확인: {chain_id}")
+PY
+done
+
 # RPC listen은 P2P mesh보다 먼저 준비될 수 있다. 연결 전에 거래를 넣으면 노드별로
 # 서로 다른 round를 시작할 수 있으므로 모든 노드의 3개 연결을 확인한 뒤 송금한다.
 for _ in $(seq 1 120); do
