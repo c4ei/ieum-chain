@@ -850,6 +850,14 @@ fn dispatch(
                 });
             Ok(transaction
                 .map(|(block, index, transaction)| {
+                    let (gas_price, gas_limit) =
+                        crate::raw_transaction::ethereum_fee_terms(&transaction);
+                    let cumulative_gas = block
+                        .transactions
+                        .iter()
+                        .take(index.saturating_add(1))
+                        .map(|item| crate::raw_transaction::ethereum_fee_terms(item).1)
+                        .fold(0_u128, u128::saturating_add);
                     json!({
                         "transactionHash": format!("0x{}", transaction.id()),
                         "transactionIndex": quantity(index as u64),
@@ -857,6 +865,11 @@ fn dispatch(
                         "blockNumber": quantity(block.height),
                         "from": transaction.from,
                         "to": transaction.to,
+                        "cumulativeGasUsed": quantity_u128(cumulative_gas),
+                        "gasUsed": quantity_u128(gas_limit),
+                        "effectiveGasPrice": quantity_u128(gas_price),
+                        "logs": [],
+                        "logsBloom": format!("0x{}", "0".repeat(512)),
                         "status": "0x1"
                     })
                 })
@@ -1603,6 +1616,7 @@ fn block_json(block: &Block, full_transactions: bool) -> Value {
 }
 
 fn transaction_json(block: &Block, index: usize, transaction: &Transaction) -> Value {
+    let (gas_price, gas_limit) = crate::raw_transaction::ethereum_fee_terms(transaction);
     json!({
         "hash": format!("0x{}", transaction.id()),
         "nonce": quantity(transaction.nonce),
@@ -1612,7 +1626,8 @@ fn transaction_json(block: &Block, index: usize, transaction: &Transaction) -> V
         "from": transaction.from,
         "to": transaction.to,
         "value": quantity_u128(transaction.amount),
-        "gasPrice": quantity_u128(transaction.fee),
+        "gas": quantity_u128(gas_limit),
+        "gasPrice": quantity_u128(gas_price),
         "input": match &transaction.action {
             crate::model::TransactionAction::Transfer=>"0x".into(),
             action=>format!("0x{}",hex::encode(serde_json::to_vec(action).unwrap_or_default()))
@@ -1758,7 +1773,87 @@ mod tests {
         assert_eq!(value["number"], "0x1");
         assert_eq!(value["transactions"][0]["blockHash"], value["hash"]);
         assert_eq!(value["transactions"][0]["transactionIndex"], "0x0");
+        assert_eq!(value["transactions"][0]["gas"], "0x1");
+        assert_eq!(value["transactions"][0]["gasPrice"], "0x5208");
         assert!(value["transactions"][0].get("signature").is_none());
+    }
+
+    #[test]
+    fn metamask_raw_transaction_and_receipt_survive_rpc_restart() {
+        let config = test_rpc_config("finalized-state-survives-restart");
+        let server = RpcServer::new(config.clone());
+        let handle = server.node_handle();
+        let shared = Arc::clone(&server.state);
+        let faucet = dispatch(&shared, "eth_coinbase", &[])
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .to_string();
+        let receiver = "0x2222222222222222222222222222222222222222";
+        let receiver_bytes: [u8; 20] = hex::decode(receiver.trim_start_matches("0x"))
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let raw = crate::raw_transaction::sign_legacy_for_test(
+            [42; 32],
+            receiver_bytes,
+            100,
+            &[],
+            21_004,
+            0,
+            1,
+            21_000,
+        );
+        let transaction_hash = dispatch(&shared, "eth_sendRawTransaction", &[json!(raw)]).unwrap();
+        let transactions = handle.drain_transactions(10).unwrap();
+        assert_eq!(transactions.len(), 1);
+        let before = handle.chain().unwrap();
+        let mut after = before.clone();
+        let producer = "0x3333333333333333333333333333333333333333";
+        after.add_block(transactions, producer.into()).unwrap();
+        let finalized = after.blocks.last().unwrap().clone();
+        handle
+            .install_finalized(&before, after, &finalized)
+            .unwrap();
+
+        let receipt_before = dispatch(
+            &shared,
+            "eth_getTransactionReceipt",
+            std::slice::from_ref(&transaction_hash),
+        )
+        .unwrap();
+        assert_eq!(receipt_before["status"], "0x1");
+        assert_eq!(receipt_before["gasUsed"], "0x5208");
+        drop(shared);
+        drop(server);
+
+        let restarted = RpcServer::new(config);
+        let restarted_state = restarted.state;
+        assert_eq!(
+            dispatch(
+                &restarted_state,
+                "eth_getBalance",
+                &[json!(receiver), json!("latest")],
+            )
+            .unwrap(),
+            json!("0x64")
+        );
+        assert_eq!(
+            dispatch(
+                &restarted_state,
+                "eth_getTransactionCount",
+                &[json!(faucet), json!("latest")],
+            )
+            .unwrap(),
+            json!("0x1")
+        );
+        let receipt_after = dispatch(
+            &restarted_state,
+            "eth_getTransactionReceipt",
+            &[transaction_hash],
+        )
+        .unwrap();
+        assert_eq!(receipt_after, receipt_before);
     }
 
     #[test]

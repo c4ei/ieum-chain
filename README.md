@@ -1,4 +1,10 @@
-# IEUM Chain v0.23.7 메인넷 실행 안내
+# IEUM Chain v0.23.8 메인넷 실행 안내
+
+v0.23.8은 MetaMask legacy raw 거래의 `gasPrice`·`gas` 조회 표시를 바로잡고,
+확정 거래의 잔액·nonce·영수증이 RPC 재시작 뒤에도 동일하게 복원되는지 자동
+검증합니다. 배포와 검증 절차는
+[`docs/VERSION_0.23.8_TRANSACTION_RESTART_BASICS.md`](docs/VERSION_0.23.8_TRANSACTION_RESTART_BASICS.md)를
+참고하세요.
 
 v0.23.7은 검증 노드가 서로 다른 블록에 잠긴 뒤 라운드만 증가하던 교착을 해소하도록
 서명된 `valid_round` prevote 인증서, 안전한 잠금 전환, 합의 wire v2를 추가합니다.

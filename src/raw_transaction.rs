@@ -115,6 +115,38 @@ pub fn verify_embedded(transaction: &Transaction, expected_chain_id: u64) -> Res
     }
 }
 
+/// Ethereum 조회 응답에서 원본 legacy 거래의 gasPrice/gasLimit을 보존합니다.
+///
+/// IEUM 자체 서명 거래는 총 수수료만 합의 필드로 가지므로 gas=1,
+/// gasPrice=fee로 표현해 두 값의 곱이 실제 차감 수수료와 정확히 일치하게 합니다.
+pub fn ethereum_fee_terms(transaction: &Transaction) -> (u128, u128) {
+    let Some(raw) = transaction.signature.strip_prefix("ethraw:") else {
+        return (transaction.fee, 1);
+    };
+    let Ok(bytes) = hex::decode(raw) else {
+        return (transaction.fee, 1);
+    };
+    let Ok(fields) = decode_list(&bytes) else {
+        return (transaction.fee, 1);
+    };
+    if fields.len() != 9 {
+        return (transaction.fee, 1);
+    }
+    let (Ok(gas_price), Ok(gas_limit)) = (
+        value_u64(fields[1], "gasPrice"),
+        value_u64(fields[2], "gasLimit"),
+    ) else {
+        return (transaction.fee, 1);
+    };
+    let gas_price = u128::from(gas_price);
+    let gas_limit = u128::from(gas_limit);
+    if gas_price.checked_mul(gas_limit) == Some(transaction.fee) {
+        (gas_price, gas_limit)
+    } else {
+        (transaction.fee, 1)
+    }
+}
+
 fn value_u64(value: &[u8], name: &str) -> Result<u64, String> {
     if value.len() > 8 {
         return Err(format!("{name}이 u64 범위를 벗어났습니다."));
@@ -243,32 +275,42 @@ fn encode_length(length: usize, short_base: u8, long_base: u8) -> Vec<u8> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn sign_legacy_for_test(
+    private_key: [u8; 32],
+    to: [u8; 20],
+    amount: u128,
+    data: &[u8],
+    chain_id: u64,
+    nonce: u64,
+    gas_price: u64,
+    gas_limit: u64,
+) -> String {
     use k256::ecdsa::SigningKey;
 
-    fn signed_raw(to: [u8; 20], amount: u128, data: &[u8], chain_id: u64) -> String {
-        let fields = [
-            encode_u64(0),
-            encode_u64(1),
-            encode_u64(50_000),
-            encode_bytes(&to),
-            encode_u128(amount),
-            encode_bytes(data),
-            encode_u64(chain_id),
-            encode_bytes(&[]),
-            encode_bytes(&[]),
-        ];
-        let signing = encode_list(&fields);
-        let key = SigningKey::from_bytes((&[1u8; 32]).into()).unwrap();
-        let (signature, recovery_id) = key
-            .sign_digest_recoverable(Keccak256::new_with_prefix(&signing))
-            .unwrap();
-        let bytes = signature.to_bytes();
+    let fields = [
+        encode_u64(nonce),
+        encode_u64(gas_price),
+        encode_u64(gas_limit),
+        encode_bytes(&to),
+        encode_u128(amount),
+        encode_bytes(data),
+        encode_u64(chain_id),
+        encode_bytes(&[]),
+        encode_bytes(&[]),
+    ];
+    let signing = encode_list(&fields);
+    let key = SigningKey::from_bytes((&private_key).into()).unwrap();
+    let (signature, recovery_id) = key
+        .sign_digest_recoverable(Keccak256::new_with_prefix(&signing))
+        .unwrap();
+    let bytes = signature.to_bytes();
+    format!(
+        "0x{}",
         hex::encode(encode_list(&[
-            encode_u64(0),
-            encode_u64(1),
-            encode_u64(50_000),
+            encode_u64(nonce),
+            encode_u64(gas_price),
+            encode_u64(gas_limit),
             encode_bytes(&to),
             encode_u128(amount),
             encode_bytes(data),
@@ -276,6 +318,16 @@ mod tests {
             encode_bytes(&bytes[..32]),
             encode_bytes(&bytes[32..]),
         ]))
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use k256::ecdsa::SigningKey;
+
+    fn signed_raw(to: [u8; 20], amount: u128, data: &[u8], chain_id: u64) -> String {
+        sign_legacy_for_test([1; 32], to, amount, data, chain_id, 0, 1, 50_000)
     }
 
     #[test]
@@ -347,6 +399,19 @@ mod tests {
         assert_eq!(transaction.fee, 21_000);
         assert_eq!(transaction.nonce, 0);
         verify_embedded(&transaction, chain_id).unwrap();
+        assert_eq!(ethereum_fee_terms(&transaction), (1, 21_000));
+    }
+
+    #[test]
+    fn native_transaction_fee_terms_preserve_exact_total_fee() {
+        let wallet = crate::Wallet::from_seed([9; 32]);
+        let transaction = wallet.sign_transfer(
+            "0x1111111111111111111111111111111111111111".into(),
+            10,
+            1_000_000_000_000,
+            0,
+        );
+        assert_eq!(ethereum_fee_terms(&transaction), (1_000_000_000_000, 1));
     }
 
     #[test]
