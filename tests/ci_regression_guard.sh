@@ -2,8 +2,15 @@
 set -euo pipefail
 
 network_test="tests/four_process_network.sh"
+operational_test="tests/v0_23_8_operational_basics.sh"
 
 bash -n "$network_test"
+bash -n "$operational_test"
+
+if [[ ! -x "$operational_test" ]]; then
+  echo "CI 회귀 방지 실패: v0.23.8 운영 기본기 스크립트에 실행 권한이 필요합니다." >&2
+  exit 1
+fi
 
 require_pattern() {
   local pattern="$1"

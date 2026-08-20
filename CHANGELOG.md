@@ -1,5 +1,13 @@
 # 변경 기록
 
+## 0.23.8 - 2026-08-20
+
+- Ethereum legacy raw 거래 조회 시 원본 `gasPrice`와 `gasLimit`을 정확히 복원
+- IEUM 자체 서명 거래는 `gas=1`, `gasPrice=fee`로 표시해 조회 수수료 합계를 보존
+- 거래 영수증에 `gasUsed`, `effectiveGasPrice`, `logs`, `logsBloom` 표준 필드 추가
+- 확정 뒤 RPC 재시작 시 잔액·nonce·거래 영수증이 동일하게 복원되는 회귀 테스트 추가
+- 재단 20%·블록 생성자 80% 수수료 배분과 운영 기본기 전용 테스트 스크립트 추가
+
 ## 0.23.7 - 2026-08-19
 
 - 제안의 `valid_round`에 해당하는 2/3 초과 서명 prevote 인증서를 함께 전파하고 검증

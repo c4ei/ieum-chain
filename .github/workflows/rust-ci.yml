@@ -44,6 +44,9 @@ jobs:
       - name: Run all tests
         run: cargo test --all-targets --all-features --locked
 
+      - name: Run v0.23.8 operational basics
+        run: bash tests/v0_23_8_operational_basics.sh
+
       - name: Build release binary
         run: cargo build --release --locked
 
