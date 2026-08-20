@@ -1,4 +1,9 @@
-# IEUM Chain v0.23.8 메인넷 실행 안내
+# IEUM Chain v0.23.9 메인넷 실행 안내
+
+v0.23.9는 최대 발행량 210,000,000 IEUM과 재단 최초 배분량 21,000,000 IEUM을
+제네시스 합의 규칙으로 고정합니다. 기존 운영 원장은 백업 후 새 제네시스로 전환해야 합니다.
+전환 순서는 [`docs/VERSION_0.23.9_FOUNDATION_GENESIS.md`](docs/VERSION_0.23.9_FOUNDATION_GENESIS.md)를
+따르세요.
 
 v0.23.8은 MetaMask legacy raw 거래의 `gasPrice`·`gas` 조회 표시를 바로잡고,
 확정 거래의 잔액·nonce·영수증이 RPC 재시작 뒤에도 동일하게 복원되는지 자동

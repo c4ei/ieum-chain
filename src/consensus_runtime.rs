@@ -789,6 +789,10 @@ impl ConsensusRuntime {
                     payments,
                 } if event.id == crate::validator_interest::event_id(block.timestamp) => {
                     if *snapshot_height != self.chain.tip_height()
+                        || !crate::validator_interest::mainnet_daily_reward_active(
+                            self.chain.chain_id,
+                            block.timestamp,
+                        )
                         || policy_hash != &self.validator_interest_policy.hash()
                         || *annual_rate_bps != self.validator_interest_policy.annual_rate_bps
                         || payments
@@ -810,6 +814,10 @@ impl ConsensusRuntime {
                     let mut excluded = std::collections::HashSet::new();
                     excluded.insert(crate::FOUNDATION_FEE_ADDRESS.to_string());
                     if *snapshot_height != self.chain.tip_height()
+                        || !crate::validator_interest::mainnet_daily_reward_active(
+                            self.chain.chain_id,
+                            block.timestamp,
+                        )
                         || !self.holder_reward_policy.active(block.timestamp)
                         || policy_hash != &self.holder_reward_policy.hash()
                         || *annual_rate_bps != self.holder_reward_policy.annual_rate_bps
@@ -847,6 +855,10 @@ impl ConsensusRuntime {
                     payments,
                 } if event.id == crate::staking::reward_event_id(block.timestamp) => {
                     if *snapshot_height != self.chain.tip_height()
+                        || !crate::validator_interest::mainnet_daily_reward_active(
+                            self.chain.chain_id,
+                            block.timestamp,
+                        )
                         || policy_hash != &self.validator_interest_policy.hash()
                         || *annual_rate_bps != self.validator_interest_policy.annual_rate_bps
                         || payments

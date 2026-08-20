@@ -10,7 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 ///
 /// 합의 상태를 결정하는 값이므로 노드별 환경변수나 실행 옵션으로 바꾸면 안 됩니다.
 /// 주소는 체인 내부 표준인 소문자 Ethereum 주소로 고정합니다.
-pub const FOUNDATION_FEE_ADDRESS: &str = "0x356456ff1216b57a6f8891b195b42d296789b67d";
+pub const FOUNDATION_FEE_ADDRESS: &str = crate::genesis::IEUM_FOUNDATION_ADDRESS;
 pub const FOUNDATION_FEE_BPS: u128 = 2_000;
 pub const FEE_BPS_DENOMINATOR: u128 = 10_000;
 
@@ -135,6 +135,7 @@ impl Blockchain {
             executed_events,
         )?;
         chain.staking = staking;
+        validate_supply_cap(&chain.balances, &chain.staking)?;
         Ok(chain)
     }
 
@@ -247,6 +248,7 @@ impl Blockchain {
             &mut executed_events,
             &mut staking,
         )?;
+        validate_supply_cap(&balances, &staking)?;
         self.blocks.push(block);
         self.balances = balances;
         self.next_nonces = nonces;
@@ -299,6 +301,7 @@ impl Blockchain {
                 )?;
             }
         }
+        validate_supply_cap(&balances, &staking)?;
         self.balances = balances;
         self.next_nonces = nonces;
         self.executed_events = executed_events;
@@ -331,6 +334,35 @@ impl Blockchain {
         }
         hex::encode(hasher.finalize())
     }
+}
+
+fn validate_supply_cap(
+    balances: &HashMap<Address, u128>,
+    staking: &StakingState,
+) -> Result<(), String> {
+    let liquid = balances.values().try_fold(0u128, |sum, balance| {
+        sum.checked_add(*balance)
+            .ok_or("유동 발행량 합계가 u128 범위를 넘습니다.")
+    })?;
+    let delegated = staking
+        .delegations
+        .iter()
+        .try_fold(0u128, |sum, position| {
+            sum.checked_add(position.amount)
+                .ok_or("위임 발행량 합계가 u128 범위를 넘습니다.")
+        })?;
+    let unbonding = staking.unbonding.iter().try_fold(0u128, |sum, entry| {
+        sum.checked_add(entry.amount)
+            .ok_or("해제 대기 발행량 합계가 u128 범위를 넘습니다.")
+    })?;
+    let total = liquid
+        .checked_add(delegated)
+        .and_then(|value| value.checked_add(unbonding))
+        .ok_or("총발행량 합계가 u128 범위를 넘습니다.")?;
+    if total > crate::genesis::IEUM_MAX_SUPPLY {
+        return Err("총발행량이 IEUM 최대 발행량 210,000,000을 넘습니다.".into());
+    }
+    Ok(())
 }
 
 fn apply_system_events(

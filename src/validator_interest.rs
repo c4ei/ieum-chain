@@ -15,6 +15,12 @@ fn round_to_twelve_decimals(value: u128) -> u128 {
         * INTEREST_ROUNDING_UNIT
 }
 
+/// Genesis 당일에는 하루치 이자를 선지급하지 않고 다음 KST 자정부터 허용합니다.
+pub fn mainnet_daily_reward_active(chain_id: u64, timestamp: u64) -> bool {
+    chain_id != 21_004
+        || timestamp >= crate::genesis::IEUM_MAINNET_GENESIS_TIME.saturating_add(DAY_SECONDS)
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct ValidatorInterestPolicy {
@@ -147,5 +153,12 @@ mod tests {
     fn one_event_id_per_kst_day() {
         assert_eq!(event_id(1_786_287_600), event_id(1_786_287_600 + 86_399));
         assert_ne!(event_id(1_786_287_600), event_id(1_786_287_600 + 86_400));
+    }
+    #[test]
+    fn mainnet_interest_starts_the_day_after_genesis() {
+        let first = crate::genesis::IEUM_MAINNET_GENESIS_TIME + DAY_SECONDS;
+        assert!(!mainnet_daily_reward_active(21_004, first - 1));
+        assert!(mainnet_daily_reward_active(21_004, first));
+        assert!(mainnet_daily_reward_active(21_005, 1));
     }
 }
