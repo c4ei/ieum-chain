@@ -2,6 +2,7 @@
   "chain_id": 21005,
   "network_name": "ieum-ci",
   "genesis_time": 1785942000,
+  "max_supply": 210000000000000000000000000,
   "initial_balances": [
     ["0xAda04f6eA65dc31079825e47296d0737A4594696", 10000000000000000000000],
     ["0xbcDf32f90E36d8D0883AC5aC8A46A7c575eAF507", 10000000000000000000000],

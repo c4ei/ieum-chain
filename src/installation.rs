@@ -3,6 +3,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 const MARKER_NAME: &str = ".ieum-initialized";
+const MAINNET_GENESIS_MARKER_VERSION: &str = "v0.23.9-foundation-allocation";
 
 /// 서명된 바이너리에 포함된 메인넷 Genesis를 실행 디렉터리의 설정 파일과 맞춥니다.
 /// 기존 파일은 최초 전환 시 한 번 보존하고, 임시 파일을 rename해 부분 쓰기를 막습니다.
@@ -13,9 +14,9 @@ pub fn synchronize_bundled_mainnet_genesis(path: &Path) -> Result<(), String> {
     genesis.validate_production_safety()?;
     if genesis.chain_id != 21_004
         || genesis.network_name != "ieum-mainnet"
-        || genesis.genesis_time != 1_787_065_200
+        || genesis.genesis_time != ieum_chain::genesis::IEUM_MAINNET_GENESIS_TIME
     {
-        return Err("번들 메인넷 Genesis 신원이 v0.23.5 기준과 다릅니다.".into());
+        return Err("번들 메인넷 Genesis 신원이 v0.23.9 기준과 다릅니다.".into());
     }
     if fs::read_to_string(path).ok().as_deref() == Some(bundled) {
         return Ok(());
@@ -27,7 +28,7 @@ pub fn synchronize_bundled_mainnet_genesis(path: &Path) -> Result<(), String> {
             .map_err(|error| format!("Genesis 설정 폴더 생성 실패: {error}"))?;
     }
     if path.exists() {
-        let backup = path.with_file_name("genesis.pre-mainnet-20260819.json");
+        let backup = path.with_file_name("genesis.pre-foundation-allocation-20260820.json");
         if !backup.exists() {
             fs::copy(path, &backup).map_err(|error| {
                 format!("기존 Genesis 백업 실패({}): {error}", backup.display())
@@ -54,7 +55,9 @@ pub fn prepare_mainnet_ledger_transition(
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("ledger");
-    let marker = data_dir.join(format!(".ieum-mainnet-genesis-{ledger_name}"));
+    let marker = data_dir.join(format!(
+        ".ieum-mainnet-genesis-{MAINNET_GENESIS_MARKER_VERSION}-{ledger_name}"
+    ));
     if marker.exists() {
         let recorded = fs::read_to_string(&marker).map_err(|error| error.to_string())?;
         if recorded.trim() != genesis_commitment {
@@ -66,7 +69,7 @@ pub fn prepare_mainnet_ledger_transition(
         .read_dir()
         .map(|mut entries| entries.next().is_some())
         .unwrap_or(false);
-    let backup = data_dir.join(format!("{ledger_name}.pre-mainnet-20260819"));
+    let backup = data_dir.join(format!("{ledger_name}.pre-foundation-allocation-20260820"));
     let moved = if has_data {
         if backup.exists() {
             return Err(format!(
@@ -565,9 +568,12 @@ mod tests {
             serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(installed.chain_id, 21_004);
         assert_eq!(installed.network_name, "ieum-mainnet");
-        assert_eq!(installed.genesis_time, 1_787_065_200);
+        assert_eq!(
+            installed.genesis_time,
+            ieum_chain::genesis::IEUM_MAINNET_GENESIS_TIME
+        );
         assert!(
-            root.join("config/genesis.pre-mainnet-20260819.json")
+            root.join("config/genesis.pre-foundation-allocation-20260820.json")
                 .exists()
         );
         fs::remove_dir_all(root).unwrap();

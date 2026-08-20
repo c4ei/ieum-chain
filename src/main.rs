@@ -1101,6 +1101,10 @@ async fn main() -> Result<(), String> {
                     }
                     let validator_interest_id = ieum_chain::validator_interest::event_id(timestamp);
                     if validator_interest_policy.enabled
+                        && ieum_chain::validator_interest::mainnet_daily_reward_active(
+                            consensus.chain.chain_id,
+                            timestamp,
+                        )
                         && !consensus.chain.executed_events().contains(&validator_interest_id)
                         && consensus.chain.executed_events().contains("ieum-bootstrap-validator-reward-v1")
                     {
@@ -1123,7 +1127,10 @@ async fn main() -> Result<(), String> {
                         }
                     }
                     let holder_event_id = ieum_chain::holder_rewards::event_id(timestamp);
-                    if holder_reward_policy.active(timestamp)
+                    if ieum_chain::validator_interest::mainnet_daily_reward_active(
+                        consensus.chain.chain_id,
+                        timestamp,
+                    ) && holder_reward_policy.active(timestamp)
                         && !consensus.chain.executed_events().contains(&holder_event_id)
                     {
                         let mut excluded = std::collections::HashSet::new();
@@ -1151,7 +1158,13 @@ async fn main() -> Result<(), String> {
                             }
                         }
                         let delegation_reward_id=ieum_chain::staking::reward_event_id(timestamp);
-                        if validator_interest_policy.enabled && !consensus.chain.executed_events().contains(&delegation_reward_id) {
+                        if validator_interest_policy.enabled
+                            && ieum_chain::validator_interest::mainnet_daily_reward_active(
+                                consensus.chain.chain_id,
+                                timestamp,
+                            )
+                            && !consensus.chain.executed_events().contains(&delegation_reward_id)
+                        {
                             let payments=ieum_chain::staking::calculate_rewards(consensus.chain.staking(),validator_interest_policy.annual_rate_bps,validator_interest_policy.maximum_daily_total);
                             if !payments.is_empty(){due_events.push(ScheduledEvent{id:delegation_reward_id,execute_at:ieum_chain::validator_interest::execute_at(timestamp),action:ScheduledEventAction::DelegationDailyReward{snapshot_height:consensus.chain.tip_height(),policy_hash:validator_interest_policy.hash(),annual_rate_bps:validator_interest_policy.annual_rate_bps,payments}});}
                         }

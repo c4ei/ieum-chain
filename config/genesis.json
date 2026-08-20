@@ -1,7 +1,8 @@
 {
   "chain_id": 21004,
   "network_name": "ieum-mainnet",
-  "genesis_time": 1787065200,
+  "genesis_time": 1787238000,
+  "max_supply": 210000000000000000000000000,
   "initial_balances": [
     [
       "0xAda04f6eA65dc31079825e47296d0737A4594696",
@@ -13,7 +14,7 @@
     ],
     [
       "0x356456fF1216B57a6f8891B195b42d296789B67D",
-      10000000000000000000000
+      21000000000000000000000000
     ],
     [
       "0x28c1da651c61d88902883adcCc7Df0Ed2Ed8931D",

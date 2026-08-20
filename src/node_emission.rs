@@ -12,16 +12,16 @@ pub const IEUM: u128 = 10u128.pow(IEUM_DECIMALS);
 /// Genesis와 향후 모든 신규 발행을 합한 IEUM 전역 최대 공급량입니다.
 pub const MAX_SUPPLY_IEUM: u128 = 210_000_000;
 pub const MAX_SUPPLY: u128 = MAX_SUPPLY_IEUM * IEUM;
-/// v0.23.5 메인넷 Genesis 공급량입니다.
-pub const MAINNET_GENESIS_SUPPLY_IEUM: u128 = 80_100;
+/// v0.23.9 메인넷 Genesis 공급량입니다.
+pub const MAINNET_GENESIS_SUPPLY_IEUM: u128 = 21_070_100;
 /// Normal 노드에 2040년 말까지 신규 발행할 수 있는 잔여 상한입니다.
 pub const TOTAL_NODE_EMISSION_IEUM: u128 = MAX_SUPPLY_IEUM - MAINNET_GENESIS_SUPPLY_IEUM;
 pub const TOTAL_NODE_EMISSION: u128 = TOTAL_NODE_EMISSION_IEUM * IEUM;
 
 /// 현재 0번 블록인 운영망에 100블록의 업그레이드 여유를 둡니다.
 pub const REWARD_ACTIVATION_HEIGHT: u64 = 100;
-/// 2026-08-10 00:00:00 KST (= 2026-08-09 15:00:00 UTC)입니다.
-pub const REWARD_ACTIVATION_UNIX: u64 = 1_786_287_600;
+/// v0.23.9 Genesis 이전에는 신규 노드 보상을 만들지 않습니다.
+pub const REWARD_ACTIVATION_UNIX: u64 = crate::genesis::IEUM_MAINNET_GENESIS_TIME;
 pub const REWARD_END_UNIX: u64 = 2_240_611_199; // 2040-12-31 23:59:59 UTC
 pub const REWARD_EPOCH_SECONDS: u64 = 24 * 60 * 60;
 pub const HALVING_SECONDS: u64 = 365 * REWARD_EPOCH_SECONDS;
