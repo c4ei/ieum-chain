@@ -94,6 +94,14 @@ impl Mempool {
         self.transactions.iter().take(max_count).cloned().collect()
     }
 
+    /// 표준 JSON-RPC가 확정 전 거래도 조회할 수 있도록 mempool 거래를 찾습니다.
+    pub fn transaction_by_hash(&self, hash: &str) -> Option<&Transaction> {
+        let wanted = hash.strip_prefix("0x").unwrap_or(hash);
+        self.transactions
+            .iter()
+            .find(|transaction| transaction.id().eq_ignore_ascii_case(wanted))
+    }
+
     /// 블록 최대 거래 수만큼 앞에서 꺼냅니다.
     /// 운영 버전에서는 수수료와 공정성을 함께 고려한 선택 정책이 필요합니다.
     pub fn drain(&mut self, max_count: usize) -> Vec<Transaction> {
@@ -139,5 +147,32 @@ impl Mempool {
 impl Default for Mempool {
     fn default() -> Self {
         Self::with_limits(DEFAULT_MAX_TRANSACTIONS, DEFAULT_MAX_BYTES)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::TransactionAction;
+
+    fn transaction() -> Transaction {
+        Transaction {
+            from: "0x1111111111111111111111111111111111111111".into(),
+            to: "0x2222222222222222222222222222222222222222".into(),
+            amount: 1,
+            fee: 1,
+            nonce: 0,
+            signature: "test-signature".into(),
+            action: TransactionAction::Transfer,
+        }
+    }
+
+    #[test]
+    fn pending_transaction_can_be_found_with_prefixed_hash() {
+        let mut pool = Mempool::default();
+        let transaction = transaction();
+        let hash = format!("0x{}", transaction.id());
+        pool.add(transaction.clone()).unwrap();
+        assert_eq!(pool.transaction_by_hash(&hash), Some(&transaction));
     }
 }

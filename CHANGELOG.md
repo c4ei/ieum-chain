@@ -1,5 +1,12 @@
 # 변경 기록
 
+## 0.23.11 - 2026-08-21
+
+- 제출되어 mempool에서 확정을 기다리는 거래도 `eth_getTransactionByHash`로 조회
+- pending 거래에는 블록 필드를 `null`, `ieumPending=true`로 반환해 확정 거래와 구분
+- RPC·노드·mempool·Docker 4노드 상태를 한 번에 확인하는 `ieum-doctor.sh` 추가
+- Release의 긴 OS별 빌드 전에 버전·포맷·Clippy·전체 테스트를 한 번 통과하도록 사전검사 분리
+
 ## 0.23.10 - 2026-08-21
 
 - BFT 라운드 변경 뒤 runtime 보조 캐시가 비어도 검증 완료된 prevote 기록에서

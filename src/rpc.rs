@@ -787,9 +787,13 @@ fn dispatch(
                             (block.clone(), index, transaction.clone())
                         })
                 });
-            Ok(transaction
-                .as_ref()
-                .map(|(block, index, transaction)| transaction_json(block, *index, transaction))
+            if let Some((block, index, transaction)) = transaction.as_ref() {
+                return Ok(transaction_json(block, *index, transaction));
+            }
+            Ok(state
+                .pool
+                .transaction_by_hash(hash)
+                .map(pending_transaction_json)
                 .unwrap_or(Value::Null))
         }
         "eth_getBlockTransactionCountByNumber" => {
@@ -1636,6 +1640,31 @@ fn transaction_json(block: &Block, index: usize, transaction: &Transaction) -> V
     })
 }
 
+fn pending_transaction_json(transaction: &Transaction) -> Value {
+    let (gas_price, gas_limit) = crate::raw_transaction::ethereum_fee_terms(transaction);
+    json!({
+        "hash": format!("0x{}", transaction.id()),
+        "nonce": quantity(transaction.nonce),
+        "blockHash": Value::Null,
+        "blockNumber": Value::Null,
+        "transactionIndex": Value::Null,
+        "from": transaction.from,
+        "to": transaction.to,
+        "value": quantity_u128(transaction.amount),
+        "gas": quantity_u128(gas_limit),
+        "gasPrice": quantity_u128(gas_price),
+        "input": match &transaction.action {
+            crate::model::TransactionAction::Transfer => "0x".into(),
+            action => format!(
+                "0x{}",
+                hex::encode(serde_json::to_vec(action).unwrap_or_default())
+            ),
+        },
+        "ieumAction": &transaction.action,
+        "ieumPending": true
+    })
+}
+
 fn parse_quantity_u64(value: &str) -> Result<u64, (i64, String)> {
     let hex = value
         .strip_prefix("0x")
@@ -1735,6 +1764,30 @@ mod tests {
             .unwrap(),
             json!("0x0")
         );
+    }
+
+    #[test]
+    fn submitted_transaction_is_queryable_while_pending() {
+        let shared =
+            RpcServer::new(test_rpc_config("submitted-transaction-queryable-pending")).state;
+        let accounts = dispatch(&shared, "eth_accounts", &[])
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .clone();
+        let faucet = accounts[0].as_str().unwrap();
+        let receiver = dispatch(&shared, "personal_newAccount", &[])
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .to_string();
+        let tx = json!({"from": faucet, "to": receiver, "value": "0x64", "gasPrice": "0x1"});
+        let hash = dispatch(&shared, "eth_sendTransaction", &[tx]).unwrap();
+        let pending = dispatch(&shared, "eth_getTransactionByHash", &[hash]).unwrap();
+        assert_eq!(pending["blockHash"], Value::Null);
+        assert_eq!(pending["blockNumber"], Value::Null);
+        assert_eq!(pending["ieumPending"], true);
+        assert_eq!(pending["to"], receiver);
     }
 
     #[test]

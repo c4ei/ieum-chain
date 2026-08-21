@@ -1,6 +1,8 @@
-# IEUM Chain v0.23.10 메인넷 실행 안내
+# IEUM Chain v0.23.11 메인넷 실행 안내
 
-v0.23.10은 검증자가 잠긴 값의 `valid_round` 증명을 runtime 캐시에서 잃더라도
+v0.23.11은 확정 전 mempool 거래 조회와 운영 진단 스크립트를 추가합니다. 자세한 내용은
+[`docs/VERSION_0.23.11_PENDING_TRANSACTION_DIAGNOSTICS.md`](docs/VERSION_0.23.11_PENDING_TRANSACTION_DIAGNOSTICS.md)를
+참고하세요. v0.23.10은 검증자가 잠긴 값의 `valid_round` 증명을 runtime 캐시에서 잃더라도
 검증 완료된 prevote 기록에서 다시 구성합니다. 증명이 불완전하면 충돌 블록을
 제안하지 않고 거래를 보존합니다. 운영 복구와 배포 순서는
 [`docs/VERSION_0.23.10_BFT_VALID_ROUND_RECONSTRUCTION.md`](docs/VERSION_0.23.10_BFT_VALID_ROUND_RECONSTRUCTION.md)를
