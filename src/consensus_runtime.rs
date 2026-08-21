@@ -171,13 +171,33 @@ impl ConsensusRuntime {
                 (Some(valid_block), Some((valid_hash, valid_round)))
                     if valid_block.hash == valid_hash =>
                 {
-                    (
-                        valid_block.clone(),
-                        Some(valid_round),
-                        self.valid_round_prevotes.clone(),
-                    )
+                    // 라운드 변경 메시지가 빠르게 연속 도착하면 runtime 캐시보다
+                    // consensus의 검증 완료 투표 기록이 더 최신일 수 있습니다. 잠긴
+                    // 노드가 새 제안을 안전하게 해제할 수 있도록 증명을 원본 기록에서
+                    // 다시 구성하고, 캐시는 하위 호환 복구용으로만 사용합니다.
+                    let reconstructed = self.consensus.prevote_certificate(valid_hash, valid_round);
+                    let proof = if reconstructed.is_empty() {
+                        self.valid_round_prevotes.clone()
+                    } else {
+                        reconstructed
+                    };
+                    if proof.is_empty() {
+                        return Err(
+                            "valid value의 prevote 증명을 복구하지 못해 충돌 제안을 보류합니다."
+                                .into(),
+                        );
+                    }
+                    (valid_block.clone(), Some(valid_round), proof)
                 }
-                _ => (block, None, Vec::new()),
+                (None, Some(_)) => {
+                    return Err(
+                        "valid value의 블록 본문을 복구하지 못해 충돌 제안을 보류합니다.".into(),
+                    );
+                }
+                (Some(_), Some(_)) => {
+                    return Err("valid value와 보관 블록이 달라 충돌 제안을 보류합니다.".into());
+                }
+                (_, None) => (block, None, Vec::new()),
             };
         let proposer_id = self.validator.address();
         let signature = self.validator.sign_bytes(&SignedProposal::bytes_to_sign(
@@ -1150,5 +1170,64 @@ mod tests {
         assert_eq!(runtime.round(), 1);
         assert_eq!(vote.round, 0);
         vote.verify().unwrap();
+    }
+
+    #[test]
+    fn later_proposal_reconstructs_valid_round_proof_after_cache_loss() {
+        let keys: Vec<_> = (1..=4)
+            .map(|value| Wallet::from_seed([value; 32]))
+            .collect();
+        let validators: Vec<_> = keys
+            .iter()
+            .map(|key| Validator::new(key.address(), 100))
+            .collect();
+        let chain = Blockchain::new(vec![(keys[0].address(), 1_000)]);
+        let mut runtime = ConsensusRuntime::new(
+            chain,
+            validators,
+            Wallet::from_seed([1; 32]),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        let proposer = keys
+            .iter()
+            .find(|key| key.address() == runtime.consensus.expected_proposer())
+            .unwrap();
+        let first = Block::new(
+            1,
+            runtime.chain.blocks.last().unwrap().hash.clone(),
+            1,
+            proposer.address(),
+            Vec::new(),
+        );
+        let proposal = SignedProposal::new(1, 0, proposer, first.clone());
+        runtime.receive_proposal(proposal).unwrap();
+        for key in keys.iter().take(3) {
+            let _ = runtime.receive_vote(ConsensusMessage::prevote(1, 0, key, &first.hash));
+        }
+        assert_eq!(
+            runtime.consensus.valid_value(),
+            Some((first.hash.as_str(), 0))
+        );
+
+        // 운영 장애와 동일하게 runtime 보조 캐시가 비어도 consensus의 서명 기록은
+        // 남아 있습니다. 이후 제안은 임의의 새 블록이 아니라 기존 valid value와
+        // 2/3 초과 증명을 반드시 재사용해야 합니다.
+        runtime.valid_round_prevotes.clear();
+        while !runtime.can_make_proposal() {
+            runtime.force_timeout_for_test().unwrap();
+        }
+        let fallback = Block::new(
+            1,
+            runtime.chain.blocks.last().unwrap().hash.clone(),
+            2,
+            keys[0].address(),
+            Vec::new(),
+        );
+        let recovered = runtime.make_proposal(fallback).unwrap();
+
+        assert_eq!(recovered.block.hash, first.hash);
+        assert_eq!(recovered.valid_round, Some(0));
+        assert!(recovered.valid_round_prevotes.len() >= 3);
     }
 }

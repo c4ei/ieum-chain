@@ -1,4 +1,10 @@
-# IEUM Chain v0.23.9 메인넷 실행 안내
+# IEUM Chain v0.23.10 메인넷 실행 안내
+
+v0.23.10은 검증자가 잠긴 값의 `valid_round` 증명을 runtime 캐시에서 잃더라도
+검증 완료된 prevote 기록에서 다시 구성합니다. 증명이 불완전하면 충돌 블록을
+제안하지 않고 거래를 보존합니다. 운영 복구와 배포 순서는
+[`docs/VERSION_0.23.10_BFT_VALID_ROUND_RECONSTRUCTION.md`](docs/VERSION_0.23.10_BFT_VALID_ROUND_RECONSTRUCTION.md)를
+따르세요.
 
 v0.23.9는 최대 발행량 210,000,000 IEUM과 재단 최초 배분량 21,000,000 IEUM을
 제네시스 합의 규칙으로 고정합니다. 기존 운영 원장은 백업 후 새 제네시스로 전환해야 합니다.

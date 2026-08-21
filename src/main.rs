@@ -1205,7 +1205,10 @@ async fn main() -> Result<(), String> {
                                 }
                                 finalize_if_ready(&mut consensus, &rpc, &commands, &finality_store).await?;
                             }
-                            Err(_) => {
+                            Err(error) => {
+                                log_error!(
+                                    "[BFT 안전 제안 보류] valid_round 복구가 완료될 때까지 새 제안을 만들지 않습니다: {error}"
+                                );
                                 for transaction in &pending {
                                     commands.send(NetworkCommand::PublishTransaction(transaction.clone())).await.map_err(|e| e.to_string())?;
                                 }
