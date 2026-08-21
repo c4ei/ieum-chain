@@ -102,6 +102,20 @@ impl Mempool {
             .find(|transaction| transaction.id().eq_ignore_ascii_case(wanted))
     }
 
+    /// 확정 nonce 뒤에 연속으로 대기 중인 거래까지 포함한 다음 nonce입니다.
+    pub fn next_nonce(&self, address: &str, finalized_nonce: u64) -> u64 {
+        let mut next = finalized_nonce;
+        while self.transactions.iter().any(|transaction| {
+            transaction.from.eq_ignore_ascii_case(address) && transaction.nonce == next
+        }) {
+            let Some(incremented) = next.checked_add(1) else {
+                break;
+            };
+            next = incremented;
+        }
+        next
+    }
+
     /// 블록 최대 거래 수만큼 앞에서 꺼냅니다.
     /// 운영 버전에서는 수수료와 공정성을 함께 고려한 선택 정책이 필요합니다.
     pub fn drain(&mut self, max_count: usize) -> Vec<Transaction> {
@@ -174,5 +188,24 @@ mod tests {
         let hash = format!("0x{}", transaction.id());
         pool.add(transaction.clone()).unwrap();
         assert_eq!(pool.transaction_by_hash(&hash), Some(&transaction));
+    }
+
+    #[test]
+    fn pending_nonce_advances_only_over_contiguous_sender_transactions() {
+        let mut pool = Mempool::default();
+        let mut first = transaction();
+        first.nonce = 3;
+        let mut second = transaction();
+        second.nonce = 4;
+        pool.add(first).unwrap();
+        pool.add(second).unwrap();
+        assert_eq!(
+            pool.next_nonce("0x1111111111111111111111111111111111111111", 3),
+            5
+        );
+        assert_eq!(
+            pool.next_nonce("0x2222222222222222222222222222222222222222", 3),
+            3
+        );
     }
 }

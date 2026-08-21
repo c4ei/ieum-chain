@@ -728,7 +728,13 @@ fn dispatch(
             let address = string_param(params, 0)?;
             let state = read_state(state)?;
             let ledger_address = resolve_ledger_address(&state, address);
-            Ok(json!(quantity(state.chain.next_nonce(&ledger_address))))
+            let finalized_nonce = state.chain.next_nonce(&ledger_address);
+            let nonce = if params.get(1).and_then(Value::as_str) == Some("pending") {
+                state.pool.next_nonce(&ledger_address, finalized_nonce)
+            } else {
+                finalized_nonce
+            };
+            Ok(json!(quantity(nonce)))
         }
         "eth_gasPrice" => Ok(json!("0x1")),
         "eth_estimateGas" => Ok(json!("0x5208")),
@@ -1788,6 +1794,24 @@ mod tests {
         assert_eq!(pending["blockNumber"], Value::Null);
         assert_eq!(pending["ieumPending"], true);
         assert_eq!(pending["to"], receiver);
+        assert_eq!(
+            dispatch(
+                &shared,
+                "eth_getTransactionCount",
+                &[json!(faucet), json!("latest")]
+            )
+            .unwrap(),
+            json!("0x0")
+        );
+        assert_eq!(
+            dispatch(
+                &shared,
+                "eth_getTransactionCount",
+                &[json!(faucet), json!("pending")]
+            )
+            .unwrap(),
+            json!("0x1")
+        );
     }
 
     #[test]

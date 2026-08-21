@@ -1,6 +1,8 @@
-# IEUM Chain v0.23.11 메인넷 실행 안내
+# IEUM Chain v0.23.12 메인넷 실행 안내
 
-v0.23.11은 확정 전 mempool 거래 조회와 운영 진단 스크립트를 추가합니다. 자세한 내용은
+v0.23.12는 Wallet의 중복 nonce 전송을 막기 위해 pending nonce 조회를 보완합니다.
+자세한 내용은 [`docs/VERSION_0.23.12_PENDING_NONCE.md`](docs/VERSION_0.23.12_PENDING_NONCE.md)를
+참고하세요. v0.23.11은 확정 전 mempool 거래 조회와 운영 진단 스크립트를 추가했습니다.
 [`docs/VERSION_0.23.11_PENDING_TRANSACTION_DIAGNOSTICS.md`](docs/VERSION_0.23.11_PENDING_TRANSACTION_DIAGNOSTICS.md)를
 참고하세요. v0.23.10은 검증자가 잠긴 값의 `valid_round` 증명을 runtime 캐시에서 잃더라도
 검증 완료된 prevote 기록에서 다시 구성합니다. 증명이 불완전하면 충돌 블록을
