@@ -400,6 +400,31 @@ kill "${pids[3]}"
 wait "${pids[3]}" 2>/dev/null || true
 echo "노드 4 중단 완료: height=$height_before_rejoin"
 
+# QUIC 종료 감지는 프로세스 종료보다 늦을 수 있다. 같은 영구 PeerId를 즉시 다시
+# 연결하면 기존 연결과 새 연결이 겹쳐 GossipSub가 구독 정보를 다시 교환하지 않는
+# 경합이 생기므로, 생존 노드 모두가 기존 연결 종료를 확인한 뒤 재기동한다.
+node4_disconnected=false
+for _ in $(seq 1 60); do
+  node4_disconnected=true
+  remaining_peer_counts=()
+  for index in 1 2 3; do
+    status="$(rpc "$((9200 + index))" ieum_nodeStatus '[]' 2>/dev/null)" || { node4_disconnected=false; break; }
+    peers="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["result"]["peers"])' <<<"$status")" || { node4_disconnected=false; break; }
+    remaining_peer_counts+=("$peers")
+    if [[ "$peers" -gt 2 ]]; then
+      node4_disconnected=false
+    fi
+  done
+  [[ "$node4_disconnected" == true ]] && break
+  sleep 0.5
+done
+[[ "$node4_disconnected" == true ]] || {
+  echo "생존 노드가 노드 4의 기존 연결 종료를 확인하지 못했습니다: peers=${remaining_peer_counts[*]:-확인불가}"
+  dump_logs
+  exit 1
+}
+echo "노드 4 P2P 연결 종료 확인: peers=${remaining_peer_counts[*]}"
+
 second_send_response="$(rpc 9202 eth_sendTransaction \
   "[{\"from\":\"$faucet\",\"to\":\"$recipient\",\"value\":\"$transfer_value\",\"gas\":\"0x5208\",\"gasPrice\":\"0x1\"}]")"
 second_transaction_hash="$(python3 - "$second_send_response" <<'PY'
