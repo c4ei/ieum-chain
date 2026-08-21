@@ -1,5 +1,12 @@
 # 변경 기록
 
+## 0.23.12 - 2026-08-21
+
+- `eth_getTransactionCount(address, "pending")`가 해당 발신자의 연속 mempool nonce 포함
+- `latest`는 확정 nonce만 유지해 Wallet이 기존 대기 거래를 정확히 감지 가능
+- 다른 주소의 대기 거래와 nonce 중간 공백을 섞지 않는 회귀 테스트 추가
+
+
 ## 0.23.11 - 2026-08-21
 
 - 제출되어 mempool에서 확정을 기다리는 거래도 `eth_getTransactionByHash`로 조회
