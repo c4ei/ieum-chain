@@ -187,6 +187,8 @@ pub enum WireMessage {
     },
     SyncResponse {
         requester: String,
+        /// 응답별 gossipsub message-id가 달라지도록 원 응답자를 포함합니다.
+        responder: String,
         tip: SyncTip,
         certificates: Vec<FinalityCertificate>,
     },
@@ -736,6 +738,7 @@ impl P2pNode {
                                     SYNC_TOPIC,
                                     &WireMessage::SyncResponse {
                                         requester,
+                                        responder: local_peer_id.to_string(),
                                         tip,
                                         certificates,
                                     },
@@ -1195,10 +1198,18 @@ async fn handle_swarm_event(
                 },
                 WireMessage::SyncResponse {
                     requester,
+                    responder,
                     tip,
                     certificates,
                 } => {
                     if requester != swarm.local_peer_id().to_string() {
+                        return Ok(());
+                    }
+                    if responder != message_source.to_string() {
+                        guard.penalize(&message_source.to_string(), 100);
+                        crate::log_error!(
+                            "[P2P 동기화 응답 거부] 서명 발신자와 responder PeerId가 다릅니다."
+                        );
                         return Ok(());
                     }
                     NetworkEvent::SyncReceived {
@@ -1579,6 +1590,25 @@ mod connection_log_tests {
     fn compressed_wire_magic_has_binary_version_byte() {
         assert_eq!(COMPRESSED_WIRE_MAGIC, &[b'I', b'E', b'U', b'M', b'Z', 0x01]);
         assert_eq!(WIRE_HEADER_BYTES, 10);
+    }
+
+    #[test]
+    fn sync_responses_from_independent_peers_have_distinct_wire_ids() {
+        let tip = SyncTip {
+            height: 3,
+            block_hash: "block-3".into(),
+            state_root: "state-3".into(),
+        };
+        let response = |responder: &str| WireMessage::SyncResponse {
+            requester: "rejoining-node".into(),
+            responder: responder.into(),
+            tip: tip.clone(),
+            certificates: Vec::new(),
+        };
+
+        let peer_a = encode_wire_message(&response("peer-a")).unwrap();
+        let peer_b = encode_wire_message(&response("peer-b")).unwrap();
+        assert_ne!(peer_a, peer_b);
     }
 
     #[test]

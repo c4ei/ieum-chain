@@ -283,8 +283,8 @@ fn sibling(current: &Path, suffix: &str) -> Result<PathBuf, String> {
 
 pub fn is_newer(current: &str, candidate: &str) -> Result<bool, String> {
     fn parts(value: &str) -> Result<Vec<u64>, String> {
-        value
-            .trim_start_matches('v')
+        let normalized = value.trim_start_matches('v').replace('-', ".");
+        normalized
             .split('.')
             .map(|part| {
                 part.parse::<u64>()
@@ -349,6 +349,8 @@ mod tests {
         assert!(is_newer("0.16.2", "0.17.0").unwrap());
         assert!(!is_newer("0.17.0", "0.17.0").unwrap());
         assert!(!is_newer("0.17.1", "0.17.0").unwrap());
+        assert!(!is_newer("1.0.0-1", "1.0.0.1").unwrap());
+        assert!(is_newer("0.23.12", "1.0.0.1").unwrap());
     }
 
     #[cfg(target_os = "linux")]

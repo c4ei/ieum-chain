@@ -37,7 +37,10 @@ jobs:
         run: |
           set -euo pipefail
           cargo_version="$(cargo metadata --no-deps --format-version 1 | python -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')"
-          tag_version="${RELEASE_TAG#v}"
+          display_version="${RELEASE_TAG#v}"
+          IFS='.' read -r major minor patch build extra <<<"$display_version"
+          test -z "${extra:-}" && test -n "${build:-}"
+          tag_version="${major}.${minor}.${patch}-${build}"
           test "$cargo_version" = "$tag_version" || {
             echo "Cargo version ($cargo_version) does not match tag ($tag_version)." >&2
             exit 1
