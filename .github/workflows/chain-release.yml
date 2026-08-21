@@ -18,7 +18,36 @@ permissions:
   contents: read
 
 jobs:
+  preflight:
+    name: Fast release checks before OS builds
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Verify tag matches Cargo version
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo_version="$(cargo metadata --no-deps --format-version 1 | python -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')"
+          tag_version="${RELEASE_TAG#v}"
+          test "$cargo_version" = "$tag_version" || {
+            echo "Cargo version ($cargo_version) does not match tag ($tag_version)." >&2
+            exit 1
+          }
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-targets --all-features --locked -- -D warnings
+      - run: cargo test --all-targets --all-features --locked
+
   build:
+    needs: preflight
     name: ${{ matrix.asset }}
     strategy:
       fail-fast: false
@@ -44,7 +73,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - name: Check out source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           ref: ${{ env.RELEASE_TAG }}
 
@@ -73,20 +102,6 @@ jobs:
             -o Acquire::http::Timeout=20 \
             -o Acquire::https::Timeout=20
           sudo apt-get install -y --no-install-recommends libsqlite3-dev
-
-      - name: Verify tag matches Cargo version
-        shell: bash
-        run: |
-          set -euo pipefail
-          cargo_version="$(cargo metadata --no-deps --format-version 1 | python -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')"
-          tag_version="${RELEASE_TAG#v}"
-          test "$cargo_version" = "$tag_version" || {
-            echo "Cargo version ($cargo_version) does not match tag ($tag_version)." >&2
-            exit 1
-          }
-
-      - name: Test
-        run: cargo test --all-targets --all-features --locked
 
       - name: Build release binary
         run: cargo build --release --locked --target ${{ matrix.target }}
@@ -129,7 +144,7 @@ jobs:
       contents: write
     steps:
       - name: Check out tagged source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           ref: ${{ env.RELEASE_TAG }}
 
