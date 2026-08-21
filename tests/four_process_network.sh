@@ -303,6 +303,7 @@ PY
 )"
 echo "0.1 IEUM 송금 제출 완료: $transaction_hash"
 
+bft_passed=false
 for _ in $(seq 1 60); do
   heights=()
   roots=()
@@ -378,13 +379,83 @@ PY
      [[ "${recipient_balances[2]}" == "$expected_recipient_balance" ]] &&
      [[ "${recipient_balances[3]}" == "$expected_recipient_balance" ]]; then
     echo "4-process BFT passed: heights=${heights[*]}, stateRoot=${roots[0]}, recipientBalance=${recipient_balances[0]}"
-    exit 0
+    bft_passed=true
+    break
   fi
 
   sleep 0.5
 done
 
-echo "4프로세스 BFT 합의가 제한 시간 안에 완료되지 않았습니다."
-echo "마지막 관측: heights=${heights[*]:-확인불가}, roots=${roots[*]:-확인불가}, recipientBalances=${recipient_balances[*]:-확인불가}"
-dump_logs
-exit 1
+if [[ "$bft_passed" != true ]]; then
+  echo "4프로세스 BFT 합의가 제한 시간 안에 완료되지 않았습니다."
+  echo "마지막 관측: heights=${heights[*]:-확인불가}, roots=${roots[*]:-확인불가}, recipientBalances=${recipient_balances[*]:-확인불가}"
+  dump_logs
+  exit 1
+fi
+
+# 한 검증자를 실제로 중단한 동안 나머지 3개 노드가 블록을 확정하고, 같은 데이터
+# 디렉터리로 재기동한 검증자가 자동 동기화한 뒤 다시 동일 상태를 제공하는지 검증한다.
+height_before_rejoin="${heights[0]}"
+kill "${pids[3]}"
+wait "${pids[3]}" 2>/dev/null || true
+echo "노드 4 중단 완료: height=$height_before_rejoin"
+
+second_send_response="$(rpc 9202 eth_sendTransaction \
+  "[{\"from\":\"$faucet\",\"to\":\"$recipient\",\"value\":\"$transfer_value\",\"gas\":\"0x5208\",\"gasPrice\":\"0x1\"}]")"
+second_transaction_hash="$(python3 - "$second_send_response" <<'PY'
+import json,sys
+response=json.loads(sys.argv[1])
+if "error" in response:
+    raise SystemExit(f"재합류 시험용 송금 제출 실패: {response['error']}")
+print(response["result"])
+PY
+)"
+expected_after_rejoin="$((expected_recipient_balance + transfer_amount_wei))"
+
+three_node_passed=false
+for _ in $(seq 1 80); do
+  three_node_passed=true
+  for index in 1 2 3; do
+    status="$(rpc "$((9200 + index))" ieum_nodeStatus '[]')" || { three_node_passed=false; break; }
+    height="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["result"]["height"])' <<<"$status")"
+    balance="$(rpc "$((9200 + index))" eth_getBalance "[\"$recipient\",\"latest\"]" | python3 -c 'import json,sys; print(int(json.load(sys.stdin)["result"],16))')"
+    if [[ "$height" -le "$height_before_rejoin" || "$balance" != "$expected_after_rejoin" ]]; then
+      three_node_passed=false
+      break
+    fi
+  done
+  [[ "$three_node_passed" == true ]] && break
+  sleep 0.5
+done
+[[ "$three_node_passed" == true ]] || { echo "노드 4 중단 중 3노드 확정 실패"; dump_logs; exit 1; }
+
+start_node 4 "$peer_1" "$peer_2" "$peer_3"
+pids[3]="${pids[4]}"
+unset 'pids[4]'
+wait_for_rpc 4
+
+rejoin_passed=false
+for _ in $(seq 1 120); do
+  heights=(); roots=(); recipient_balances=(); rejoin_passed=true
+  for index in 1 2 3 4; do
+    status="$(rpc "$((9200 + index))" ieum_nodeStatus '[]' 2>/dev/null)" || { rejoin_passed=false; break; }
+    parsed="$(python3 -c 'import json,sys;r=json.load(sys.stdin)["result"];print(r["height"]);print(r["stateRoot"])' <<<"$status")" || { rejoin_passed=false; break; }
+    heights+=("$(sed -n '1p' <<<"$parsed")")
+    roots+=("$(sed -n '2p' <<<"$parsed")")
+    recipient_balances+=("$(rpc "$((9200 + index))" eth_getBalance "[\"$recipient\",\"latest\"]" | python3 -c 'import json,sys;print(int(json.load(sys.stdin)["result"],16))')")
+  done
+  if [[ "$rejoin_passed" == true ]] &&
+     [[ "${heights[0]}" == "${heights[1]}" && "${heights[1]}" == "${heights[2]}" && "${heights[2]}" == "${heights[3]}" ]] &&
+     [[ "${roots[0]}" == "${roots[1]}" && "${roots[1]}" == "${roots[2]}" && "${roots[2]}" == "${roots[3]}" ]] &&
+     [[ "${recipient_balances[3]}" == "$expected_after_rejoin" ]]; then
+    receipt="$(rpc 9204 eth_getTransactionReceipt "[\"$second_transaction_hash\"]")"
+    python3 -c 'import json,sys; assert json.load(sys.stdin).get("result") is not None' <<<"$receipt" || rejoin_passed=false
+    [[ "$rejoin_passed" == true ]] && break
+  else
+    rejoin_passed=false
+  fi
+  sleep 0.5
+done
+
+[[ "$rejoin_passed" == true ]] || { echo "노드 4 자동 재합류 실패"; dump_logs; exit 1; }
+echo "4-process restart/rejoin passed: heights=${heights[*]}, stateRoot=${roots[0]}, receipt=$second_transaction_hash"

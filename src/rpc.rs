@@ -1200,7 +1200,7 @@ fn dispatch(
         "ieum_nodeStatus" => {
             let state = read_state(state)?;
             Ok(json!({
-                "version": env!("CARGO_PKG_VERSION"),
+                "version": crate::IEUM_DISPLAY_VERSION,
                 "chainId": state.chain_id,
                 "height": state.chain.tip_height(),
                 "blockHash": format!("0x{}", state.chain.tip_hash()),

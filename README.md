@@ -1,4 +1,6 @@
-# IEUM Chain v0.23.12 메인넷 실행 안내
+# IEUM Chain v1.0.0.1 메인넷 실행 안내
+
+운영 안정화 최종 변경은 [`docs/VERSION_1.0.0.1_OPERATION_FINAL.md`](docs/VERSION_1.0.0.1_OPERATION_FINAL.md)를 참고하세요.
 
 v0.23.12는 Wallet의 중복 nonce 전송을 막기 위해 pending nonce 조회를 보완합니다.
 자세한 내용은 [`docs/VERSION_0.23.12_PENDING_NONCE.md`](docs/VERSION_0.23.12_PENDING_NONCE.md)를

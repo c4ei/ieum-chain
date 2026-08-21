@@ -34,7 +34,11 @@ const SUPPORTED_PROTOCOL_VERSION: u32 = 3;
 mod installation;
 
 #[derive(Debug, Parser)]
-#[command(name = "ieum-chain", version, about = "가벼운 IEUM 메인넷 노드")]
+#[command(
+    name = "ieum-chain",
+    version = "1.0.0.1",
+    about = "가벼운 IEUM 메인넷 노드"
+)]
 struct Args {
     /// 실행 역할. 생략하면 기존 검증자 자격을 안전하게 감지하고 나머지는 일반 노드로
     /// 시작합니다.
@@ -954,7 +958,7 @@ async fn main() -> Result<(), String> {
                     Err(error) => log_error!("[자동 업데이트 실패] {error}"),
                 }
                 commands.send(NetworkCommand::PublishUpdateAvailable {
-                    version: env!("CARGO_PKG_VERSION").to_string(),
+                    version: ieum_chain::IEUM_DISPLAY_VERSION.to_string(),
                 }).await.map_err(|error| error.to_string())?;
             }
             _ = registration_tick.tick() => {
@@ -1252,7 +1256,7 @@ async fn main() -> Result<(), String> {
                         )).await.map_err(|e| e.to_string())?;
                         if auto_update.is_some() {
                             commands.send(NetworkCommand::PublishUpdateAvailable {
-                                version: env!("CARGO_PKG_VERSION").to_string(),
+                                version: ieum_chain::IEUM_DISPLAY_VERSION.to_string(),
                             }).await.map_err(|error| error.to_string())?;
                         }
                     }
@@ -1347,7 +1351,7 @@ async fn main() -> Result<(), String> {
                         let Some((_, config)) = auto_update.as_ref() else {
                             continue;
                         };
-                        if !ieum_chain::updater::is_newer(env!("CARGO_PKG_VERSION"), &version)
+                        if !ieum_chain::updater::is_newer(ieum_chain::IEUM_DISPLAY_VERSION, &version)
                             .unwrap_or(false)
                         {
                             continue;
