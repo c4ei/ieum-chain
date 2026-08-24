@@ -15,7 +15,7 @@ use libp2p::{
     swarm::{ConnectionId, NetworkBehaviour, SwarmEvent},
 };
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr};
 use std::time::{Duration, Instant};
@@ -26,6 +26,7 @@ pub const BLOCK_TOPIC: &str = "ieum-chain/blocks/1";
 pub const CONSENSUS_TOPIC: &str = "ieum-chain/consensus/2";
 pub const SYNC_TOPIC: &str = "ieum-chain/sync/2";
 pub const COMMUNICATION_PROTOCOL: &str = "/ieum-chain/communication/1";
+pub const SYNC_PROTOCOL: &str = "/ieum-chain/sync/1";
 // The suffix is one binary framing-version byte, not the four text bytes "\x01".
 const COMPRESSED_WIRE_MAGIC: &[u8; 6] = b"IEUMZ\x01";
 const COMPRESSION_THRESHOLD_BYTES: usize = 1_024;
@@ -195,6 +196,20 @@ pub enum WireMessage {
     SnapshotAttestation(SnapshotAttestation),
     // 새 variant는 bincode enum index 호환성을 위해 항상 기존 variant 뒤에 추가합니다.
     RoundChange(SignedRoundChange),
+}
+
+/// GossipSub 토픽 상태와 무관하게 연결된 피어에게 직접 보내는 원장 동기화 요청입니다.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct DirectSyncRequest {
+    from_height: u64,
+}
+
+/// 직접 연결에서 반환하는 tip과 BFT 확정 인증서입니다.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct DirectSyncResponse {
+    responder: String,
+    tip: SyncTip,
+    certificates: Vec<FinalityCertificate>,
 }
 
 /// 노드 코어가 비동기 P2P 작업에 보내는 명령입니다.
@@ -468,6 +483,7 @@ struct IeumBehaviour {
     kademlia: kad::Behaviour<kad::store::MemoryStore>,
     identify: identify::Behaviour,
     communication: request_response::cbor::Behaviour<CommunicationEnvelope, CommunicationAck>,
+    sync: request_response::cbor::Behaviour<DirectSyncRequest, DirectSyncResponse>,
 }
 
 #[derive(Debug)]
@@ -482,6 +498,7 @@ enum IeumBehaviourEvent {
     Kademlia(kad::Event),
     Identify(Box<identify::Event>),
     Communication(request_response::Event<CommunicationEnvelope, CommunicationAck>),
+    Sync(request_response::Event<DirectSyncRequest, DirectSyncResponse>),
 }
 
 impl From<relay::client::Event> for IeumBehaviourEvent {
@@ -532,6 +549,11 @@ impl From<identify::Event> for IeumBehaviourEvent {
 impl From<request_response::Event<CommunicationEnvelope, CommunicationAck>> for IeumBehaviourEvent {
     fn from(value: request_response::Event<CommunicationEnvelope, CommunicationAck>) -> Self {
         Self::Communication(value)
+    }
+}
+impl From<request_response::Event<DirectSyncRequest, DirectSyncResponse>> for IeumBehaviourEvent {
+    fn from(value: request_response::Event<DirectSyncRequest, DirectSyncResponse>) -> Self {
+        Self::Sync(value)
     }
 }
 
@@ -604,6 +626,14 @@ impl P2pNode {
                         request_response::Config::default()
                             .with_request_timeout(Duration::from_secs(10)),
                     );
+                    let sync = request_response::cbor::Behaviour::new(
+                        [(
+                            StreamProtocol::new(SYNC_PROTOCOL),
+                            request_response::ProtocolSupport::Full,
+                        )],
+                        request_response::Config::default()
+                            .with_request_timeout(Duration::from_secs(10)),
+                    );
                     // 채굴장 내부의 다른 NAT 노드를 공인 판정 서버로 임의 선택하지
                     // 않고, bootstrap.json에 고정한 공개 노드만 사용합니다.
                     let autonat_config = autonat::Config {
@@ -623,6 +653,7 @@ impl P2pNode {
                         kademlia,
                         identify,
                         communication,
+                        sync,
                     })
                 },
             )
@@ -659,6 +690,10 @@ impl P2pNode {
         let mut guard = PeerGuard::new(config.ban_duration);
         let mut connected_at: HashMap<ConnectionId, Instant> = HashMap::new();
         let mut same_lan_peers = HashSet::new();
+        let mut pending_sync_responses = HashMap::<
+            PeerId,
+            VecDeque<request_response::ResponseChannel<DirectSyncResponse>>,
+        >::new();
         let mut bootstrap_redial_tick = tokio::time::interval(Duration::from_secs(60));
         bootstrap_redial_tick.tick().await;
 
@@ -723,6 +758,13 @@ impl P2pNode {
                                 );
                             }
                             Some(NetworkCommand::RequestSync { from_height }) => {
+                                let connected = swarm.connected_peers().copied().collect::<Vec<_>>();
+                                for peer in connected {
+                                    swarm.behaviour_mut().sync.send_request(
+                                        &peer,
+                                        DirectSyncRequest { from_height },
+                                    );
+                                }
                                 publish(
                                     &mut swarm,
                                     SYNC_TOPIC,
@@ -733,6 +775,29 @@ impl P2pNode {
                                 );
                             }
                             Some(NetworkCommand::RespondSync { requester, tip, certificates }) => {
+                                if let Ok(peer) = requester.parse::<PeerId>() {
+                                    let direct_channel = pending_sync_responses
+                                        .get_mut(&peer)
+                                        .and_then(VecDeque::pop_front);
+                                    if pending_sync_responses
+                                        .get(&peer)
+                                        .is_some_and(VecDeque::is_empty)
+                                    {
+                                        pending_sync_responses.remove(&peer);
+                                    }
+                                    if let Some(channel) = direct_channel {
+                                        let response = DirectSyncResponse {
+                                            responder: local_peer_id.to_string(),
+                                            tip: tip.clone(),
+                                            certificates: certificates.clone(),
+                                        };
+                                        if swarm.behaviour_mut().sync.send_response(channel, response).is_err() {
+                                            crate::logger::write_repeated_error(
+                                                "[동기화 직접 응답 실패] 요청 연결이 이미 종료됐습니다."
+                                            );
+                                        }
+                                    }
+                                }
                                 publish(
                                     &mut swarm,
                                     SYNC_TOPIC,
@@ -793,6 +858,7 @@ impl P2pNode {
                             &mut guard,
                             &mut connected_at,
                             &mut same_lan_peers,
+                            &mut pending_sync_responses,
                             context,
                         ).await {
                             crate::log_error!("P2P 이벤트 처리 오류: {error}");
@@ -1001,6 +1067,10 @@ async fn handle_swarm_event(
     guard: &mut PeerGuard,
     connected_at: &mut HashMap<ConnectionId, Instant>,
     same_lan_peers: &mut HashSet<PeerId>,
+    pending_sync_responses: &mut HashMap<
+        PeerId,
+        VecDeque<request_response::ResponseChannel<DirectSyncResponse>>,
+    >,
     context: SwarmEventContext<'_>,
 ) -> Result<(), String> {
     let SwarmEventContext {
@@ -1232,6 +1302,63 @@ async fn handle_swarm_event(
                 .await
                 .map_err(|e| e.to_string())?;
         }
+        SwarmEvent::Behaviour(IeumBehaviourEvent::Sync(event)) => match event {
+            request_response::Event::Message { peer, message, .. } => match message {
+                request_response::Message::Request {
+                    request, channel, ..
+                } => {
+                    if guard.check(&peer.to_string()) == PeerDecision::TemporarilyBlocked {
+                        return Ok(());
+                    }
+                    pending_sync_responses
+                        .entry(peer)
+                        .or_default()
+                        .push_back(channel);
+                    event_tx
+                        .send(NetworkEvent::SyncRequested {
+                            source: peer,
+                            requester: peer.to_string(),
+                            from_height: request.from_height,
+                        })
+                        .await
+                        .map_err(|error| error.to_string())?;
+                }
+                request_response::Message::Response { response, .. } => {
+                    if response.responder != peer.to_string() {
+                        guard.penalize(&peer.to_string(), 100);
+                        crate::log_error!(
+                            "[동기화 직접 응답 거부] 연결 PeerId와 responder가 다릅니다."
+                        );
+                        return Ok(());
+                    }
+                    guard.reward(&peer.to_string());
+                    event_tx
+                        .send(NetworkEvent::SyncReceived {
+                            source: peer,
+                            tip: response.tip,
+                            certificates: response.certificates,
+                        })
+                        .await
+                        .map_err(|error| error.to_string())?;
+                }
+            },
+            request_response::Event::OutboundFailure { peer, error, .. } => {
+                crate::logger::write_repeated_error(&format!(
+                    "[동기화 직접 요청 실패] PeerId: {peer} · {error}"
+                ));
+            }
+            request_response::Event::InboundFailure { peer, error, .. } => {
+                pending_sync_responses.remove(&peer);
+                crate::logger::write_repeated_error(&format!(
+                    "[동기화 직접 수신 실패] PeerId: {peer} · {error}"
+                ));
+            }
+            request_response::Event::ResponseSent { peer, .. } => {
+                crate::logger::write_repeated_info(&format!(
+                    "[동기화 직접 응답 완료] PeerId: {peer}"
+                ));
+            }
+        },
         SwarmEvent::Behaviour(IeumBehaviourEvent::Communication(event)) => match event {
             request_response::Event::Message { peer, message, .. } => match message {
                 request_response::Message::Request {

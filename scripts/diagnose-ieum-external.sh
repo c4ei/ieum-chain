@@ -3,7 +3,7 @@ set -Eeuo pipefail
 
 usage() {
   cat <<'EOF'
-IEUM 외부 PC RPC 진단 도구 v1.0.1.1
+IEUM 외부 PC RPC 진단 도구 v1.0.2.1
 
 사용법:
   diagnose-ieum-external.sh [-h] -H RPC_HOST [-p PORTS] [-t TIMEOUT]

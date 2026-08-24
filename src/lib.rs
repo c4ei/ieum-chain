@@ -39,7 +39,7 @@ pub mod traffic_rewards;
 pub mod updater;
 pub mod upgrade;
 
-pub const IEUM_DISPLAY_VERSION: &str = "1.0.1.1";
+pub const IEUM_DISPLAY_VERSION: &str = "1.0.2.1";
 pub mod validator_interest;
 pub mod validator_key;
 pub mod validator_policy;

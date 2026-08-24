@@ -3,7 +3,7 @@ set -Eeuo pipefail
 
 usage() {
   cat <<'EOF'
-IEUM 실서버 종합 진단 도구 v1.0.1.1
+IEUM 실서버 종합 진단 도구 v1.0.2.1
 
 사용법:
   diagnose-ieum-server.sh [-h] [-H RPC_HOST] [-p PORTS] [-c COMPOSE_DIR] [-s LOG_SINCE]
@@ -87,9 +87,16 @@ for node in 1 2 3 4; do
   if grep -q '\[P2P 토픽 연결\]' <<<"$log"; then
     echo "[정상] bootstrap 연결 피어가 토픽 전파 대상으로 등록됐습니다."
   else
-    echo "[경고] v1.0.1.1 토픽 연결 로그가 없습니다. 실행 바이너리 버전을 확인하세요."
+    echo "[경고] 토픽 연결 로그가 없습니다. 실행 바이너리와 P2P 연결을 확인하세요."
   fi
-  grep -E '\[동기화 (요청|요청 수신|응답 수신|완료)|\[동기화 교차검증\]|\[P2P 전파 대기\]' <<<"$log" | tail -n 30 || true
+  if grep -q '\[동기화 직접 응답 완료\]' <<<"$log"; then
+    echo "[정상] v1.0.2.1 직접 동기화 응답 경로가 작동했습니다."
+  elif grep -q '\[동기화 직접 \(요청\|수신\|응답\) 실패\]' <<<"$log"; then
+    echo "[오류] 직접 동기화 request-response 경로에서 실패가 발생했습니다."
+  else
+    echo "[안내] 최근 로그에 직접 동기화 응답 기록이 없습니다. 높이가 같으면 정상일 수 있습니다."
+  fi
+  grep -E '\[동기화 (요청|요청 수신|응답 수신|완료)|\[동기화 직접|\[동기화 교차검증\]|\[P2P 전파 대기\]' <<<"$log" | tail -n 40 || true
   if grep -q 'curl 실행 실패: No such file or directory' <<<"$log"; then
     echo "[오류] 컨테이너에 curl이 없어 자동 업데이트가 실패합니다."
   fi

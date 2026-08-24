@@ -36,7 +36,7 @@ mod installation;
 #[derive(Debug, Parser)]
 #[command(
     name = "ieum-chain",
-    version = "1.0.1.1",
+    version = "1.0.2.1",
     about = "가벼운 IEUM 메인넷 노드"
 )]
 struct Args {
