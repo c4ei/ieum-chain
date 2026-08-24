@@ -20,7 +20,6 @@ v1.0.2.1은 다음 두 경로를 함께 사용합니다.
 전체 검증:
 
 ```bash
-cargo fmt --all
 cargo fmt --all --check
 cargo clippy --all-targets --all-features --locked -- -D warnings
 cargo test --all-targets --all-features --locked
@@ -38,6 +37,8 @@ Node 1 재현 테스트는 다음을 자동 수행합니다.
 5. 15초 이내 `syncHighest` 발견
 6. 60초 이내 높이·state root 일치
 7. 생존 피어의 동기화 요청 수신 로그 확인
+
+각 거래는 대상 노드의 영수증 생성을 확인한 후 다음 거래를 제출합니다. 시스템 이벤트 블록만 증가한 상태를 송금 확정으로 오판하거나 동일 거래를 mempool에 중복 제출하지 않습니다.
 
 운영 포트와 데이터는 사용하지 않으며 임시 디렉터리, UDP `7301~7304`, RPC `9301~9304`를 사용합니다.
 

@@ -101,14 +101,23 @@ send_transfer() {
   python3 -c 'import json,sys; r=json.load(sys.stdin); assert "error" not in r, r; print(r["result"])' <<<"$response"
 }
 
+receipt_confirmed() {
+  local index="$1" transaction_hash="$2"
+  rpc "$index" eth_getTransactionReceipt "[\"$transaction_hash\"]" 2>/dev/null |
+    python3 -c 'import json,sys; raise SystemExit(0 if json.load(sys.stdin).get("result") is not None else 1)'
+}
+
 wait_for_three_node_advance() {
-  local previous="$1"
+  local previous="$1" transaction_hash="$2"
   for _ in $(seq 1 240); do
     local h2 h3 h4
     h2="$(status_field 2 height 2>/dev/null || echo 0)"
     h3="$(status_field 3 height 2>/dev/null || echo 0)"
     h4="$(status_field 4 height 2>/dev/null || echo 0)"
-    if [[ "$h2" -gt "$previous" && "$h2" == "$h3" && "$h3" == "$h4" ]]; then
+    if [[ "$h2" -gt "$previous" && "$h2" == "$h3" && "$h3" == "$h4" ]] &&
+      receipt_confirmed 2 "$transaction_hash" &&
+      receipt_confirmed 3 "$transaction_hash" &&
+      receipt_confirmed 4 "$transaction_hash"; then
       echo "$h2"
       return 0
     fi
@@ -131,16 +140,28 @@ wait_for_peer_id 4
 for index in 1 2 3 4; do wait_for_rpc "$index"; done
 wait_for_mesh 1 2 3 4
 
-send_transfer >/dev/null
+initial_transaction_hash="$(send_transfer)"
+initial_confirmed=false
 for _ in $(seq 1 120); do
   base_height="$(status_field 1 height 2>/dev/null || echo 0)"
   [[ "$base_height" -ge 1 ]] &&
     [[ "$base_height" == "$(status_field 2 height)" ]] &&
     [[ "$base_height" == "$(status_field 3 height)" ]] &&
-    [[ "$base_height" == "$(status_field 4 height)" ]] && break
+    [[ "$base_height" == "$(status_field 4 height)" ]] &&
+    receipt_confirmed 1 "$initial_transaction_hash" &&
+    receipt_confirmed 2 "$initial_transaction_hash" &&
+    receipt_confirmed 3 "$initial_transaction_hash" &&
+    receipt_confirmed 4 "$initial_transaction_hash" && {
+      initial_confirmed=true
+      break
+    }
   sleep 0.5
 done
-[[ "${base_height:-0}" -ge 1 ]] || { echo "[실패] 초기 합의 실패"; dump_logs; exit 1; }
+[[ "$initial_confirmed" == true ]] || {
+  echo "[실패] 최초 송금이 네 노드에서 확정되지 않았습니다."
+  dump_logs
+  exit 1
+}
 
 kill "${pids[1]}"
 wait "${pids[1]}" 2>/dev/null || true
@@ -148,8 +169,8 @@ echo "[진행] Node 1 중단: height=$base_height"
 
 target_height="$base_height"
 for round in 1 2 3; do
-  send_transfer >/dev/null
-  target_height="$(wait_for_three_node_advance "$target_height")"
+  transaction_hash="$(send_transfer)"
+  target_height="$(wait_for_three_node_advance "$target_height" "$transaction_hash")"
   echo "[진행] 생존 3검증자 확정 $round/3: height=$target_height"
 done
 
