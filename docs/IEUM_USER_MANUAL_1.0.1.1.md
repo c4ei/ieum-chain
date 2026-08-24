@@ -1,9 +1,9 @@
-# IEUM Chain v1.0.1.1 사용자·운영자 매뉴얼
+# IEUM Chain v1.0.2.1 사용자·운영자 매뉴얼
 
 ## 네트워크
 
 - 메인넷 Chain ID: `21004`
-- 표시 버전: `1.0.1.1`
+- 표시 버전: `1.0.2.1`
 - 기본 P2P/RPC: UDP `7001`, TCP `8989`
 - 운영 Genesis: `config/genesis.json`
 
@@ -22,6 +22,8 @@ curl -fsS -H 'content-type: application/json' \
 ```bash
 sudo bash scripts/diagnose-ieum-server.sh -H 192.168.1.148
 bash scripts/diagnose-ieum-external.sh -H 192.168.1.148
+sudo bash scripts/ieum-cluster-tool.sh status
+sudo bash scripts/ieum-cluster-tool.sh logs 1
 ```
 
 데이터 디렉터리는 진단과 백업 없이 삭제하지 않습니다. 같은 높이의 block hash가 다르면 즉시 거래를 중지하고 네 노드의 로그·설정·볼륨을 보존합니다.
@@ -46,4 +48,4 @@ cargo test --all-targets --all-features --locked
 cargo build --release --locked
 ```
 
-릴리스와 Git 절차는 [`VERSION_1.0.1.1_GOSSIPSUB_SYNC_RECOVERY.md`](VERSION_1.0.1.1_GOSSIPSUB_SYNC_RECOVERY.md)를 참고합니다.
+릴리스와 Git 절차는 [`VERSION_1.0.2.1_DIRECT_SYNC_RECOVERY.md`](VERSION_1.0.2.1_DIRECT_SYNC_RECOVERY.md)를 참고합니다.

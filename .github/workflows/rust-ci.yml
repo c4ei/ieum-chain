@@ -63,3 +63,6 @@ jobs:
             echo "===== 4-process BFT/rejoin attempt $attempt/2 ====="
             bash tests/four_process_network.sh target/release/ieum-chain
           done
+
+      - name: Reproduce persistent Node 1 multi-block rejoin
+        run: bash tests/four_process_node1_persistent_rejoin.sh target/release/ieum-chain

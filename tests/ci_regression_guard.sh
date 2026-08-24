@@ -3,14 +3,25 @@ set -euo pipefail
 
 network_test="tests/four_process_network.sh"
 operational_test="tests/v0_23_8_operational_basics.sh"
+node1_rejoin_test="tests/four_process_node1_persistent_rejoin.sh"
 
 bash -n "$network_test"
 bash -n "$operational_test"
+bash -n "$node1_rejoin_test"
 
 if [[ ! -x "$operational_test" ]]; then
   echo "CI 회귀 방지 실패: v0.23.8 운영 기본기 스크립트에 실행 권한이 필요합니다." >&2
   exit 1
 fi
+
+grep -Fq 'syncHighest' "$node1_rejoin_test" || {
+  echo "CI 회귀 방지 실패: Node 1 재합류 테스트가 피어 최고 높이를 확인해야 합니다." >&2
+  exit 1
+}
+grep -Fq 'old_peer_id' "$node1_rejoin_test" || {
+  echo "CI 회귀 방지 실패: Node 1 재합류 테스트가 영구 PeerId를 확인해야 합니다." >&2
+  exit 1
+}
 
 require_pattern() {
   local pattern="$1"
