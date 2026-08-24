@@ -114,6 +114,41 @@ fn new_node_rejects_block_without_three_precommits() {
 }
 
 #[test]
+fn certified_snapshot_recovers_a_multi_block_gap() {
+    use ieum_chain::{SnapshotAttestation, SnapshotCertificate, StateSnapshot, ValidatorSigner};
+    use std::collections::{HashMap, HashSet};
+
+    let (mut nodes, _) = setup();
+    let checkpoint_chain = Blockchain::from_snapshot_with_staking(
+        nodes[0].chain.chain_id,
+        nodes[0].chain.genesis_commitment.clone(),
+        20,
+        "11".repeat(32),
+        HashMap::new(),
+        HashMap::new(),
+        HashSet::new(),
+        Default::default(),
+    )
+    .unwrap();
+    let snapshot = StateSnapshot::from_chain(&checkpoint_chain);
+    let attestations = (1_u8..=3)
+        .map(|seed| {
+            let signer = ValidatorSigner::from(Wallet::from_seed([seed; 32]));
+            SnapshotAttestation::sign(&snapshot, &signer).unwrap()
+        })
+        .collect();
+    let certificate = SnapshotCertificate::from_attestations(attestations).unwrap();
+
+    nodes[0]
+        .install_certified_snapshot(snapshot.clone(), &certificate)
+        .unwrap();
+
+    assert_eq!(nodes[0].chain.tip_height(), 20);
+    assert_eq!(nodes[0].chain.tip_hash(), snapshot.block_hash);
+    assert_eq!(nodes[0].chain.state_hash(), snapshot.state_hash);
+}
+
+#[test]
 fn timeout_changes_round_without_storing_candidate() {
     let (mut nodes, _) = setup();
     assert_eq!(nodes[0].force_timeout_for_test().unwrap(), 1);

@@ -253,6 +253,44 @@ impl RpcNodeHandle {
         Ok(())
     }
 
+    pub fn install_certified_snapshot(
+        &self,
+        snapshot: StateSnapshot,
+        certificate: SnapshotCertificate,
+    ) -> Result<(), String> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| "RPC 상태 쓰기 잠금이 손상되었습니다.".to_string())?;
+        certificate.verify_snapshot(&snapshot, &state.validators)?;
+        if snapshot.chain_id != state.chain.chain_id
+            || snapshot.genesis_commitment != state.chain.genesis_commitment
+        {
+            return Err("다른 체인의 snapshot을 RPC 상태에 설치할 수 없습니다.".into());
+        }
+        let chain = Blockchain::from_snapshot_with_staking(
+            snapshot.chain_id,
+            snapshot.genesis_commitment.clone(),
+            snapshot.height,
+            snapshot.block_hash.clone(),
+            snapshot.balances.clone(),
+            snapshot.next_nonces.clone(),
+            snapshot.executed_events.clone(),
+            snapshot.staking.clone(),
+        )?;
+        if chain.state_hash() != snapshot.state_hash {
+            return Err("snapshot RPC 복원 상태 루트가 인증 값과 다릅니다.".into());
+        }
+        state
+            .archive
+            .persist_certified_snapshot(snapshot, certificate)?;
+        state.state_store.commit(&chain)?;
+        state.chain = chain;
+        state.sync_current = state.chain.tip_height();
+        state.sync_active = state.sync_current < state.sync_highest;
+        Ok(())
+    }
+
     pub fn set_peer_count(&self, count: usize) -> Result<(), String> {
         self.state
             .write()

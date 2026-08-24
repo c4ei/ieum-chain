@@ -39,7 +39,7 @@ pub mod traffic_rewards;
 pub mod updater;
 pub mod upgrade;
 
-pub const IEUM_DISPLAY_VERSION: &str = "1.0.2.1";
+pub const IEUM_DISPLAY_VERSION: &str = "1.0.3.1";
 pub mod validator_interest;
 pub mod validator_key;
 pub mod validator_policy;
@@ -47,7 +47,7 @@ pub mod wallet;
 
 pub use account::AccountWallet;
 pub use account_security::{AccountKey, AccountPolicy, Authorization, Permission, RecoveryRequest};
-pub use archive::ArchiveStore;
+pub use archive::{ArchiveStore, StateSnapshot};
 pub use chain::{Blockchain, FEE_BPS_DENOMINATOR, FOUNDATION_FEE_ADDRESS, FOUNDATION_FEE_BPS};
 pub use checkpoint::Checkpoint;
 pub use communication::{

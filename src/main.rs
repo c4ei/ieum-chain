@@ -3,9 +3,10 @@ use ieum_chain::{
     AccountWallet, ConsensusRuntime, ConsensusTimeouts, EventSchedule, EvidenceStore,
     ExternalSigner, FinalityStore, GenesisConfig, Keystore, NetworkCommand, NetworkConfig,
     NetworkEvent, NodeRewardRegistration, NodeWalletKeystore, P2pNode, RpcConfig, RpcServer,
-    ScheduledEvent, ScheduledEventAction, SnapshotAttestation, SnapshotCertificate, SyncTip,
-    TipQuorum, Transaction, UpgradeSchedule, Validator, ValidatorRegistration, ValidatorSigner,
-    Wallet, log_error, log_info, logger::init_server_log, node_key::load_or_create_node_key,
+    ScheduledEvent, ScheduledEventAction, SnapshotAttestation, SnapshotCertificate, StateSnapshot,
+    SyncTip, TipQuorum, Transaction, UpgradeSchedule, Validator, ValidatorRegistration,
+    ValidatorSigner, Wallet, log_error, log_info, logger::init_server_log,
+    node_key::load_or_create_node_key,
 };
 use libp2p::{Multiaddr, multiaddr::Protocol};
 use rand_core::{OsRng, RngCore};
@@ -36,7 +37,7 @@ mod installation;
 #[derive(Debug, Parser)]
 #[command(
     name = "ieum-chain",
-    version = "1.0.2.1",
+    version = "1.0.3.1",
     about = "가벼운 IEUM 메인넷 노드"
 )]
 struct Args {
@@ -422,8 +423,12 @@ struct NodeArgs {
     precommit_timeout_ms: u64,
 
     /// 동일 tip/state root 확인에 필요한 독립 피어 수(2~3)
-    #[arg(long, default_value_t = 2, value_parser = parse_sync_quorum_peers)]
+    #[arg(long, default_value_t = 3, value_parser = parse_sync_quorum_peers)]
     sync_quorum_peers: usize,
+
+    /// 이 높이 차이까지는 확정 블록을 직접 받고, 더 크거나 인증서가 끊기면 snapshot을 사용합니다.
+    #[arg(long, default_value_t = 12, value_parser = clap::value_parser!(u64).range(1..=4096))]
+    direct_sync_block_limit: u64,
 
     /// 서버/클라이언트가 시작할 때 접속할 추가 P2P 주소
     #[arg(long, help = "/dns4/node.ieum.aah.name/udp/7001/quic-v1/p2p/PeerId")]
@@ -469,7 +474,8 @@ fn default_node_args() -> NodeArgs {
         propose_timeout_ms: 3_000,
         prevote_timeout_ms: 2_000,
         precommit_timeout_ms: 2_000,
-        sync_quorum_peers: 2,
+        sync_quorum_peers: 3,
+        direct_sync_block_limit: 12,
         peer: Vec::new(),
         no_default_bootstrap: false,
     }
@@ -923,6 +929,7 @@ async fn main() -> Result<(), String> {
     let mut update_tick = tokio::time::interval(Duration::from_secs(update_interval));
     let mut sync_quorum = TipQuorum::new(args.sync_quorum_peers)?;
     let mut snapshot_votes = HashMap::<(u64, String, String), Vec<SnapshotAttestation>>::new();
+    let mut snapshot_candidates = HashMap::<(u64, String, String), StateSnapshot>::new();
 
     log_info!("IEUM {mode} 노드 시작: {peer_id}");
     log_info!("영구 노드 키: {}", args.node_key.display());
@@ -1488,22 +1495,111 @@ async fn main() -> Result<(), String> {
                             "[동기화 요청 수신] 요청자 {requester} · 시작 높이 {from_height} · 로컬 높이 {}",
                             consensus.chain.tip_height()
                         ));
+                        let tip_height = consensus.chain.tip_height();
+                        let certificates = consensus.contiguous_certificates_from(from_height);
+                        let certificate_tip = certificates.last().map(|value| value.block.height);
+                        let small_gap = tip_height.saturating_sub(from_height.saturating_sub(1))
+                            <= args.direct_sync_block_limit;
+                        let use_blocks = small_gap && certificate_tip == Some(tip_height);
+                        let (certificates, snapshot, snapshot_attestation) = if use_blocks {
+                            (certificates, None, None)
+                        } else if from_height <= tip_height {
+                            let snapshot = StateSnapshot::from_chain(&consensus.chain);
+                            let attestation = consensus.sign_snapshot_attestation(&snapshot)?;
+                            (Vec::new(), Some(Box::new(snapshot)), Some(attestation))
+                        } else {
+                            (Vec::new(), None, None)
+                        };
                         commands.send(NetworkCommand::RespondSync {
                             requester,
                             tip: SyncTip {
-                                height: consensus.chain.tip_height(),
+                                height: tip_height,
                                 block_hash: consensus.chain.tip_hash().to_string(),
                                 state_root: consensus.chain.state_hash(),
                             },
-                            certificates: consensus.certificates_from(from_height),
+                            certificates,
+                            snapshot,
+                            snapshot_attestation,
                         }).await.map_err(|e| e.to_string())?;
                     }
-                    Some(NetworkEvent::SyncReceived { source, tip, certificates }) => {
+                    Some(NetworkEvent::SyncReceived {
+                        source,
+                        tip,
+                        certificates,
+                        snapshot,
+                        snapshot_attestation,
+                    }) => {
                         ieum_chain::logger::write_repeated_info(&format!(
-                            "[동기화 응답 수신] PeerId: {source} · 높이 {} · 인증서 {}개",
+                            "[동기화 응답 수신] PeerId: {source} · 높이 {} · 인증서 {}개 · snapshot {}",
                             tip.height,
-                            certificates.len()
+                            certificates.len(),
+                            if snapshot.is_some() { "포함" } else { "없음" }
                         ));
+                        if let (Some(snapshot), Some(attestation)) = (snapshot, snapshot_attestation) {
+                            let snapshot = *snapshot;
+                            let key = (
+                                snapshot.height,
+                                snapshot.block_hash.clone(),
+                                snapshot.state_hash.clone(),
+                            );
+                            if snapshot.height != tip.height
+                                || snapshot.block_hash != tip.block_hash
+                                || snapshot.state_hash != tip.state_root
+                                || attestation.height != snapshot.height
+                                || attestation.block_hash != snapshot.block_hash
+                                || attestation.state_root != snapshot.state_hash
+                                || attestation.verify().is_err()
+                            {
+                                log_error!("[snapshot 동기화 거부] PeerId: {source} · tip/상태/서명이 일치하지 않습니다.");
+                                commands.send(NetworkCommand::PenalizePeer { peer_id: source, points: 100 })
+                                    .await.map_err(|error| error.to_string())?;
+                                continue;
+                            }
+                            if !validators
+                                .iter()
+                                .any(|validator| validator.id == attestation.validator_id)
+                            {
+                                log_error!("[snapshot 동기화 거부] PeerId: {source} · 등록되지 않은 검증자 서명입니다.");
+                                commands.send(NetworkCommand::PenalizePeer { peer_id: source, points: 100 })
+                                    .await.map_err(|error| error.to_string())?;
+                                continue;
+                            }
+                            snapshot_candidates
+                                .entry(key.clone())
+                                .or_insert(snapshot.clone());
+                            let votes = snapshot_votes.entry(key.clone()).or_default();
+                            if !votes.iter().any(|known| known.validator_id == attestation.validator_id) {
+                                votes.push(attestation);
+                            }
+                            let certificate = SnapshotCertificate::from_attestations(votes.clone())?;
+                            match certificate.verify(&validators) {
+                                Ok(()) => {
+                                    let candidate = snapshot_candidates
+                                        .remove(&key)
+                                        .ok_or("인증된 snapshot 본문을 찾을 수 없습니다.")?;
+                                    if candidate.height > consensus.chain.tip_height() {
+                                        rpc.install_certified_snapshot(
+                                            candidate.clone(),
+                                            certificate.clone(),
+                                        )?;
+                                        consensus
+                                            .install_certified_snapshot(candidate, &certificate)?;
+                                        log_info!("[snapshot 동기화 완료] 2/3 초과 인증 상태 설치 · 높이 {}", consensus.chain.tip_height());
+                                    }
+                                    snapshot_votes.retain(|(height, _, _), _| {
+                                        *height > consensus.chain.tip_height()
+                                    });
+                                    commands.send(NetworkCommand::RequestSync {
+                                        from_height: consensus.chain.tip_height() + 1,
+                                    }).await.map_err(|error| error.to_string())?;
+                                }
+                                Err(error) if error.contains("2/3 초과") => {
+                                    log_info!("[snapshot 동기화 교차검증] 2/3 초과 검증자 서명을 기다립니다.");
+                                }
+                                Err(error) => log_error!("[snapshot 동기화 거부] {error}"),
+                            }
+                            continue;
+                        }
                         let Some(agreed_tip) = sync_quorum.observe(source.to_string(), tip) else {
                             log_info!("[동기화 교차검증] 두 번째 독립 피어 응답을 기다립니다.");
                             continue;
@@ -1513,14 +1609,24 @@ async fn main() -> Result<(), String> {
                         for certificate in certificates {
                             let chain_before = consensus.chain.clone();
                             let block = certificate.block.clone();
-                            if consensus.apply_sync_certificates(vec![certificate.clone()])? == 1 {
-                                rpc.install_finalized(
-                                    &chain_before,
-                                    consensus.chain.clone(),
-                                    &block,
-                                )?;
-                                finality_store.append(&certificate)?;
-                                applied += 1;
+                            match consensus.apply_sync_certificates(vec![certificate.clone()]) {
+                                Ok(1) => {
+                                    rpc.install_finalized(
+                                        &chain_before,
+                                        consensus.chain.clone(),
+                                        &block,
+                                    )?;
+                                    finality_store.append(&certificate)?;
+                                    applied += 1;
+                                }
+                                Ok(_) => {}
+                                Err(error) => {
+                                    log_error!("[동기화 응답 보류] PeerId: {source} · {error} · 누락 높이부터 다시 요청합니다.");
+                                    commands.send(NetworkCommand::RequestSync {
+                                        from_height: consensus.chain.tip_height() + 1,
+                                    }).await.map_err(|send_error| send_error.to_string())?;
+                                    break;
+                                }
                             }
                         }
                         if applied > 0 {

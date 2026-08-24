@@ -22,6 +22,10 @@ grep -Fq 'old_peer_id' "$node1_rejoin_test" || {
   echo "CI 회귀 방지 실패: Node 1 재합류 테스트가 영구 PeerId를 확인해야 합니다." >&2
   exit 1
 }
+grep -Fq 'snapshot 동기화 완료' "$node1_rejoin_test" || {
+  echo "CI 회귀 방지 실패: Node 1 재합류 테스트가 인증 snapshot 복구를 확인해야 합니다." >&2
+  exit 1
+}
 
 require_pattern() {
   local pattern="$1"

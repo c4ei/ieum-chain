@@ -8,7 +8,7 @@ use crate::consensus_era::SignedRoundChange;
 use crate::model::Block;
 use crate::scheduled_event::{EventSchedule, MAX_CLOCK_DRIFT_SECONDS};
 use crate::signer::ValidatorSigner;
-use crate::snapshot_sync::SnapshotAttestation;
+use crate::snapshot_sync::{SnapshotAttestation, SnapshotCertificate};
 use crate::wallet::Wallet;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -572,6 +572,63 @@ impl ConsensusRuntime {
             selected.push(certificate.clone());
         }
         selected
+    }
+
+    /// 요청 높이부터 끊김 없는 인증서만 반환합니다. 일부 과거 인증서만 남아 있는
+    /// 노드는 잘못된 첫 높이를 보내지 않고 인증 snapshot 경로로 전환해야 합니다.
+    pub fn contiguous_certificates_from(&self, from_height: u64) -> Vec<FinalityCertificate> {
+        let selected = self.certificates_from(from_height);
+        let mut expected = from_height;
+        let mut contiguous = Vec::new();
+        for certificate in selected {
+            if certificate.block.height != expected {
+                break;
+            }
+            expected = expected.saturating_add(1);
+            contiguous.push(certificate);
+        }
+        contiguous
+    }
+
+    /// 2/3 초과 검증자가 인증한 상태 기준점을 설치합니다. Geth의 checkpoint/snap
+    /// 시작점처럼 사용한 뒤 그 다음 높이부터 다시 블록 단위 동기화합니다.
+    pub fn install_certified_snapshot(
+        &mut self,
+        snapshot: StateSnapshot,
+        certificate: &SnapshotCertificate,
+    ) -> Result<(), String> {
+        certificate.verify_snapshot(&snapshot, &self.validators)?;
+        if snapshot.chain_id != self.chain.chain_id
+            || snapshot.genesis_commitment != self.chain.genesis_commitment
+        {
+            return Err("다른 체인의 snapshot을 설치할 수 없습니다.".into());
+        }
+        if snapshot.height <= self.chain.tip_height() {
+            return Ok(());
+        }
+        let chain = Blockchain::from_snapshot_with_staking(
+            snapshot.chain_id,
+            snapshot.genesis_commitment.clone(),
+            snapshot.height,
+            snapshot.block_hash.clone(),
+            snapshot.balances.clone(),
+            snapshot.next_nonces.clone(),
+            snapshot.executed_events.clone(),
+            snapshot.staking.clone(),
+        )?;
+        if chain.state_hash() != snapshot.state_hash {
+            return Err("snapshot을 복원한 상태 루트가 인증 값과 다릅니다.".into());
+        }
+        self.chain = chain;
+        self.consensus.start_round(snapshot.height + 1, 0)?;
+        self.pending = None;
+        self.valid_block = None;
+        self.valid_round_prevotes.clear();
+        self.precommits.clear();
+        self.deferred_votes.clear();
+        self.round_change_votes.clear();
+        self.reset_deadline();
+        Ok(())
     }
 
     pub fn import_certificate_history(
