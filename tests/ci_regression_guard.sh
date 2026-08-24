@@ -10,6 +10,8 @@ grep -q 'version = ieum_chain::IEUM_DISPLAY_VERSION' src/main.rs
 grep -q 'env!("IEUM_DISPLAY_VERSION")' src/lib.rs
 grep -q 'transaction_is_admissible(&state.chain, &transaction)' src/rpc.rs
 grep -q 'state.pool.next_nonce(&wallet.address(), finalized_nonce)' src/rpc.rs
+grep -q 'rpc.begin_sync(tip.height)' src/main.rs
+grep -q '5초 sync tick에 맡깁니다' src/main.rs
 
 bash -n "$network_test"
 bash -n "$operational_test"

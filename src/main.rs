@@ -1565,6 +1565,9 @@ async fn main() -> Result<(), String> {
                                     .await.map_err(|error| error.to_string())?;
                                 continue;
                             }
+                            // snapshot도 일반 블록 동기화와 동일하게 피어 최고 높이를
+                            // 먼저 기록해야 RPC 진행률과 합의 참여 제한이 정확해집니다.
+                            rpc.begin_sync(tip.height)?;
                             snapshot_candidates
                                 .entry(key.clone())
                                 .or_insert(snapshot.clone());
@@ -1642,9 +1645,12 @@ async fn main() -> Result<(), String> {
                                 from_height: consensus.chain.tip_height() + 1,
                             }).await.map_err(|e| e.to_string())?;
                         } else if consensus.chain.tip_height() < agreed_tip.height {
-                            commands.send(NetworkCommand::RequestSync {
-                                from_height: consensus.chain.tip_height() + 1,
-                            }).await.map_err(|e| e.to_string())?;
+                            // snapshot 본문이 없는 gossip 응답은 direct 응답보다 먼저
+                            // 도착할 수 있습니다. 여기서 즉시 재요청하면 요청→빈 gossip
+                            // 응답→재요청 피드백 루프가 생기므로 5초 sync tick에 맡깁니다.
+                            ieum_chain::logger::write_repeated_info(
+                                "[동기화 응답 대기] 연속 인증서 또는 인증 snapshot direct 응답을 기다립니다."
+                            );
                         }
                     }
                     Some(NetworkEvent::SnapshotAttestationReceived { source, attestation }) => {

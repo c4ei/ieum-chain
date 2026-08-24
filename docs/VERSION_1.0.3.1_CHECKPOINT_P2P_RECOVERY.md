@@ -50,6 +50,14 @@ nonce는 계좌별 거래 순번입니다. 계좌의 확정 nonce가 1이면 non
 이미 사용된 nonce는 폐기합니다. 노드가 직접 만드는 거래는 확정 nonce뿐 아니라
 mempool에서 연속으로 대기 중인 nonce까지 계산해 다음 번호를 사용합니다.
 
+### snapshot 요청 폭주 방지
+
+snapshot direct 응답보다 snapshot 본문이 없는 gossip tip 응답이 먼저 도착할 수
+있습니다. 빈 gossip 응답을 받을 때마다 즉시 재요청하면 요청과 빈 응답이 서로를
+증폭하므로, 즉시 재요청하지 않고 5초 주기 sync tick이 재시도를 담당합니다.
+유효한 snapshot 응답을 받으면 설치 전 `syncHighest`를 갱신해 RPC 진행률과
+동기화 중 합의 참여 제한이 실제 피어 높이와 일치하도록 합니다.
+
 ## 원클릭 복구
 
 ```bash
