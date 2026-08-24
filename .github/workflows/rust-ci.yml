@@ -57,4 +57,9 @@ jobs:
         run: cargo build --release --locked
 
       - name: Run real four-process BFT network
-        run: bash tests/four_process_network.sh target/release/ieum-chain
+        run: |
+          set -euo pipefail
+          for attempt in 1 2; do
+            echo "===== 4-process BFT/rejoin attempt $attempt/2 ====="
+            bash tests/four_process_network.sh target/release/ieum-chain
+          done

@@ -894,6 +894,9 @@ async fn main() -> Result<(), String> {
     // 비제안자 RPC로 들어온 거래는 제안자가 받을 때까지 주기적으로 재전파하되,
     // 매 consensus tick마다 같은 payload를 쏟아내지는 않습니다.
     let mut announced_transactions = std::collections::HashMap::<String, std::time::Instant>::new();
+    // 라운드 변경 투표는 한 번의 gossip 유실만으로 생존 검증자들이 서로 다른
+    // 라운드에 오래 머물지 않도록 활성 합의 중 제한된 주기로 다시 전파합니다.
+    let mut last_round_change_rebroadcast = std::time::Instant::now();
     // 같은 블록은 여러 피어에서 도착할 수 있습니다. 운영 로그에는 최초 수신만 남겨
     // 로그 폭증을 막되, 블록 검증과 합의 처리는 기존대로 모두 수행합니다.
     let mut logged_block_hashes = HashSet::<String>::new();
@@ -1040,6 +1043,26 @@ async fn main() -> Result<(), String> {
                             consensus.round()
                         );
                         io::stdout().flush().map_err(|error| error.to_string())?;
+                    }
+                    if timeout_now.duration_since(last_round_change_rebroadcast)
+                        >= Duration::from_secs(2)
+                    {
+                        let votes = consensus.round_change_snapshot();
+                        if !votes.is_empty() {
+                            ieum_chain::logger::write_repeated_info(&format!(
+                                "[BFT 라운드 정렬] 높이 {} · 현재 라운드 {} · round-change {}개 재전파",
+                                consensus.chain.tip_height().saturating_add(1),
+                                consensus.round(),
+                                votes.len()
+                            ));
+                            for vote in votes {
+                                commands
+                                    .send(NetworkCommand::PublishRoundChange(vote))
+                                    .await
+                                    .map_err(|error| error.to_string())?;
+                            }
+                        }
+                        last_round_change_rebroadcast = timeout_now;
                     }
                 }
                 consensus_was_active = consensus_is_active;
@@ -1461,10 +1484,10 @@ async fn main() -> Result<(), String> {
                         }
                     }
                     Some(NetworkEvent::SyncRequested { requester, from_height, .. }) if !is_client => {
-                        log_info!(
+                        ieum_chain::logger::write_repeated_info(&format!(
                             "[동기화 요청 수신] 요청자 {requester} · 시작 높이 {from_height} · 로컬 높이 {}",
                             consensus.chain.tip_height()
-                        );
+                        ));
                         commands.send(NetworkCommand::RespondSync {
                             requester,
                             tip: SyncTip {
@@ -1476,11 +1499,11 @@ async fn main() -> Result<(), String> {
                         }).await.map_err(|e| e.to_string())?;
                     }
                     Some(NetworkEvent::SyncReceived { source, tip, certificates }) => {
-                        log_info!(
+                        ieum_chain::logger::write_repeated_info(&format!(
                             "[동기화 응답 수신] PeerId: {source} · 높이 {} · 인증서 {}개",
                             tip.height,
                             certificates.len()
-                        );
+                        ));
                         let Some(agreed_tip) = sync_quorum.observe(source.to_string(), tip) else {
                             log_info!("[동기화 교차검증] 두 번째 독립 피어 응답을 기다립니다.");
                             continue;

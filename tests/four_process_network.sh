@@ -438,7 +438,10 @@ PY
 expected_after_rejoin="$((expected_recipient_balance + transfer_amount_wei))"
 
 three_node_passed=false
-for _ in $(seq 1 80); do
+# 공유 GitHub runner가 느린 경우에도 BFT 단계별 timeout과 round-change 재전파가
+# 두 번 이상 완료될 시간을 보장합니다. 단순 sleep 성공이 아니라 세 노드 모두의
+# 실제 높이·잔액 증가를 계속 검사합니다.
+for _ in $(seq 1 240); do
   three_node_passed=true
   for index in 1 2 3; do
     status="$(rpc "$((9200 + index))" ieum_nodeStatus '[]')" || { three_node_passed=false; break; }
