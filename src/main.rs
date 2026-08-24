@@ -37,7 +37,7 @@ mod installation;
 #[derive(Debug, Parser)]
 #[command(
     name = "ieum-chain",
-    version = "1.0.3.1",
+    version = ieum_chain::IEUM_DISPLAY_VERSION,
     about = "가벼운 IEUM 메인넷 노드"
 )]
 struct Args {
@@ -422,8 +422,9 @@ struct NodeArgs {
     #[arg(long, default_value_t = 2_000)]
     precommit_timeout_ms: u64,
 
-    /// 동일 tip/state root 확인에 필요한 독립 피어 수(2~3)
-    #[arg(long, default_value_t = 3, value_parser = parse_sync_quorum_peers)]
+    /// 직접 동기화 후보 tip/state root 확인에 필요한 독립 원격 피어 수(2~3).
+    /// 데이터 신뢰성은 이 수가 아니라 블록 3/4 precommit 또는 snapshot 3/4 서명으로 검증합니다.
+    #[arg(long, default_value_t = 2, value_parser = parse_sync_quorum_peers)]
     sync_quorum_peers: usize,
 
     /// 이 높이 차이까지는 확정 블록을 직접 받고, 더 크거나 인증서가 끊기면 snapshot을 사용합니다.
@@ -474,7 +475,7 @@ fn default_node_args() -> NodeArgs {
         propose_timeout_ms: 3_000,
         prevote_timeout_ms: 2_000,
         precommit_timeout_ms: 2_000,
-        sync_quorum_peers: 3,
+        sync_quorum_peers: 2,
         direct_sync_block_limit: 12,
         peer: Vec::new(),
         no_default_bootstrap: false,

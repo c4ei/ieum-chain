@@ -16,8 +16,31 @@ v1.0.3.1은 Geth의 block/checkpoint sync와 Solana/Agave의 known-validator sna
 - 등록 검증자 투표권 2/3 초과가 같은 height/hash/state root에 서명해야 snapshot 설치
 - snapshot 다음 높이부터 다시 확정 블록 동기화
 - 불완전한 응답은 프로세스를 종료하지 않고 누락 높이부터 재요청
-- 기본 tip 교차검증 피어 3개
+- 직접 동기화 후보 tip은 독립 원격 피어 2개가 일치해야 선택
+- 실제 데이터는 블록의 3/4 precommit 또는 snapshot의 3/4 검증자 서명으로 별도 검증
 - `--direct-sync-block-limit`으로 기준 조정
+
+### Geth와 IEUM의 차이
+
+Geth는 합의 클라이언트가 제공한 목표 헤더를 기준으로 부모 해시가 이어지는 헤더를
+검증한 뒤 block body·receipt·state를 내려받습니다. 가까운 구간은 블록 단위로
+실행하고, 먼 구간은 snap/checkpoint 상태에서 시작한 뒤 블록 동기화로 전환합니다.
+
+IEUM은 합의·실행을 한 프로세스에 가진 4검증자 BFT 체인이므로 역할을 다음처럼
+분리합니다.
+
+- 같은 tip을 보고한 원격 피어 2개: 다운로드 후보 선택과 단일 악성 피어 배제
+- 연속 블록의 3/4 precommit: 블록의 확정성 검증
+- 동일 snapshot의 3/4 검증자 서명: checkpoint 상태의 확정성 검증
+- 동기화 중인 검증자: 최신 인증 상태가 설치될 때까지 제안·투표 금지
+
+원격 피어 3개를 tip 선택 조건으로 사용하면 검증자 하나가 중단됐을 때 생존 노드가
+각각 두 피어밖에 볼 수 없어 진행할 수 없습니다. 이는 BFT 서명 정족수와 네트워크
+응답 수를 혼동한 설정이므로 기본값을 2로 유지합니다.
+
+버전은 `Cargo.toml`의 package version 한 곳만 수정합니다. `build.rs`가
+`1.0.3-1`을 `1.0.3.1`로 변환하고 CLI·RPC·자동 업데이트가 같은
+`IEUM_DISPLAY_VERSION`을 사용합니다.
 
 ## 원클릭 복구
 
@@ -76,9 +99,11 @@ git status --short
 git add -- \
   .github/workflows/chain-release.yml .github/workflows/rust-ci.yml \
   Cargo.toml Cargo.lock CHANGELOG.md \
+  build.rs \
   src/consensus_runtime.rs src/lib.rs src/main.rs src/network.rs src/rpc.rs \
   scripts/diagnose-ieum-external.sh scripts/diagnose-ieum-server.sh \
   scripts/ieum-cluster-tool.sh scripts/recover-ieum-node.sh \
+  scripts/commit-push-pr-v1.0.3.1-fix.sh \
   deploy/docker-four-node/Dockerfile deploy/docker-four-node/README.md \
   deploy/docker-four-node/update-four-nodes.sh \
   tests/ci_regression_guard.sh tests/diagnostic_scripts.sh tests/four_node_bft.rs \

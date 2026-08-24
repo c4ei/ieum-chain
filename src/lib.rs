@@ -39,7 +39,9 @@ pub mod traffic_rewards;
 pub mod updater;
 pub mod upgrade;
 
-pub const IEUM_DISPLAY_VERSION: &str = "1.0.3.1";
+/// `Cargo.toml`의 `1.0.3-1`을 사용자 표시용 `1.0.3.1`로 변환한 단일 버전 값입니다.
+/// `build.rs`가 빌드 시 생성하므로 CLI·RPC·자동 업데이트 버전이 서로 어긋나지 않습니다.
+pub const IEUM_DISPLAY_VERSION: &str = env!("IEUM_DISPLAY_VERSION");
 pub mod validator_interest;
 pub mod validator_key;
 pub mod validator_policy;

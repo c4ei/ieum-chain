@@ -94,6 +94,20 @@ wait_for_mesh() {
   return 1
 }
 
+wait_for_survivor_mesh() {
+  for _ in $(seq 1 120); do
+    local ready=true
+    for index in 2 3 4; do
+      [[ "$(status_field "$index" peers 2>/dev/null || echo -1)" == 2 ]] || ready=false
+    done
+    [[ "$ready" == true ]] && return 0
+    sleep 0.5
+  done
+  echo "[실패] Node 1 종료 후 생존 3노드의 피어 이탈 반영 시간 초과" >&2
+  dump_logs >&2
+  return 1
+}
+
 send_transfer() {
   local faucet recipient response
   faucet="$(rpc 2 eth_coinbase '[]' | python3 -c 'import json,sys; print(json.load(sys.stdin)["result"])')"
@@ -167,6 +181,8 @@ done
 kill "${pids[1]}"
 wait "${pids[1]}" 2>/dev/null || true
 echo "[진행] Node 1 중단: height=$base_height"
+wait_for_survivor_mesh
+echo "[진행] 생존 3노드 연결 확인: peers=2 2 2"
 
 target_height="$base_height"
 for round in 1 2 3; do

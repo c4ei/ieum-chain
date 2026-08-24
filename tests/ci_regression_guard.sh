@@ -4,6 +4,10 @@ set -euo pipefail
 network_test="tests/four_process_network.sh"
 operational_test="tests/v0_23_8_operational_basics.sh"
 node1_rejoin_test="tests/four_process_node1_persistent_rejoin.sh"
+grep -q 'wait_for_survivor_mesh' "$node1_rejoin_test"
+grep -q 'default_value_t = 2, value_parser = parse_sync_quorum_peers' src/main.rs
+grep -q 'version = ieum_chain::IEUM_DISPLAY_VERSION' src/main.rs
+grep -q 'env!("IEUM_DISPLAY_VERSION")' src/lib.rs
 
 bash -n "$network_test"
 bash -n "$operational_test"
