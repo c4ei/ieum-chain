@@ -199,6 +199,12 @@ impl RpcNodeHandle {
             .write()
             .map_err(|_| "RPC 상태 쓰기 잠금이 손상되었습니다.".to_string())?;
         for transaction in transactions {
+            // 확정 직전 다른 피어가 전파한 거래가 뒤늦게 도착할 수 있습니다.
+            // 이미 사용된 nonce를 다시 mempool에 넣으면 다음 제안 전체가 무효가 되므로
+            // 현재 확정 상태를 기준으로 검증한 거래만 복원합니다.
+            if !transaction_is_admissible(&state.chain, &transaction) {
+                continue;
+            }
             let _ = state.pool.add(transaction);
         }
         Ok(())
@@ -1592,7 +1598,10 @@ fn send_transaction(
     let to_ledger = resolve_ledger_address(&state, to);
     let nonce = match request.get("nonce").and_then(Value::as_str) {
         Some(value) => parse_quantity_u64(value)?,
-        None => state.chain.next_nonce(&wallet.address()),
+        None => {
+            let finalized_nonce = state.chain.next_nonce(&wallet.address());
+            state.pool.next_nonce(&wallet.address(), finalized_nonce)
+        }
     };
     let transaction = wallet.sign_transfer(to_ledger, amount, fee, nonce);
     let transaction_id = format!("0x{}", transaction.id());
@@ -1602,6 +1611,26 @@ fn send_transaction(
         .map_err(|message| (-32000, message))?;
 
     Ok(json!(transaction_id))
+}
+
+fn transaction_is_admissible(chain: &Blockchain, transaction: &Transaction) -> bool {
+    if transaction.nonce < chain.next_nonce(&transaction.from)
+        || crate::wallet::verify_transaction(transaction).is_err()
+    {
+        return false;
+    }
+    let debit = if matches!(
+        &transaction.action,
+        crate::model::TransactionAction::Transfer
+            | crate::model::TransactionAction::Delegate { .. }
+    ) {
+        transaction.amount
+    } else {
+        0
+    };
+    debit
+        .checked_add(transaction.fee)
+        .is_some_and(|required| chain.balance_of(&transaction.from) >= required)
 }
 
 fn unix_timestamp() -> Result<u64, String> {
