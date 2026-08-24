@@ -43,6 +43,7 @@ start_node() {
     --node-key "$test_root/node-$index/keys/p2p_identity.key"
     --validator-key "$test_root/node-$index/keys/consensus_signing.key"
     --validators-config "$test_root/node-$index/validators.json"
+    --direct-sync-block-limit 2
   )
   mkdir -p "$test_root/node-$index"
   for peer in "$@"; do args+=(--peer "$peer"); done
@@ -90,6 +91,20 @@ wait_for_mesh() {
   done
   echo "[실패] 4노드 P2P 연결 시간 초과"
   dump_logs
+  return 1
+}
+
+wait_for_survivor_mesh() {
+  for _ in $(seq 1 120); do
+    local ready=true
+    for index in 2 3 4; do
+      [[ "$(status_field "$index" peers 2>/dev/null || echo -1)" == 2 ]] || ready=false
+    done
+    [[ "$ready" == true ]] && return 0
+    sleep 0.5
+  done
+  echo "[실패] Node 1 종료 후 생존 3노드의 피어 이탈 반영 시간 초과" >&2
+  dump_logs >&2
   return 1
 }
 
@@ -166,6 +181,8 @@ done
 kill "${pids[1]}"
 wait "${pids[1]}" 2>/dev/null || true
 echo "[진행] Node 1 중단: height=$base_height"
+wait_for_survivor_mesh
+echo "[진행] 생존 3노드 연결 확인: peers=2 2 2"
 
 target_height="$base_height"
 for round in 1 2 3; do
@@ -196,20 +213,27 @@ done
 }
 
 for _ in $(seq 1 120); do
-  heights=(); roots=()
+  heights=(); hashes=(); roots=()
   for index in 1 2 3 4; do
     heights+=("$(status_field "$index" height 2>/dev/null || echo -1)")
+    hashes+=("$(status_field "$index" blockHash 2>/dev/null || echo RPC실패)")
     roots+=("$(status_field "$index" stateRoot 2>/dev/null || echo RPC실패)")
   done
   if [[ "${heights[0]}" == "$target_height" ]] &&
      [[ "${heights[0]}" == "${heights[1]}" && "${heights[1]}" == "${heights[2]}" && "${heights[2]}" == "${heights[3]}" ]] &&
+     [[ "${hashes[0]}" == "${hashes[1]}" && "${hashes[1]}" == "${hashes[2]}" && "${hashes[2]}" == "${hashes[3]}" ]] &&
      [[ "${roots[0]}" == "${roots[1]}" && "${roots[1]}" == "${roots[2]}" && "${roots[2]}" == "${roots[3]}" ]]; then
     grep -q '\[동기화 요청 수신\]' "$test_root/node-2.log" "$test_root/node-3.log" "$test_root/node-4.log" || {
       echo "[실패] 생존 피어에서 동기화 요청 수신 로그를 찾지 못했습니다."
       dump_logs
       exit 1
     }
-    echo "[성공] Node 1 영구 원장 재합류: heights=${heights[*]}, stateRoot=${roots[0]}"
+    echo "[성공] Node 1 영구 원장 재합류: heights=${heights[*]}, blockHash=${hashes[0]}, stateRoot=${roots[0]}"
+    grep -q '\[snapshot 동기화 완료\]' "$test_root/node-1.log" || {
+      echo "[실패] 높이 차이가 임계값을 넘었지만 인증 snapshot 복구 로그가 없습니다."
+      dump_logs
+      exit 1
+    }
     exit 0
   fi
   sleep 0.5

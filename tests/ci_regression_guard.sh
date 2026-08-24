@@ -4,6 +4,14 @@ set -euo pipefail
 network_test="tests/four_process_network.sh"
 operational_test="tests/v0_23_8_operational_basics.sh"
 node1_rejoin_test="tests/four_process_node1_persistent_rejoin.sh"
+grep -q 'wait_for_survivor_mesh' "$node1_rejoin_test"
+grep -q 'default_value_t = 2, value_parser = parse_sync_quorum_peers' src/main.rs
+grep -q 'version = ieum_chain::IEUM_DISPLAY_VERSION' src/main.rs
+grep -q 'env!("IEUM_DISPLAY_VERSION")' src/lib.rs
+grep -q 'transaction_is_admissible(&state.chain, &transaction)' src/rpc.rs
+grep -q 'state.pool.next_nonce(&wallet.address(), finalized_nonce)' src/rpc.rs
+grep -q 'rpc.begin_sync(tip.height)' src/main.rs
+grep -q '5초 sync tick에 맡깁니다' src/main.rs
 
 bash -n "$network_test"
 bash -n "$operational_test"
@@ -20,6 +28,10 @@ grep -Fq 'syncHighest' "$node1_rejoin_test" || {
 }
 grep -Fq 'old_peer_id' "$node1_rejoin_test" || {
   echo "CI 회귀 방지 실패: Node 1 재합류 테스트가 영구 PeerId를 확인해야 합니다." >&2
+  exit 1
+}
+grep -Fq 'snapshot 동기화 완료' "$node1_rejoin_test" || {
+  echo "CI 회귀 방지 실패: Node 1 재합류 테스트가 인증 snapshot 복구를 확인해야 합니다." >&2
   exit 1
 }
 

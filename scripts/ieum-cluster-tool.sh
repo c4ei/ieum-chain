@@ -8,7 +8,7 @@ since=15m
 
 usage() {
   cat <<'EOF'
-IEUM 4노드 상태관리·진단 도구 v1.0.2.1
+IEUM 4노드 상태관리·진단 도구 v1.0.3.1
 
 사용법:
   ieum-cluster-tool.sh [공통 옵션] COMMAND [COMMAND 옵션]
@@ -26,6 +26,7 @@ COMMAND:
   logs [1-4|all]  동기화·P2P·BFT 핵심 로그만 출력
   snapshot DIR    설정·상태·로그를 DIR에 읽기 전용 수집
   restart N       지정한 노드 하나만 재시작하고 상태 확인
+  recover [N]     키·설정을 보존하고 이상 노드를 자동 또는 지정 복구
   reproduce BIN   개발용 Node 1 영구 원장 재합류 테스트 실행
 
 예:
@@ -115,6 +116,13 @@ case "$command_name" in
     (cd "$compose_dir" && sudo docker compose restart "node$node")
     sleep 10
     "$script_dir/diagnose-ieum-external.sh" -H "$rpc_host" -p "$ports" || true
+    ;;
+  recover)
+    require_compose
+    node="${1:-}"
+    args=(--docker --compose-dir "$compose_dir" --rpc-host "$rpc_host")
+    [[ -z "$node" ]] || args+=(--node "$node")
+    exec "$script_dir/recover-ieum-node.sh" "${args[@]}"
     ;;
   reproduce)
     binary="${1:-}"

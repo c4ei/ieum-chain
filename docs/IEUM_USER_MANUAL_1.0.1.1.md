@@ -1,9 +1,9 @@
-# IEUM Chain v1.0.2.1 사용자·운영자 매뉴얼
+# IEUM Chain v1.0.3.1 사용자·운영자 매뉴얼
 
 ## 네트워크
 
 - 메인넷 Chain ID: `21004`
-- 표시 버전: `1.0.2.1`
+- 표시 버전: `1.0.3.1`
 - 기본 P2P/RPC: UDP `7001`, TCP `8989`
 - 운영 Genesis: `config/genesis.json`
 
@@ -15,7 +15,7 @@ curl -fsS -H 'content-type: application/json' \
   http://127.0.0.1:8989 | python3 -m json.tool
 ```
 
-네 노드의 `chainId`, genesis hash, 높이, tip hash와 state root가 일치해야 합니다. 거래가 없으면 새 블록을 만들지 않으므로 높이가 일정한 것은 정상입니다. 한 노드만 낮고 `syncHighest`도 자기 높이와 같으면 토픽 동기화를 진단합니다.
+네 노드의 `chainId`, genesis hash, 높이, tip hash와 state root가 일치해야 합니다. 거래가 없으면 새 블록을 만들지 않으므로 높이가 일정한 것은 정상입니다. 한 노드가 뒤처지면 1분 이내 차이는 확정 블록으로, 큰 차이 또는 인증서 공백은 2/3 인증 snapshot으로 자동 복구합니다.
 
 ## 자동 진단
 
@@ -24,6 +24,7 @@ sudo bash scripts/diagnose-ieum-server.sh -H 192.168.1.148
 bash scripts/diagnose-ieum-external.sh -H 192.168.1.148
 sudo bash scripts/ieum-cluster-tool.sh status
 sudo bash scripts/ieum-cluster-tool.sh logs 1
+sudo bash scripts/ieum-cluster-tool.sh recover
 ```
 
 데이터 디렉터리는 진단과 백업 없이 삭제하지 않습니다. 같은 높이의 block hash가 다르면 즉시 거래를 중지하고 네 노드의 로그·설정·볼륨을 보존합니다.
@@ -39,6 +40,15 @@ sudo docker logs --since 10m ieum-node1
 
 Compose 명령은 Compose 파일이 있는 디렉터리에서 실행하거나 `docker restart ieum-node1`처럼 컨테이너 이름을 직접 사용합니다.
 
+## 키 보존 복구
+
+```bash
+bash scripts/recover-ieum-node.sh -h
+sudo bash scripts/recover-ieum-node.sh
+```
+
+복구 도구는 config와 노드·검증자 키를 보존하며 기존 원장을 날짜가 붙은 백업으로 남깁니다. 같은 서버 Docker 노드는 다수 정상 상태의 원장을 복제하는 응급복구를 사용하고, 일반 노드는 빈 원장에서 인증 snapshot/P2P 동기화를 시작합니다.
+
 ## 빌드와 테스트
 
 ```bash
@@ -48,4 +58,4 @@ cargo test --all-targets --all-features --locked
 cargo build --release --locked
 ```
 
-릴리스와 Git 절차는 [`VERSION_1.0.2.1_DIRECT_SYNC_RECOVERY.md`](VERSION_1.0.2.1_DIRECT_SYNC_RECOVERY.md)를 참고합니다.
+릴리스와 Git 절차는 [`VERSION_1.0.3.1_CHECKPOINT_P2P_RECOVERY.md`](VERSION_1.0.3.1_CHECKPOINT_P2P_RECOVERY.md)를 참고합니다.

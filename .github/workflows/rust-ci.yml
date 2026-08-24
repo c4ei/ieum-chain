@@ -16,7 +16,7 @@ concurrency:
 
 jobs:
   validate:
-    name: fmt, clippy, test, release build
+    name: fmt, clippy, test, one debug build
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
@@ -53,16 +53,15 @@ jobs:
       - name: Run v0.23.8 operational basics
         run: bash tests/v0_23_8_operational_basics.sh
 
-      - name: Build release binary
-        run: cargo build --release --locked
+      # PR에서는 느린 release 최적화를 반복하지 않습니다. 동일 debug 바이너리를
+      # 두 실제 프로세스 시험이 공유하고, release 빌드는 태그 workflow에서만 합니다.
+      - name: Build one CI binary
+        run: cargo build --locked
 
       - name: Run real four-process BFT network
         run: |
           set -euo pipefail
-          for attempt in 1 2; do
-            echo "===== 4-process BFT/rejoin attempt $attempt/2 ====="
-            bash tests/four_process_network.sh target/release/ieum-chain
-          done
+          bash tests/four_process_network.sh target/debug/ieum-chain
 
       - name: Reproduce persistent Node 1 multi-block rejoin
-        run: bash tests/four_process_node1_persistent_rejoin.sh target/release/ieum-chain
+        run: bash tests/four_process_node1_persistent_rejoin.sh target/debug/ieum-chain

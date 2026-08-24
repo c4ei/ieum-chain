@@ -3,7 +3,7 @@ set -Eeuo pipefail
 
 usage() {
   cat <<'EOF'
-IEUM 실서버 종합 진단 도구 v1.0.2.1
+IEUM 실서버 종합 진단 도구 v1.0.3.1
 
 사용법:
   diagnose-ieum-server.sh [-h] [-H RPC_HOST] [-p PORTS] [-c COMPOSE_DIR] [-s LOG_SINCE]
@@ -90,7 +90,7 @@ for node in 1 2 3 4; do
     echo "[경고] 토픽 연결 로그가 없습니다. 실행 바이너리와 P2P 연결을 확인하세요."
   fi
   if grep -q '\[동기화 직접 응답 완료\]' <<<"$log"; then
-    echo "[정상] v1.0.2.1 직접 동기화 응답 경로가 작동했습니다."
+    echo "[정상] 직접 동기화 응답 경로가 작동했습니다."
   elif grep -q '\[동기화 직접 \(요청\|수신\|응답\) 실패\]' <<<"$log"; then
     echo "[오류] 직접 동기화 request-response 경로에서 실패가 발생했습니다."
   else

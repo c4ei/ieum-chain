@@ -1,3 +1,4 @@
+use crate::archive::StateSnapshot;
 use crate::communication::{CommunicationAck, CommunicationEnvelope};
 use crate::consensus::{ConsensusMessage, DoubleVoteEvidence, FinalityCertificate, SignedProposal};
 use crate::consensus_era::SignedRoundChange;
@@ -210,6 +211,12 @@ struct DirectSyncResponse {
     responder: String,
     tip: SyncTip,
     certificates: Vec<FinalityCertificate>,
+    /// 인증서 이력이 연속되지 않거나 높이 차이가 큰 노드가 사용하는 상태 기준점입니다.
+    /// 기존 v1 응답과 CBOR 호환성을 유지하기 위해 선택 필드로 추가합니다.
+    #[serde(default)]
+    snapshot: Option<Box<StateSnapshot>>,
+    #[serde(default)]
+    snapshot_attestation: Option<SnapshotAttestation>,
 }
 
 /// 노드 코어가 비동기 P2P 작업에 보내는 명령입니다.
@@ -233,6 +240,8 @@ pub enum NetworkCommand {
         requester: String,
         tip: SyncTip,
         certificates: Vec<FinalityCertificate>,
+        snapshot: Option<Box<StateSnapshot>>,
+        snapshot_attestation: Option<SnapshotAttestation>,
     },
     PublishSnapshotAttestation(SnapshotAttestation),
     PenalizePeer {
@@ -318,6 +327,8 @@ pub enum NetworkEvent {
         source: PeerId,
         tip: SyncTip,
         certificates: Vec<FinalityCertificate>,
+        snapshot: Option<Box<StateSnapshot>>,
+        snapshot_attestation: Option<SnapshotAttestation>,
     },
     SnapshotAttestationReceived {
         source: PeerId,
@@ -774,7 +785,13 @@ impl P2pNode {
                                     },
                                 );
                             }
-                            Some(NetworkCommand::RespondSync { requester, tip, certificates }) => {
+                            Some(NetworkCommand::RespondSync {
+                                requester,
+                                tip,
+                                certificates,
+                                snapshot,
+                                snapshot_attestation,
+                            }) => {
                                 if let Ok(peer) = requester.parse::<PeerId>() {
                                     let direct_channel = pending_sync_responses
                                         .get_mut(&peer)
@@ -790,6 +807,8 @@ impl P2pNode {
                                             responder: local_peer_id.to_string(),
                                             tip: tip.clone(),
                                             certificates: certificates.clone(),
+                                            snapshot,
+                                            snapshot_attestation,
                                         };
                                         if swarm.behaviour_mut().sync.send_response(channel, response).is_err() {
                                             crate::logger::write_repeated_error(
@@ -1288,6 +1307,8 @@ async fn handle_swarm_event(
                         source: message_source,
                         tip,
                         certificates,
+                        snapshot: None,
+                        snapshot_attestation: None,
                     }
                 }
                 WireMessage::SnapshotAttestation(attestation) => {
@@ -1337,6 +1358,8 @@ async fn handle_swarm_event(
                             source: peer,
                             tip: response.tip,
                             certificates: response.certificates,
+                            snapshot: response.snapshot,
+                            snapshot_attestation: response.snapshot_attestation,
                         })
                         .await
                         .map_err(|error| error.to_string())?;
