@@ -1,55 +1,49 @@
-# IEUM Chain 0.21.12 멀티 인스턴스 계정·업데이트 안내
+# IEUM Chain v1.0.1.1 사용자·운영자 매뉴얼
 
-모든 상대경로의 기준은 현재 실행한 `ieum-chain` 바이너리의 폴더입니다.
+## 네트워크
 
-| 실행 바이너리 | 계정 암호 | keystore | 업데이트 설정 |
-| --- | --- | --- | --- |
-| `/opt/ieum-node1/ieum-chain` | `/opt/ieum-node1/secure/ieum-account.password` | `/opt/ieum-node1/data/keystore` | `/opt/ieum-node1/config/update.json` |
-| `/opt/ieum-node2/ieum-chain` | `/opt/ieum-node2/secure/ieum-account.password` | `/opt/ieum-node2/data/keystore` | `/opt/ieum-node2/config/update.json` |
-| `/opt/ieum-node3/ieum-chain` | `/opt/ieum-node3/secure/ieum-account.password` | `/opt/ieum-node3/data/keystore` | `/opt/ieum-node3/config/update.json` |
+- 메인넷 Chain ID: `21004`
+- 표시 버전: `1.0.1.1`
+- 기본 P2P/RPC: UDP `7001`, TCP `8989`
+- 운영 Genesis: `config/genesis.json`
 
-## 계정 생성과 가져오기
-
-```bash
-cd /tmp
-/opt/ieum-node2/ieum-chain account new
-/opt/ieum-node2/ieum-chain account import secure/private-key.hex
-/opt/ieum-node2/ieum-chain account list
-```
-
-어느 폴더에서 호출해도 node2의 파일만 사용합니다. `account new` 또는 `import`를
-처음 실행할 때 `secure/ieum-account.password`가 없으면 0600 권한의 임의 암호를
-자동 생성합니다. 이후 `send`도 같은 파일을 자동 사용합니다. 계정마다
-`data/keystore/UTC--timestamp--주소` 파일이 누적됩니다.
-
-외부에서 관리하는 암호를 쓰려면 바이너리 폴더 기준 상대경로나 절대경로를
-명시할 수 있습니다.
+## 노드 상태 확인
 
 ```bash
-/opt/ieum-node2/ieum-chain account new \
-  --password-file secure/operator.password
+curl -fsS -H 'content-type: application/json' \
+  --data '{"jsonrpc":"2.0","id":1,"method":"ieum_nodeStatus","params":[]}' \
+  http://127.0.0.1:8989 | python3 -m json.tool
 ```
 
-## IEUM 전송과 조회
+네 노드의 `chainId`, genesis hash, 높이, tip hash와 state root가 일치해야 합니다. 거래가 없으면 새 블록을 만들지 않으므로 높이가 일정한 것은 정상입니다. 한 노드만 낮고 `syncHighest`도 자기 높이와 같으면 토픽 동기화를 진단합니다.
+
+## 자동 진단
 
 ```bash
-/opt/ieum-node2/ieum-chain account send \
-  --from 0x보내는주소 \
-  --to 0x받는주소 \
-  --amount 0.1 \
-  --fee 0.000001 \
-  --rpc-port 8992
-
-/opt/ieum-node2/ieum-chain account balance 0x주소 --rpc-port 8992
-/opt/ieum-node2/ieum-chain account transaction 0x거래해시 --rpc-port 8992
-/opt/ieum-node2/ieum-chain account receipt 0x거래해시 --rpc-port 8992
+sudo bash scripts/diagnose-ieum-server.sh -H 192.168.1.148
+bash scripts/diagnose-ieum-external.sh -H 192.168.1.148
 ```
 
-## 자동 업데이트
+데이터 디렉터리는 진단과 백업 없이 삭제하지 않습니다. 같은 높이의 block hash가 다르면 즉시 거래를 중지하고 네 노드의 로그·설정·볼륨을 보존합니다.
 
-각 프로세스는 자기 바이너리 옆 `config/update.json`만 읽습니다. 서명과 SHA-256을
-확인한 신규 바이너리는 `current_exe()`가 가리키는 자기 실행 파일만 교체하며,
-다른 `/opt/ieum-node*` 폴더에는 접근하지 않습니다. systemd 재시작 후 새 버전이
-실행됩니다.
+## Docker 운영
 
-절대경로로 지정한 옵션은 인스턴스 기준으로 다시 붙이지 않고 그대로 사용합니다.
+```bash
+cd /opt/ieum-docker-four-node
+sudo docker compose ps
+sudo docker compose restart node1
+sudo docker logs --since 10m ieum-node1
+```
+
+Compose 명령은 Compose 파일이 있는 디렉터리에서 실행하거나 `docker restart ieum-node1`처럼 컨테이너 이름을 직접 사용합니다.
+
+## 빌드와 테스트
+
+```bash
+cargo fmt --all --check
+cargo clippy --all-targets --all-features --locked -- -D warnings
+cargo test --all-targets --all-features --locked
+cargo build --release --locked
+```
+
+릴리스와 Git 절차는 [`VERSION_1.0.1.1_GOSSIPSUB_SYNC_RECOVERY.md`](VERSION_1.0.1.1_GOSSIPSUB_SYNC_RECOVERY.md)를 참고합니다.

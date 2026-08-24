@@ -1,7 +1,0 @@
-Cargo.toml
-Cargo.lock
-src/rpc.rs
-src/main.rs
-CHANGELOG.md
-README.md
-docs/VERSION_0.22.2.md

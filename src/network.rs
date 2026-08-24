@@ -1294,6 +1294,13 @@ async fn handle_swarm_event(
             ..
         } => {
             connected_at.insert(connection_id, Instant::now());
+            // Bootstrap으로 직접 연결된 피어도 gossipsub의 명시적 피어로 등록합니다.
+            // 과거에는 mDNS 발견 피어만 등록되어 Docker/LAN 재시작 뒤 물리 연결은
+            // 존재하지만 sync/consensus 토픽의 전파 대상이 0명으로 남을 수 있었습니다.
+            swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
+            crate::log_info!(
+                "[P2P 토픽 연결] PeerId: {peer_id} · sync/consensus/block 전파 대상으로 등록"
+            );
             let remote_address = endpoint.get_remote_address().clone();
             let unique_peers = swarm.connected_peers().count();
             let _ = event_tx
@@ -1316,6 +1323,15 @@ async fn handle_swarm_event(
             cause,
             ..
         } => {
+            if num_established == 0 && !same_lan_peers.contains(&peer_id) {
+                swarm
+                    .behaviour_mut()
+                    .gossipsub
+                    .remove_explicit_peer(&peer_id);
+                crate::log_info!(
+                    "[P2P 토픽 해제] PeerId: {peer_id} · 남은 연결이 없어 전파 대상에서 제거"
+                );
+            }
             let remote_address = endpoint.get_remote_address().clone();
             let unique_peers = swarm.connected_peers().count();
             let connected_for = connected_at
