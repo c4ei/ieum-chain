@@ -36,7 +36,7 @@ mod installation;
 #[derive(Debug, Parser)]
 #[command(
     name = "ieum-chain",
-    version = "1.0.0.1",
+    version = "1.0.1.1",
     about = "가벼운 IEUM 메인넷 노드"
 )]
 struct Args {
@@ -939,6 +939,11 @@ async fn main() -> Result<(), String> {
     loop {
         tokio::select! {
             _ = sync_tick.tick() => {
+                ieum_chain::logger::write_repeated_info(&format!(
+                    "[동기화 요청] 현재 높이 {} · 요청 시작 높이 {}",
+                    consensus.chain.tip_height(),
+                    consensus.chain.tip_height() + 1
+                ));
                 commands.send(NetworkCommand::RequestSync {
                     from_height: consensus.chain.tip_height() + 1,
                 }).await.map_err(|error| error.to_string())?;
@@ -1456,6 +1461,10 @@ async fn main() -> Result<(), String> {
                         }
                     }
                     Some(NetworkEvent::SyncRequested { requester, from_height, .. }) if !is_client => {
+                        log_info!(
+                            "[동기화 요청 수신] 요청자 {requester} · 시작 높이 {from_height} · 로컬 높이 {}",
+                            consensus.chain.tip_height()
+                        );
                         commands.send(NetworkCommand::RespondSync {
                             requester,
                             tip: SyncTip {
@@ -1467,6 +1476,11 @@ async fn main() -> Result<(), String> {
                         }).await.map_err(|e| e.to_string())?;
                     }
                     Some(NetworkEvent::SyncReceived { source, tip, certificates }) => {
+                        log_info!(
+                            "[동기화 응답 수신] PeerId: {source} · 높이 {} · 인증서 {}개",
+                            tip.height,
+                            certificates.len()
+                        );
                         let Some(agreed_tip) = sync_quorum.observe(source.to_string(), tip) else {
                             log_info!("[동기화 교차검증] 두 번째 독립 피어 응답을 기다립니다.");
                             continue;

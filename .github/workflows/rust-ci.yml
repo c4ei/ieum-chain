@@ -38,6 +38,12 @@ jobs:
       - name: Check CI regression guards
         run: bash tests/ci_regression_guard.sh
 
+      - name: Check Korean diagnostic scripts
+        run: bash tests/diagnostic_scripts.sh
+
+      - name: Check release build policy
+        run: bash tests/release_build_policy.sh
+
       - name: Run Clippy
         run: cargo clippy --all-targets --all-features --locked -- -D warnings
 

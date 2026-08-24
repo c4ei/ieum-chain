@@ -5,5 +5,6 @@
 .env
 /data_backup*
 /docs/운영
+/docs/end/
 validator.key
 validators.json

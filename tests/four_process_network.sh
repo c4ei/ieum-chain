@@ -483,4 +483,9 @@ for _ in $(seq 1 120); do
 done
 
 [[ "$rejoin_passed" == true ]] || { echo "노드 4 자동 재합류 실패"; dump_logs; exit 1; }
+grep -q '\[P2P 토픽 연결\]' "$test_root/node-4.log" || {
+  echo "노드 4 재합류 뒤 bootstrap 피어의 토픽 전파 등록 로그가 없습니다."
+  dump_logs
+  exit 1
+}
 echo "4-process restart/rejoin passed: heights=${heights[*]}, stateRoot=${roots[0]}, receipt=$second_transaction_hash"

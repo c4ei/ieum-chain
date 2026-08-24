@@ -1,65 +1,49 @@
-# IEUM Chain 0.21.11 기본 계정·송금 사용자 안내
+# IEUM Chain v1.0.1.1 사용자·운영자 매뉴얼
 
-사용자 자산 주소는 모두 secp256k1 기반 `0x` + 40자리입니다. Ed25519 64자리 값은
-검증자·P2P 식별과 과거 호환에만 사용하며 입금 주소로 사용하지 않습니다.
+## 네트워크
 
-## 암호 파일 준비
+- 메인넷 Chain ID: `21004`
+- 표시 버전: `1.0.1.1`
+- 기본 P2P/RPC: UDP `7001`, TCP `8989`
+- 운영 Genesis: `config/genesis.json`
 
-```bash
-install -m 600 /dev/null /secure/ieum-account.password
-vi /secure/ieum-account.password
-```
-
-암호는 10자 이상이어야 하며 명령행 인수나 Git에 넣지 않습니다.
-
-## 계정 생성·가져오기·목록
+## 노드 상태 확인
 
 ```bash
-./ieum-chain account new --password-file /secure/ieum-account.password
-./ieum-chain account import /secure/private-key.hex \
-  --password-file /secure/ieum-account.password
-./ieum-chain account list
+curl -fsS -H 'content-type: application/json' \
+  --data '{"jsonrpc":"2.0","id":1,"method":"ieum_nodeStatus","params":[]}' \
+  http://127.0.0.1:8989 | python3 -m json.tool
 ```
 
-개인키 파일은 `0x` 접두사가 선택적인 정확히 64자리 hex입니다. 생성·가져오기 결과는
-`data/keystore/UTC--timestamp--주소`에 암호화되어 계정별로 누적됩니다. 기존
-`data/keystore/주소.json` 파일도 계속 읽습니다.
+네 노드의 `chainId`, genesis hash, 높이, tip hash와 state root가 일치해야 합니다. 거래가 없으면 새 블록을 만들지 않으므로 높이가 일정한 것은 정상입니다. 한 노드만 낮고 `syncHighest`도 자기 높이와 같으면 토픽 동기화를 진단합니다.
 
-로컬 RPC에서 같은 저장소에 계정을 생성하거나 가져올 수 있습니다.
+## 자동 진단
 
 ```bash
-curl -sS -H 'Content-Type: application/json' \
-  --data '{"jsonrpc":"2.0","id":1,"method":"personal_newAccount","params":["10자이상암호"]}' \
-  http://127.0.0.1:8989
-
-curl -sS -H 'Content-Type: application/json' \
-  --data '{"jsonrpc":"2.0","id":2,"method":"personal_importRawKey","params":["64자리개인키","10자이상암호"]}' \
-  http://127.0.0.1:8989
+sudo bash scripts/diagnose-ieum-server.sh -H 192.168.1.148
+bash scripts/diagnose-ieum-external.sh -H 192.168.1.148
 ```
 
-`personal_*` 요청에는 암호·개인키가 포함되므로 RPC는 localhost에만 바인딩하고
-프록시 접근 로그에 요청 본문을 남기지 마세요.
+데이터 디렉터리는 진단과 백업 없이 삭제하지 않습니다. 같은 높이의 block hash가 다르면 즉시 거래를 중지하고 네 노드의 로그·설정·볼륨을 보존합니다.
 
-## 잔액·송금·트랜잭션 조회
+## Docker 운영
 
 ```bash
-./ieum-chain account balance 0x주소 --rpc-port 8989
-
-./ieum-chain account send \
-  --from 0x보내는주소 \
-  --to 0x받는주소 \
-  --amount 0.1 \
-  --fee 0.000001 \
-  --password-file /secure/ieum-account.password \
-  --rpc-port 8989
-
-./ieum-chain account transaction 0x거래해시 --rpc-port 8989
-./ieum-chain account receipt 0x거래해시 --rpc-port 8989
+cd /opt/ieum-docker-four-node
+sudo docker compose ps
+sudo docker compose restart node1
+sudo docker logs --since 10m ieum-node1
 ```
 
-`account send`가 출력한 `0x` 거래 해시로 조회합니다. 블록 확정 전에는 transaction과
-receipt 결과가 `null`일 수 있으며, 확정 후 receipt의 `status`가 `0x1`이면 성공입니다.
+Compose 명령은 Compose 파일이 있는 디렉터리에서 실행하거나 `docker restart ieum-node1`처럼 컨테이너 이름을 직접 사용합니다.
 
-기존 JSON-RPC `eth_getBalance`, `eth_getTransactionCount`, `eth_sendTransaction`,
-`eth_sendRawTransaction`, `eth_getTransactionByHash`, `eth_getTransactionReceipt`,
-`eth_getBlockByNumber`도 유지됩니다.
+## 빌드와 테스트
+
+```bash
+cargo fmt --all --check
+cargo clippy --all-targets --all-features --locked -- -D warnings
+cargo test --all-targets --all-features --locked
+cargo build --release --locked
+```
+
+릴리스와 Git 절차는 [`VERSION_1.0.1.1_GOSSIPSUB_SYNC_RECOVERY.md`](VERSION_1.0.1.1_GOSSIPSUB_SYNC_RECOVERY.md)를 참고합니다.
