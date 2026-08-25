@@ -12,6 +12,12 @@ grep -q 'transaction_is_admissible(&state.chain, &transaction)' src/rpc.rs
 grep -q 'state.pool.next_nonce(&wallet.address(), finalized_nonce)' src/rpc.rs
 grep -q 'rpc.begin_sync(tip.height)' src/main.rs
 grep -q '5초 sync tick에 맡깁니다' src/main.rs
+grep -q 'pub const SERVICE_BOND: u128 = 100 \* IEUM' src/node_emission.rs
+grep -q 'pub const SERVICE_MINIMUM_VALIDATORS: usize = 3' src/node_emission.rs
+grep -q 'validator_peer_ids.contains(&attestation.peer_id)' src/node_emission.rs
+grep -q 'NodeServiceDailyReward' src/consensus_runtime.rs
+grep -q '일반 공개 노드 보상: 100 IEUM 담보 필수' README.md
+grep -q '일반 공개 노드 보상과 100 IEUM 담보' docs/IEUM_USER_MANUAL_1.0.1.1.md
 
 bash -n "$network_test"
 bash -n "$operational_test"
@@ -54,6 +60,12 @@ require_pattern 'expected_recipient_balance="$((initial_recipient_balances[0] + 
   "최종 잔액은 송금 전 잔액의 증가분으로 계산해야 합니다."
 require_pattern '[[ "${recipient_balances[3]}" == "$expected_recipient_balance" ]]' \
   "네 노드 모두에서 기대 잔액을 확인해야 합니다."
+require_pattern 'eth_sendRawTransaction' \
+  "실제 EIP-155 서명 raw 거래를 4노드 BFT로 확정해야 합니다."
+require_pattern 'IEUM_CI_IDLE_WAIT_SECONDS' \
+  "유휴 상태가 끝난 뒤 첫 거래 확정을 검증해야 합니다."
+require_pattern 'raw 거래 확정 nonce 불일치' \
+  "raw 거래 확정 뒤 네 노드의 nonce 증가를 확인해야 합니다."
 
 if grep -Fq 'recipient_balances[*]}" == "100000000000000000 ' "$network_test"; then
   echo "CI 회귀 방지 실패: 고정 절대 잔액 판정이 다시 추가됐습니다." >&2

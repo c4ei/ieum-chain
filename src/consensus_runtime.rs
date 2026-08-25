@@ -10,7 +10,7 @@ use crate::scheduled_event::{EventSchedule, MAX_CLOCK_DRIFT_SECONDS};
 use crate::signer::ValidatorSigner;
 use crate::snapshot_sync::{SnapshotAttestation, SnapshotCertificate};
 use crate::wallet::Wallet;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy, Debug)]
@@ -50,6 +50,7 @@ pub struct ConsensusRuntime {
     deadline: Instant,
     timeouts: ConsensusTimeouts,
     validators: Vec<Validator>,
+    validator_peer_ids: HashSet<String>,
     precommits: Vec<ConsensusMessage>,
     deferred_votes: Vec<ConsensusMessage>,
     round_change_votes: HashMap<(u64, u32), Vec<SignedRoundChange>>,
@@ -119,6 +120,7 @@ impl ConsensusRuntime {
             deadline,
             timeouts,
             validators,
+            validator_peer_ids: HashSet::new(),
             precommits: Vec::new(),
             deferred_votes: Vec::new(),
             round_change_votes: HashMap::new(),
@@ -133,6 +135,32 @@ impl ConsensusRuntime {
     }
     pub fn set_upgrade_schedule(&mut self, schedule: crate::upgrade::UpgradeSchedule) {
         self.upgrade_schedule = schedule;
+    }
+
+    pub fn set_validator_peer_ids(&mut self, peer_ids: HashSet<String>) {
+        self.validator_peer_ids = peer_ids;
+    }
+
+    pub fn sign_node_service_attestation(
+        &self,
+        peer_id: String,
+        reward_address: String,
+        observed_at: u64,
+        uptime_bps: u16,
+        network_group: String,
+    ) -> Result<crate::node_emission::NodeServiceAttestation, String> {
+        let mut attestation = crate::node_emission::NodeServiceAttestation {
+            peer_id,
+            reward_address,
+            epoch: observed_at / crate::node_emission::REWARD_EPOCH_SECONDS,
+            observed_at,
+            uptime_bps,
+            network_group,
+            validator_id: self.validator.address(),
+            signature_hex: String::new(),
+        };
+        attestation.signature_hex = self.validator.sign_bytes(&attestation.bytes_to_sign())?;
+        Ok(attestation)
     }
 
     pub fn set_event_schedule(&mut self, schedule: EventSchedule) -> Result<(), String> {
@@ -837,7 +865,7 @@ impl ConsensusRuntime {
             return Err("블록 시각이 허용된 미래 오차를 넘었습니다.".into());
         }
         let protocol = self.upgrade_schedule.version_at(block.height);
-        if protocol<3 && (block.transactions.iter().any(|tx|!tx.action.is_transfer()) || block.system_events.iter().any(|event|matches!(&event.action,crate::scheduled_event::ScheduledEventAction::DoubleVoteSlash{..}|crate::scheduled_event::ScheduledEventAction::DelegationDailyReward{..}))) {
+        if protocol<3 && (block.transactions.iter().any(|tx|!tx.action.is_transfer()) || block.system_events.iter().any(|event|matches!(&event.action,crate::scheduled_event::ScheduledEventAction::DoubleVoteSlash{..}|crate::scheduled_event::ScheduledEventAction::DelegationDailyReward{..}|crate::scheduled_event::ScheduledEventAction::NodeServiceDailyReward{..}))) {
             return Err("위임·페널티 기능은 프로토콜 v3 활성화 높이 이전에 사용할 수 없습니다.".into());
         }
         for transaction in &block.transactions {
@@ -862,6 +890,7 @@ impl ConsensusRuntime {
                         | crate::scheduled_event::ScheduledEventAction::HolderDailyReward { .. }
                         | crate::scheduled_event::ScheduledEventAction::DoubleVoteSlash { .. }
                         | crate::scheduled_event::ScheduledEventAction::DelegationDailyReward { .. }
+                        | crate::scheduled_event::ScheduledEventAction::NodeServiceDailyReward { .. }
                 )
             })
             .cloned()
@@ -988,6 +1017,30 @@ impl ConsensusRuntime {
                         );
                     }
                 }
+                crate::scheduled_event::ScheduledEventAction::NodeServiceDailyReward {
+                    snapshot_height,
+                    epoch,
+                    attestations,
+                    payments,
+                } if event.id == crate::node_emission::service_event_id(*epoch) => {
+                    let expected = crate::node_emission::calculate_service_payments(
+                        block.timestamp,
+                        attestations,
+                        &self.validators,
+                        &self.validator_peer_ids,
+                        self.chain.staking(),
+                        self.chain.balance_of(crate::FOUNDATION_FEE_ADDRESS),
+                    )?;
+                    if *snapshot_height != self.chain.tip_height()
+                        || *epoch != block.timestamp / crate::node_emission::REWARD_EPOCH_SECONDS
+                        || payments != &expected
+                    {
+                        return Err(
+                            "공개 노드 일일 보상이 담보·서비스 증명 계산과 일치하지 않습니다."
+                                .into(),
+                        );
+                    }
+                }
                 crate::scheduled_event::ScheduledEventAction::BootstrapValidatorReward {
                     ..
                 }
@@ -1005,6 +1058,9 @@ impl ConsensusRuntime {
                 }
                 crate::scheduled_event::ScheduledEventAction::DelegationDailyReward { .. } => {
                     return Err("위임 보상 이벤트 ID가 올바르지 않습니다.".into());
+                }
+                crate::scheduled_event::ScheduledEventAction::NodeServiceDailyReward { .. } => {
+                    return Err("공개 노드 일일 보상 이벤트 ID가 올바르지 않습니다.".into());
                 }
                 _ => continue,
             }

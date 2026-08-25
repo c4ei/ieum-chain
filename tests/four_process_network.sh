@@ -204,6 +204,13 @@ fi
 # GossipSub 구독 정보가 연결 직후 전파될 시간을 짧게 보장한다.
 sleep 2
 
+# 합의 라운드가 유휴 상태로 돌아간 뒤 첫 거래가 들어오는 운영 상황을 재현한다.
+# CI 기본값은 단계별 timeout(3s/2s/2s)보다 길게 두고, 운영 장기 시험에서는
+# IEUM_CI_IDLE_WAIT_SECONDS=86400으로 같은 검사를 하루 유휴 조건으로 실행할 수 있다.
+idle_wait_seconds="${IEUM_CI_IDLE_WAIT_SECONDS:-15}"
+echo "유휴 후 첫 거래 시험 대기: ${idle_wait_seconds}초"
+sleep "$idle_wait_seconds"
+
 faucet_response="$(rpc 9202 eth_coinbase '[]')"
 
 faucet="$(
@@ -279,14 +286,11 @@ fi
 expected_recipient_balance="$((initial_recipient_balances[0] + transfer_amount_wei))"
 echo "수신 주소 송금 전 잔액 확인: balance=${initial_recipient_balances[0]} wei, expectedAfter=$expected_recipient_balance wei"
 
-send_response="$(rpc 9202 eth_sendTransaction \
-  "[{
-    \"from\":\"$faucet\",
-    \"to\":\"$recipient\",
-    \"value\":\"$transfer_value\",
-    \"gas\":\"0x5208\",
-    \"gasPrice\":\"0x1\"
-  }]")"
+# 고정 CI faucet 개인키([42; 32])로 EIP-155 legacy 거래를 실제 서명한 값이다.
+# chainId=21005, nonce=0, gasPrice=1, gasLimit=21000, value=0.1 IEUM이며
+# eth_sendTransaction 우회 없이 월렛/MetaMask와 같은 raw RPC 경로를 검증한다.
+signed_raw_transaction="0xf8698001825208943252b7b65e50b54508974db8d634134b0bd6be9088016345785d8a00008082a43da075c45042269a144a256fd866208f5916e81eb3d8bdd4adec84559f51ad5b0166a03cd6037082115234b573a7b92e775edf6c21d327bd94bafab7cb5d2a9e6a4d1a"
+send_response="$(rpc 9202 eth_sendRawTransaction "[\"$signed_raw_transaction\"]")"
 
 transaction_hash="$(python3 - "$send_response" <<'PY'
 import json
@@ -392,6 +396,28 @@ if [[ "$bft_passed" != true ]]; then
   dump_logs
   exit 1
 fi
+
+# 네 노드 모두 raw 거래의 확정 영수증과 송신자 nonce 증가를 동일하게 제공해야 한다.
+for index in 1 2 3 4; do
+  port="$((9200 + index))"
+  receipt_response="$(rpc "$port" eth_getTransactionReceipt "[\"$transaction_hash\"]")"
+  nonce_response="$(rpc "$port" eth_getTransactionCount "[\"$faucet\",\"latest\"]")"
+  python3 - "$index" "$transaction_hash" "$receipt_response" "$nonce_response" <<'PY'
+import json
+import sys
+
+index, transaction_hash, receipt_raw, nonce_raw = sys.argv[1:]
+receipt = json.loads(receipt_raw).get("result")
+if not isinstance(receipt, dict):
+    raise SystemExit(f"노드 {index} raw 거래 확정 영수증 없음")
+if receipt.get("transactionHash") != transaction_hash or receipt.get("status") != "0x1":
+    raise SystemExit(f"노드 {index} raw 거래 영수증 불일치: {receipt}")
+nonce = int(json.loads(nonce_raw).get("result", "0x0"), 16)
+if nonce != 1:
+    raise SystemExit(f"노드 {index} raw 거래 확정 nonce 불일치: {nonce}")
+print(f"노드 {index} raw 거래 E2E 확인: receipt={transaction_hash}, nonce={nonce}")
+PY
+done
 
 # 한 검증자를 실제로 중단한 동안 나머지 3개 노드가 블록을 확정하고, 같은 데이터
 # 디렉터리로 재기동한 검증자가 자동 동기화한 뒤 다시 동일 상태를 제공하는지 검증한다.

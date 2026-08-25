@@ -442,6 +442,11 @@ fn apply_system_events(
                     transfer_from_foundation(balances, &payment.address, payment.amount)?;
                 }
             }
+            ScheduledEventAction::NodeServiceDailyReward { payments, .. } => {
+                for payment in payments {
+                    transfer_from_foundation(balances, &payment.address, payment.amount)?;
+                }
+            }
         }
     }
     Ok(())
@@ -532,7 +537,7 @@ fn apply_transactions(
                 "받는 계정 잔액이 u128 범위를 넘습니다.",
             )?,
             TransactionAction::Delegate { validator } => {
-                staking.delegate(&tx.from, validator, tx.amount)?
+                staking.delegate_at(&tx.from, validator, tx.amount, block_timestamp)?
             }
             TransactionAction::Undelegate { validator } => {
                 staking.undelegate(&tx.from, validator, tx.amount, block_timestamp)?;

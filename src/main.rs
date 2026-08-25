@@ -2,11 +2,11 @@ use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
 use ieum_chain::{
     AccountWallet, ConsensusRuntime, ConsensusTimeouts, EventSchedule, EvidenceStore,
     ExternalSigner, FinalityStore, GenesisConfig, Keystore, NetworkCommand, NetworkConfig,
-    NetworkEvent, NodeRewardRegistration, NodeWalletKeystore, P2pNode, RpcConfig, RpcServer,
-    ScheduledEvent, ScheduledEventAction, SnapshotAttestation, SnapshotCertificate, StateSnapshot,
-    SyncTip, TipQuorum, Transaction, UpgradeSchedule, Validator, ValidatorRegistration,
-    ValidatorSigner, Wallet, log_error, log_info, logger::init_server_log,
-    node_key::load_or_create_node_key,
+    NetworkEvent, NodeRewardRegistration, NodeServiceAttestation, NodeWalletKeystore, P2pNode,
+    RpcConfig, RpcServer, ScheduledEvent, ScheduledEventAction, SnapshotAttestation,
+    SnapshotCertificate, StateSnapshot, SyncTip, TipQuorum, Transaction, UpgradeSchedule,
+    Validator, ValidatorRegistration, ValidatorSigner, Wallet, log_error, log_info,
+    logger::init_server_log, node_key::load_or_create_node_key,
 };
 use libp2p::{Multiaddr, multiaddr::Protocol};
 use rand_core::{OsRng, RngCore};
@@ -31,6 +31,28 @@ const DEFAULT_BOOTSTRAP_PEERS: [&str; 4] = [
 const SERVER_INSTANCE_PORT: u16 = 49_889;
 const CLIENT_INSTANCE_PORT: u16 = 49_890;
 const SUPPORTED_PROTOCOL_VERSION: u32 = 3;
+
+#[derive(Clone, Debug)]
+struct ServiceObservation {
+    connected_since: u64,
+    network_group: String,
+}
+
+fn service_network_group(remote_ip: Option<&str>) -> Option<String> {
+    match remote_ip?.parse::<IpAddr>().ok()? {
+        IpAddr::V4(ip) => {
+            let [a, b, c, _] = ip.octets();
+            Some(format!("ipv4:{a}.{b}.{c}.0/24"))
+        }
+        IpAddr::V6(ip) => {
+            let segments = ip.segments();
+            Some(format!(
+                "ipv6:{:x}:{:x}:{:x}::/48",
+                segments[0], segments[1], segments[2]
+            ))
+        }
+    }
+}
 
 mod installation;
 
@@ -844,12 +866,15 @@ async fn main() -> Result<(), String> {
                 .sign(&reward_registration_bytes)
                 .map_err(|error| format!("노드 보상 등록 서명 실패: {error}"))?,
         ),
+        reward_signature_hex: reward_wallet.sign_bytes(&reward_registration_bytes),
     };
     let mut node_reward_registrations = BTreeMap::new();
     node_reward_registrations.insert(
         local_reward_registration.peer_id.clone(),
         local_reward_registration.clone(),
     );
+    let mut service_observations = HashMap::<String, ServiceObservation>::new();
+    let mut service_attestations = BTreeMap::<(u64, String, String), NodeServiceAttestation>::new();
     upgrades.ensure_supported(
         rpc.chain()?.tip_height().saturating_add(1),
         SUPPORTED_PROTOCOL_VERSION,
@@ -869,6 +894,13 @@ async fn main() -> Result<(), String> {
     consensus.set_upgrade_schedule(upgrades.clone());
     consensus.set_validator_interest_policy(validator_interest_policy.clone())?;
     consensus.set_holder_reward_policy(holder_reward_policy.clone())?;
+    consensus.set_validator_peer_ids(
+        registrations
+            .values()
+            .filter(|registration| validators.iter().any(|v| v.id == registration.validator_id))
+            .map(|registration| registration.peer_id.clone())
+            .collect(),
+    );
     log_info!(
         "[검증자 일일 이자] enabled={} APR={:.2}% 최소={} wei 정책={}",
         validator_interest_policy.enabled,
@@ -997,6 +1029,47 @@ async fn main() -> Result<(), String> {
                     ))
                     .await
                     .map_err(|error| error.to_string())?;
+                if local_is_validator {
+                    let now = unix_timestamp();
+                    let epoch = now / ieum_chain::node_emission::REWARD_EPOCH_SECONDS;
+                    let epoch_start = epoch * ieum_chain::node_emission::REWARD_EPOCH_SECONDS;
+                    let validator_peers = registrations
+                        .values()
+                        .filter(|registration| validators.iter().any(|v| v.id == registration.validator_id))
+                        .map(|registration| registration.peer_id.as_str())
+                        .collect::<HashSet<_>>();
+                    for (observed_peer, observation) in &service_observations {
+                        if validator_peers.contains(observed_peer.as_str()) {
+                            continue;
+                        }
+                        let Some(reward_registration) = node_reward_registrations.get(observed_peer) else {
+                            continue;
+                        };
+                        let observed_seconds = now.saturating_sub(observation.connected_since.max(epoch_start));
+                        let uptime_bps = ((u128::from(observed_seconds) * 10_000)
+                            / u128::from(ieum_chain::node_emission::REWARD_EPOCH_SECONDS))
+                            .min(10_000) as u16;
+                        if uptime_bps < ieum_chain::node_emission::SERVICE_MINIMUM_UPTIME_BPS {
+                            continue;
+                        }
+                        let attestation = consensus.sign_node_service_attestation(
+                            observed_peer.clone(),
+                            reward_registration.reward_address.clone(),
+                            now,
+                            uptime_bps,
+                            observation.network_group.clone(),
+                        )?;
+                        service_attestations.insert(
+                            (epoch, observed_peer.clone(), attestation.validator_id.clone()),
+                            attestation.clone(),
+                        );
+                        commands
+                            .send(NetworkCommand::PublishNodeServiceAttestation(attestation))
+                            .await
+                            .map_err(|error| error.to_string())?;
+                    }
+                    service_attestations.retain(|(known_epoch, _, _), _| *known_epoch + 1 >= epoch);
+                }
             }
             _ = snapshot_tick.tick() => {
                 if local_is_validator
@@ -1209,6 +1282,41 @@ async fn main() -> Result<(), String> {
                             if !payments.is_empty(){due_events.push(ScheduledEvent{id:delegation_reward_id,execute_at:ieum_chain::validator_interest::execute_at(timestamp),action:ScheduledEventAction::DelegationDailyReward{snapshot_height:consensus.chain.tip_height(),policy_hash:validator_interest_policy.hash(),annual_rate_bps:validator_interest_policy.annual_rate_bps,payments}});}
                         }
                     }
+                    let service_epoch = timestamp / ieum_chain::node_emission::REWARD_EPOCH_SECONDS;
+                    let service_reward_id = ieum_chain::node_emission::service_event_id(service_epoch);
+                    if !consensus.chain.executed_events().contains(&service_reward_id) {
+                        let validator_peer_ids = registrations
+                            .values()
+                            .filter(|registration| validators.iter().any(|v| v.id == registration.validator_id))
+                            .map(|registration| registration.peer_id.clone())
+                            .collect::<HashSet<_>>();
+                        consensus.set_validator_peer_ids(validator_peer_ids.clone());
+                        let proofs = service_attestations
+                            .values()
+                            .filter(|proof| proof.epoch == service_epoch)
+                            .cloned()
+                            .collect::<Vec<_>>();
+                        let payments = ieum_chain::node_emission::calculate_service_payments(
+                            timestamp,
+                            &proofs,
+                            &validators,
+                            &validator_peer_ids,
+                            consensus.chain.staking(),
+                            consensus.chain.balance_of(ieum_chain::FOUNDATION_FEE_ADDRESS),
+                        )?;
+                        if !payments.is_empty() {
+                            due_events.push(ScheduledEvent {
+                                id: service_reward_id,
+                                execute_at: timestamp,
+                                action: ScheduledEventAction::NodeServiceDailyReward {
+                                    snapshot_height: consensus.chain.tip_height(),
+                                    epoch: service_epoch,
+                                    attestations: proofs,
+                                    payments,
+                                },
+                            });
+                        }
+                    }
                     if consensus.can_make_proposal()
                         && std::time::Instant::now() >= next_block_at
                         && (rpc.has_pending_transactions()? || !due_events.is_empty())
@@ -1268,6 +1376,14 @@ async fn main() -> Result<(), String> {
             event = events.recv() => {
                 match event {
                     Some(NetworkEvent::PeerConnected { peer_id: connected, remote_address, remote_ip, direction, connection_id, unique_peers, peer_connections }) => {
+                        if peer_connections == 1
+                            && let Some(network_group) = service_network_group(remote_ip.as_deref())
+                        {
+                            service_observations.entry(connected.to_string()).or_insert(ServiceObservation {
+                                connected_since: unix_timestamp(),
+                                network_group,
+                            });
+                        }
                         rpc.peer_connected(
                             &connected.to_string(),
                             &remote_address.to_string(),
@@ -1315,6 +1431,13 @@ async fn main() -> Result<(), String> {
                                 registrations.len().min(4)
                             );
                         }
+                        consensus.set_validator_peer_ids(
+                            registrations
+                                .values()
+                                .filter(|known| validators.iter().any(|v| v.id == known.validator_id))
+                                .map(|known| known.peer_id.clone())
+                                .collect(),
+                        );
                         if registrations.len() >= 4 && consensus.chain.tip_height() == 0 {
                             let selected: Vec<_> = registrations
                                 .keys()
@@ -1373,6 +1496,10 @@ async fn main() -> Result<(), String> {
                             log_error!("[노드 보상 등록 거부] {error}");
                             continue;
                         }
+                        if let Err(error) = registration.verify_reward_address() {
+                            log_error!("[노드 보상 등록 거부] {error}");
+                            continue;
+                        }
                         let is_new = node_reward_registrations
                             .insert(registration.peer_id.clone(), registration)
                             .is_none();
@@ -1382,6 +1509,25 @@ async fn main() -> Result<(), String> {
                                 node_reward_registrations.len().min(100)
                             );
                         }
+                    }
+                    Some(NetworkEvent::NodeServiceAttestationReceived { source, attestation }) if !is_client => {
+                        if let Err(error) = attestation.verify() {
+                            log_error!("[노드 활동 증명 거부] PeerId: {source} · {error}");
+                            commands.send(NetworkCommand::PenalizePeer { peer_id: source, points: 25 })
+                                .await.map_err(|error| error.to_string())?;
+                            continue;
+                        }
+                        if !validators.iter().any(|validator| validator.id == attestation.validator_id) {
+                            continue;
+                        }
+                        let current_epoch = unix_timestamp() / ieum_chain::node_emission::REWARD_EPOCH_SECONDS;
+                        if attestation.epoch != current_epoch {
+                            continue;
+                        }
+                        service_attestations.insert(
+                            (attestation.epoch, attestation.peer_id.clone(), attestation.validator_id.clone()),
+                            attestation,
+                        );
                     }
                     Some(NetworkEvent::UpdateAvailableReceived { source, version }) => {
                         let Some((_, config)) = auto_update.as_ref() else {
@@ -1682,6 +1828,9 @@ async fn main() -> Result<(), String> {
                         }
                     }
                     Some(NetworkEvent::PeerDisconnected { peer_id, remote_address, remote_ip, direction, connection_id, connected_for, unique_peers, peer_connections, cause }) => {
+                        if peer_connections == 0 {
+                            service_observations.remove(&peer_id.to_string());
+                        }
                         rpc.peer_disconnected(&peer_id.to_string(), peer_connections)?;
                         log_info!("{}", NetworkEvent::PeerDisconnected {
                             peer_id,

@@ -80,9 +80,9 @@ pub use network::{
     ValidatorRegistration,
 };
 pub use node_emission::{
-    MAIN_NODE_PEER_IDS, MAX_SUPPLY, MAX_SUPPLY_IEUM, REWARD_ACTIVATION_HEIGHT,
-    REWARD_ACTIVATION_UNIX, TOTAL_NODE_EMISSION, annual_budget, daily_budget, is_reward_active,
-    settle_daily_rewards,
+    MAIN_NODE_PEER_IDS, MAX_SUPPLY, MAX_SUPPLY_IEUM, NodeServiceAttestation,
+    REWARD_ACTIVATION_HEIGHT, REWARD_ACTIVATION_UNIX, TOTAL_NODE_EMISSION, annual_budget,
+    daily_budget, is_reward_active, settle_daily_rewards,
 };
 pub use node_wallet_keystore::NodeWalletKeystore;
 pub use operations::{NodeStorageMode, PruningPolicy, StorageManifest};

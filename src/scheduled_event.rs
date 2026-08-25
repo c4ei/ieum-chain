@@ -66,6 +66,13 @@ pub enum ScheduledEventAction {
         annual_rate_bps: u32,
         payments: Vec<EventPayment>,
     },
+    /// 100 IEUM 성숙 담보와 3/4 독립 서비스 증명을 통과한 외부 공개 노드의 일일 보상입니다.
+    NodeServiceDailyReward {
+        snapshot_height: u64,
+        epoch: u64,
+        attestations: Vec<crate::node_emission::NodeServiceAttestation>,
+        payments: Vec<EventPayment>,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -265,6 +272,36 @@ impl ScheduledEvent {
                     validate_reward_address(&payment.address)?;
                     if payment.amount == 0 {
                         return Err("위임 보상액은 0보다 커야 합니다.".into());
+                    }
+                }
+                return Ok(());
+            }
+            ScheduledEventAction::NodeServiceDailyReward {
+                epoch,
+                attestations,
+                payments,
+                ..
+            } => {
+                if self.id != crate::node_emission::service_event_id(*epoch)
+                    || attestations.len() < crate::node_emission::SERVICE_MINIMUM_VALIDATORS
+                    || attestations.len() > 10_000
+                    || payments.is_empty()
+                    || payments.len() > 10_000
+                {
+                    return Err(
+                        "공개 노드 일일 보상 증명 또는 지급 대상이 올바르지 않습니다.".into(),
+                    );
+                }
+                for attestation in attestations {
+                    attestation.verify()?;
+                    if attestation.epoch != *epoch {
+                        return Err("공개 노드 서비스 증명의 epoch가 다릅니다.".into());
+                    }
+                }
+                for payment in payments {
+                    validate_address(&payment.address)?;
+                    if payment.amount == 0 {
+                        return Err("공개 노드 일일 보상액은 0보다 커야 합니다.".into());
                     }
                 }
                 return Ok(());
