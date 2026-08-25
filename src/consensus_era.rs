@@ -1,5 +1,6 @@
 use crate::Wallet;
 use crate::consensus::{ConsensusMessage, Validator, VoteType};
+use crate::model::Block;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -15,7 +16,17 @@ pub struct SignedRoundChange {
     pub height: u64,
     pub round: u32,
     pub validator_id: String,
+    #[serde(default)]
+    pub valid_value: Option<RoundChangeValidValue>,
     pub signature: String,
+}
+
+/// 라운드 변경 중 새 제안자가 기존 잠금 값을 안전하게 이어받기 위한 2/3 prevote 증명입니다.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RoundChangeValidValue {
+    pub block: Block,
+    pub valid_round: u32,
+    pub prevotes: Vec<ConsensusMessage>,
 }
 
 impl SignedRoundChange {
@@ -34,6 +45,7 @@ impl SignedRoundChange {
             height,
             round,
             &validator_id,
+            None,
         ));
         Self {
             chain_id,
@@ -41,6 +53,7 @@ impl SignedRoundChange {
             height,
             round,
             validator_id,
+            valid_value: None,
             signature,
         }
     }
@@ -59,6 +72,7 @@ impl SignedRoundChange {
             height,
             round,
             validator_id,
+            valid_value: None,
             signature,
         };
         message.verify()?;
@@ -71,6 +85,7 @@ impl SignedRoundChange {
         height: u64,
         round: u32,
         validator_id: &str,
+        _valid_value: Option<&RoundChangeValidValue>,
     ) -> Vec<u8> {
         let mut bytes = b"IEUM-ROUND-CHANGE-V1".to_vec();
         bytes.extend_from_slice(&chain_id.to_be_bytes());
@@ -79,6 +94,57 @@ impl SignedRoundChange {
         bytes.extend_from_slice(&round.to_be_bytes());
         push_round_change_text(&mut bytes, validator_id);
         bytes
+    }
+
+    pub fn with_valid_value(
+        chain_id: u64,
+        genesis_commitment: impl Into<String>,
+        height: u64,
+        round: u32,
+        validator: &Wallet,
+        valid_value: Option<RoundChangeValidValue>,
+    ) -> Self {
+        let genesis_commitment = genesis_commitment.into();
+        let validator_id = validator.address();
+        let signature = validator.sign_bytes(&Self::bytes_to_sign(
+            chain_id,
+            &genesis_commitment,
+            height,
+            round,
+            &validator_id,
+            valid_value.as_ref(),
+        ));
+        Self {
+            chain_id,
+            genesis_commitment,
+            height,
+            round,
+            validator_id,
+            valid_value,
+            signature,
+        }
+    }
+
+    pub fn from_signature_with_valid_value(
+        chain_id: u64,
+        genesis_commitment: String,
+        height: u64,
+        round: u32,
+        validator_id: String,
+        valid_value: Option<RoundChangeValidValue>,
+        signature: String,
+    ) -> Result<Self, String> {
+        let message = Self {
+            chain_id,
+            genesis_commitment,
+            height,
+            round,
+            validator_id,
+            valid_value,
+            signature,
+        };
+        message.verify()?;
+        Ok(message)
     }
 
     pub fn verify(&self) -> Result<(), String> {
@@ -90,6 +156,7 @@ impl SignedRoundChange {
                 self.height,
                 self.round,
                 &self.validator_id,
+                self.valid_value.as_ref(),
             ),
             &self.signature,
         )
@@ -314,5 +381,32 @@ mod tests {
                 .collect(),
         };
         assert!(certificate.verify(&validators()).is_ok());
+    }
+
+    #[test]
+    fn signed_round_change_carries_independently_signed_valid_value() {
+        let keys: Vec<_> = (1..=4)
+            .map(|index| Wallet::from_seed([index; 32]))
+            .collect();
+        let block = Block::new(9, "parent".to_string(), 1, keys[0].address(), Vec::new());
+        let valid_value = RoundChangeValidValue {
+            block: block.clone(),
+            valid_round: 2,
+            prevotes: keys
+                .iter()
+                .take(3)
+                .map(|key| ConsensusMessage::prevote(9, 2, key, &block.hash))
+                .collect(),
+        };
+        let message = SignedRoundChange::with_valid_value(
+            21_004,
+            "genesis",
+            9,
+            3,
+            &keys[0],
+            Some(valid_value),
+        );
+        message.verify().unwrap();
+        assert_eq!(message.valid_value.unwrap().prevotes.len(), 3);
     }
 }

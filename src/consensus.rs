@@ -697,6 +697,60 @@ impl BftConsensus {
         votes
     }
 
+    /// round-change에 포함된 서명된 2/3 prevote 증명을 채택합니다. 잠금 자체를
+    /// 임의로 해제하지 않고, 이후 제안자가 같은 valid value를 재제안할 수 있게 합니다.
+    pub fn adopt_valid_value(
+        &mut self,
+        block_hash: &str,
+        valid_round: u32,
+        prevotes: &[ConsensusMessage],
+    ) -> Result<(), String> {
+        if prevotes.len() > self.validators.len() {
+            return Err("round-change prevote 수가 검증자 수를 넘었습니다.".into());
+        }
+        let mut voters = HashSet::new();
+        let mut power = 0_u64;
+        for vote in prevotes {
+            if vote.height != self.height
+                || vote.round != valid_round
+                || vote.vote_type != VoteType::Prevote
+                || vote.block_hash != block_hash
+            {
+                return Err("round-change valid value의 prevote 증명이 일치하지 않습니다.".into());
+            }
+            vote.verify()?;
+            let voting_power = self
+                .validators
+                .get(&vote.validator_id)
+                .ok_or("등록되지 않은 검증자의 round-change prevote입니다.")?;
+            if !voters.insert(vote.validator_id.as_str()) {
+                return Err("round-change prevote에 중복 검증자가 있습니다.".into());
+            }
+            power = power
+                .checked_add(*voting_power)
+                .ok_or("round-change prevote 투표권 합계가 범위를 넘었습니다.")?;
+        }
+        if power.saturating_mul(3) <= self.total_power.saturating_mul(2) {
+            return Err("round-change valid value에 2/3 초과 prevote가 없습니다.".into());
+        }
+        if self.valid_round.is_none_or(|known| valid_round > known) {
+            self.valid_value = Some(block_hash.to_string());
+            self.valid_round = Some(valid_round);
+            for vote in prevotes {
+                let key = (
+                    vote.height,
+                    vote.round,
+                    vote.vote_type,
+                    vote.validator_id.clone(),
+                );
+                self.vote_history
+                    .insert(key.clone(), vote.block_hash.clone());
+                self.vote_messages.insert(key, vote.clone());
+            }
+        }
+        Ok(())
+    }
+
     pub fn take_evidence(&mut self) -> Vec<DoubleVoteEvidence> {
         std::mem::take(&mut self.evidence)
     }
