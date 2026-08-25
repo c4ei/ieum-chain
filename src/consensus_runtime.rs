@@ -4,7 +4,7 @@ use crate::consensus::{
     BftConsensus, ConsensusMessage, ConsensusPhase, DoubleVoteEvidence, FinalityCertificate,
     SignedProposal, Validator, VoteType,
 };
-use crate::consensus_era::SignedRoundChange;
+use crate::consensus_era::{RoundChangeValidValue, SignedRoundChange};
 use crate::model::Block;
 use crate::scheduled_event::{EventSchedule, MAX_CLOCK_DRIFT_SECONDS};
 use crate::signer::ValidatorSigner;
@@ -341,6 +341,30 @@ impl ConsensusRuntime {
         if vote.round > current_round.saturating_add(MAX_FUTURE_ROUND_DISTANCE) {
             return Err("round-change 메시지가 허용된 미래 범위를 넘었습니다.".into());
         }
+        if let Some(valid) = &vote.valid_value {
+            if valid.valid_round > vote.round {
+                return Err("round-change valid_round가 timeout 라운드보다 미래입니다.".into());
+            }
+            let previous = self
+                .chain
+                .blocks
+                .last()
+                .ok_or("제네시스 블록이 없습니다.")?;
+            if valid.block.height != vote.height || valid.block.previous_hash != previous.hash {
+                return Err("round-change valid value가 현재 체인의 다음 블록이 아닙니다.".into());
+            }
+            self.validate_scheduled_block(&valid.block)?;
+            self.consensus.adopt_valid_value(
+                &valid.block.hash,
+                valid.valid_round,
+                &valid.prevotes,
+            )?;
+            if self.consensus.valid_value() == Some((valid.block.hash.as_str(), valid.valid_round))
+            {
+                self.valid_block = Some(valid.block.clone());
+                self.valid_round_prevotes = valid.prevotes.clone();
+            }
+        }
         let key = (vote.height, vote.round);
         let votes = self.round_change_votes.entry(key).or_default();
         if !votes
@@ -452,6 +476,17 @@ impl ConsensusRuntime {
         }
         let height = self.consensus.height();
         let round = self.consensus.round();
+        let valid_value = match (self.valid_block.as_ref(), self.consensus.valid_value()) {
+            (Some(block), Some((hash, valid_round))) if block.hash == hash => {
+                let prevotes = self.consensus.prevote_certificate(hash, valid_round);
+                (!prevotes.is_empty()).then(|| RoundChangeValidValue {
+                    block: block.clone(),
+                    valid_round,
+                    prevotes,
+                })
+            }
+            _ => None,
+        };
         let validator_id = self.validator.address();
         let signature = self
             .validator
@@ -461,13 +496,15 @@ impl ConsensusRuntime {
                 height,
                 round,
                 &validator_id,
+                valid_value.as_ref(),
             ))?;
-        let round_change = SignedRoundChange::from_signature(
+        let round_change = SignedRoundChange::from_signature_with_valid_value(
             self.chain.chain_id,
             self.chain.genesis_commitment.clone(),
             height,
             round,
             validator_id,
+            valid_value,
             signature,
         )?;
         self.receive_round_change(round_change.clone())?;

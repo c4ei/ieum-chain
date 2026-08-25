@@ -1,5 +1,11 @@
 # 변경 기록
 
+## 1.0.4.1 - 2026-08-25
+
+- round-change에 검증 가능한 valid block과 2/3 서명 prevote 인증서를 전달해 잠금 교착 자동 회복
+- 구버전 valid-value 없는 round-change 서명 호환 유지
+- 변조된 valid value 및 불충분·중복 prevote 인증서 거부
+
 ## 1.0.3.1 - 2026-08-24
 
 - 작은 높이 차이는 연속 확정 블록, 큰 차이·인증서 공백은 2/3 인증 snapshot으로 자동 복구
