@@ -15,6 +15,9 @@ pub struct DelegationPosition {
     pub validator: Address,
     #[serde(with = "crate::model::decimal_u128")]
     pub amount: u128,
+    /// v1.0.5.1 이전 위임은 0으로 읽혀 이미 성숙한 담보로 취급합니다.
+    #[serde(default)]
+    pub delegated_at: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -58,6 +61,16 @@ impl StakingState {
         validator: &str,
         amount: u128,
     ) -> Result<(), String> {
+        self.delegate_at(delegator, validator, amount, 0)
+    }
+
+    pub fn delegate_at(
+        &mut self,
+        delegator: &str,
+        validator: &str,
+        amount: u128,
+        delegated_at: u64,
+    ) -> Result<(), String> {
         validate_validator(validator)?;
         if amount < MINIMUM_DELEGATION {
             return Err("최소 위임 수량은 1 IEUM입니다.".into());
@@ -74,15 +87,32 @@ impl StakingState {
                 .amount
                 .checked_add(amount)
                 .ok_or("위임액이 u128 범위를 넘습니다.")?;
+            position.delegated_at = position.delegated_at.max(delegated_at);
         } else {
             self.delegations.push(DelegationPosition {
                 delegator: delegator.into(),
                 validator: validator.into(),
                 amount,
+                delegated_at,
             });
         }
         self.sort();
         Ok(())
+    }
+
+    pub fn mature_delegated_by(
+        &self,
+        delegator: &str,
+        timestamp: u64,
+        maturity_seconds: u64,
+    ) -> u128 {
+        self.delegations
+            .iter()
+            .filter(|position| {
+                position.delegator == delegator
+                    && position.delegated_at.saturating_add(maturity_seconds) <= timestamp
+            })
+            .fold(0u128, |sum, position| sum.saturating_add(position.amount))
     }
 
     pub fn undelegate(

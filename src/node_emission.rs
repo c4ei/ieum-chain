@@ -4,7 +4,10 @@
 //! 체인 버전을 올리고 같은 활성화 높이에서 4개 검증자를 함께 업그레이드해야 합니다.
 
 use crate::traffic_rewards::{EligibleNode, LotteryPayment};
+use crate::{EventPayment, Validator};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 pub const IEUM_DECIMALS: u32 = 18;
 pub const IEUM: u128 = 10u128.pow(IEUM_DECIMALS);
@@ -33,6 +36,171 @@ pub const MAIN_NODE_WEIGHT_BPS: u64 = 15_000;
 /// 운영 메인 4노드의 영구 PeerId를 입력합니다. 빈 값은 메인노드로 인정하지 않습니다.
 /// PeerId가 확정되면 네 문자열만 교체하고 체인 버전을 올려 함께 배포하세요.
 pub const MAIN_NODE_PEER_IDS: [&str; 4] = ["", "", "", ""];
+
+/// 외부 공개 노드 하나가 보상 자격을 얻기 위해 보상 주소로 잠가야 하는 위임액입니다.
+pub const SERVICE_BOND: u128 = 100 * IEUM;
+pub const SERVICE_BOND_MATURITY_SECONDS: u64 = 7 * REWARD_EPOCH_SECONDS;
+pub const SERVICE_MINIMUM_UPTIME_BPS: u16 = 8_000;
+pub const SERVICE_MINIMUM_VALIDATORS: usize = 3;
+pub const SERVICE_MAX_REWARDED_PER_NETWORK_GROUP: usize = 2;
+pub const SERVICE_DAILY_POOL_CAP: u128 = 1_000 * IEUM;
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NodeServiceAttestation {
+    pub peer_id: String,
+    pub reward_address: String,
+    pub epoch: u64,
+    pub observed_at: u64,
+    pub uptime_bps: u16,
+    /// IPv4 /24 또는 IPv6 /48. 원문 IP를 합의·블록에 남기지 않습니다.
+    pub network_group: String,
+    pub validator_id: String,
+    pub signature_hex: String,
+}
+
+impl NodeServiceAttestation {
+    pub fn bytes_to_sign(&self) -> Vec<u8> {
+        format!(
+            "ieum-node-service-v1:{}:{}:{}:{}:{}:{}:{}",
+            self.peer_id,
+            self.reward_address,
+            self.epoch,
+            self.observed_at,
+            self.uptime_bps,
+            self.network_group,
+            self.validator_id
+        )
+        .into_bytes()
+    }
+
+    pub fn verify(&self) -> Result<(), String> {
+        if self.peer_id.is_empty()
+            || self.reward_address.len() != 42
+            || !self.reward_address.starts_with("0x")
+            || !self.reward_address[2..]
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+            || self.epoch != self.observed_at / REWARD_EPOCH_SECONDS
+            || self.uptime_bps > 10_000
+            || self.network_group.is_empty()
+            || self.network_group.len() > 96
+        {
+            return Err("노드 서비스 증명 필드가 올바르지 않습니다.".into());
+        }
+        crate::wallet::verify_signature(
+            &self.validator_id,
+            &self.bytes_to_sign(),
+            &self.signature_hex,
+        )
+    }
+}
+
+pub fn service_event_id(epoch: u64) -> String {
+    format!("ieum-node-service-reward-v1-{epoch}")
+}
+
+/// 세 검증자의 독립 관측, 100 IEUM 성숙 담보, 주소·대역 중복 상한을 모두 적용합니다.
+pub fn calculate_service_payments(
+    timestamp: u64,
+    attestations: &[NodeServiceAttestation],
+    validators: &[Validator],
+    validator_peer_ids: &HashSet<String>,
+    staking: &crate::staking::StakingState,
+    foundation_balance: u128,
+) -> Result<Vec<EventPayment>, String> {
+    let epoch = timestamp / REWARD_EPOCH_SECONDS;
+    let active: HashSet<_> = validators
+        .iter()
+        .map(|validator| validator.id.as_str())
+        .collect();
+    let mut groups = BTreeMap::<(String, String), Vec<&NodeServiceAttestation>>::new();
+    for attestation in attestations {
+        attestation.verify()?;
+        if attestation.epoch != epoch
+            || !active.contains(attestation.validator_id.as_str())
+            || validator_peer_ids.contains(&attestation.peer_id)
+            || attestation.uptime_bps < SERVICE_MINIMUM_UPTIME_BPS
+        {
+            continue;
+        }
+        groups
+            .entry((
+                attestation.peer_id.clone(),
+                attestation.reward_address.clone(),
+            ))
+            .or_default()
+            .push(attestation);
+    }
+
+    let mut eligible = Vec::<(String, String, String)>::new();
+    let mut used_addresses = HashSet::new();
+    for ((peer_id, reward_address), proofs) in groups {
+        let unique_validators: HashSet<_> = proofs
+            .iter()
+            .map(|proof| proof.validator_id.as_str())
+            .collect();
+        if unique_validators.len() < SERVICE_MINIMUM_VALIDATORS
+            || staking.mature_delegated_by(
+                &reward_address,
+                timestamp,
+                SERVICE_BOND_MATURITY_SECONDS,
+            ) < SERVICE_BOND
+            || !used_addresses.insert(reward_address.clone())
+        {
+            continue;
+        }
+        let mut network_counts = HashMap::<&str, usize>::new();
+        for proof in &proofs {
+            *network_counts.entry(&proof.network_group).or_default() += 1;
+        }
+        let Some((network_group, count)) = network_counts
+            .into_iter()
+            .max_by(|left, right| left.1.cmp(&right.1).then_with(|| right.0.cmp(left.0)))
+        else {
+            continue;
+        };
+        if count < SERVICE_MINIMUM_VALIDATORS {
+            continue;
+        }
+        eligible.push((peer_id, reward_address, network_group.to_string()));
+    }
+    eligible.sort();
+
+    let mut per_network = HashMap::<String, usize>::new();
+    eligible.retain(|(_, _, network_group)| {
+        let count = per_network.entry(network_group.clone()).or_default();
+        if *count >= SERVICE_MAX_REWARDED_PER_NETWORK_GROUP {
+            return false;
+        }
+        *count += 1;
+        true
+    });
+    if eligible.is_empty() {
+        return Ok(Vec::new());
+    }
+    let pool = daily_budget(timestamp)
+        .min(SERVICE_DAILY_POOL_CAP)
+        .min(foundation_balance);
+    if pool == 0 {
+        return Ok(Vec::new());
+    }
+    let eligible_count = eligible.len();
+    let each = pool / eligible_count as u128;
+    let mut assigned = 0u128;
+    Ok(eligible
+        .into_iter()
+        .enumerate()
+        .map(|(index, (_, address, _))| {
+            let amount = if index + 1 == eligible_count {
+                pool - assigned
+            } else {
+                each
+            };
+            assigned += amount;
+            EventPayment { address, amount }
+        })
+        .collect())
+}
 
 pub fn is_reward_active(height: u64, timestamp: u64) -> bool {
     height >= REWARD_ACTIVATION_HEIGHT
@@ -141,6 +309,7 @@ fn reward_year_count() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{Wallet, staking::StakingState};
 
     fn node(peer: &str, points: u64) -> EligibleNode {
         EligibleNode {
@@ -149,6 +318,64 @@ mod tests {
             points,
             distinct_verifiers: 3,
         }
+    }
+
+    fn service_proof(
+        wallet: &Wallet,
+        peer_id: &str,
+        reward_address: &str,
+        timestamp: u64,
+        network_group: &str,
+    ) -> NodeServiceAttestation {
+        let mut proof = NodeServiceAttestation {
+            peer_id: peer_id.into(),
+            reward_address: reward_address.into(),
+            epoch: timestamp / REWARD_EPOCH_SECONDS,
+            observed_at: timestamp,
+            uptime_bps: SERVICE_MINIMUM_UPTIME_BPS,
+            network_group: network_group.into(),
+            validator_id: wallet.address(),
+            signature_hex: String::new(),
+        };
+        proof.signature_hex = wallet.sign_bytes(&proof.bytes_to_sign());
+        proof
+    }
+
+    fn service_fixture(
+        bond: u128,
+        delegated_at: u64,
+    ) -> (
+        u64,
+        Vec<Validator>,
+        Vec<NodeServiceAttestation>,
+        StakingState,
+    ) {
+        let timestamp = REWARD_ACTIVATION_UNIX + 20 * REWARD_EPOCH_SECONDS;
+        let wallets = (1..=4)
+            .map(|seed| Wallet::from_seed([seed; 32]))
+            .collect::<Vec<_>>();
+        let validators = wallets
+            .iter()
+            .map(|wallet| Validator::new(wallet.address(), 100))
+            .collect::<Vec<_>>();
+        let reward_address = "0x1111111111111111111111111111111111111111";
+        let proofs = wallets[..3]
+            .iter()
+            .map(|wallet| {
+                service_proof(
+                    wallet,
+                    "public-peer-1",
+                    reward_address,
+                    timestamp,
+                    "ipv4:203.0.113.0/24",
+                )
+            })
+            .collect();
+        let mut staking = StakingState::default();
+        staking
+            .delegate_at(reward_address, &wallets[0].address(), bond, delegated_at)
+            .unwrap();
+        (timestamp, validators, proofs, staking)
     }
 
     #[test]
@@ -187,6 +414,146 @@ mod tests {
         assert_eq!(
             payments.iter().map(|item| item.amount).sum::<u128>(),
             remaining
+        );
+    }
+
+    #[test]
+    fn public_service_requires_three_validators_and_mature_100_ieum_bond() {
+        let timestamp = REWARD_ACTIVATION_UNIX + 20 * REWARD_EPOCH_SECONDS;
+        let (timestamp, validators, proofs, staking) =
+            service_fixture(SERVICE_BOND, timestamp - SERVICE_BOND_MATURITY_SECONDS);
+        let payments = calculate_service_payments(
+            timestamp,
+            &proofs,
+            &validators,
+            &HashSet::new(),
+            &staking,
+            2_000 * IEUM,
+        )
+        .unwrap();
+        assert_eq!(payments.len(), 1);
+        assert_eq!(payments[0].amount, SERVICE_DAILY_POOL_CAP);
+
+        assert!(
+            calculate_service_payments(
+                timestamp,
+                &proofs[..2],
+                &validators,
+                &HashSet::new(),
+                &staking,
+                2_000 * IEUM,
+            )
+            .unwrap()
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn insufficient_or_immature_bond_is_rejected() {
+        let timestamp = REWARD_ACTIVATION_UNIX + 20 * REWARD_EPOCH_SECONDS;
+        for (bond, delegated_at) in [
+            (SERVICE_BOND - 1, timestamp - SERVICE_BOND_MATURITY_SECONDS),
+            (SERVICE_BOND, timestamp - SERVICE_BOND_MATURITY_SECONDS + 1),
+        ] {
+            let (timestamp, validators, proofs, staking) = service_fixture(bond, delegated_at);
+            assert!(
+                calculate_service_payments(
+                    timestamp,
+                    &proofs,
+                    &validators,
+                    &HashSet::new(),
+                    &staking,
+                    2_000 * IEUM,
+                )
+                .unwrap()
+                .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn validator_peer_is_excluded_from_public_reward() {
+        let timestamp = REWARD_ACTIVATION_UNIX + 20 * REWARD_EPOCH_SECONDS;
+        let (timestamp, validators, proofs, staking) =
+            service_fixture(SERVICE_BOND, timestamp - SERVICE_BOND_MATURITY_SECONDS);
+        assert!(
+            calculate_service_payments(
+                timestamp,
+                &proofs,
+                &validators,
+                &HashSet::from(["public-peer-1".into()]),
+                &staking,
+                2_000 * IEUM,
+            )
+            .unwrap()
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn tampered_attestation_is_rejected() {
+        let timestamp = REWARD_ACTIVATION_UNIX + 20 * REWARD_EPOCH_SECONDS;
+        let (timestamp, validators, mut proofs, staking) =
+            service_fixture(SERVICE_BOND, timestamp - SERVICE_BOND_MATURITY_SECONDS);
+        proofs[0].uptime_bps += 1;
+        assert!(
+            calculate_service_payments(
+                timestamp,
+                &proofs,
+                &validators,
+                &HashSet::new(),
+                &staking,
+                2_000 * IEUM,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn third_node_in_same_network_group_is_not_rewarded() {
+        let timestamp = REWARD_ACTIVATION_UNIX + 20 * REWARD_EPOCH_SECONDS;
+        let wallets = (1..=4)
+            .map(|seed| Wallet::from_seed([seed; 32]))
+            .collect::<Vec<_>>();
+        let validators = wallets
+            .iter()
+            .map(|wallet| Validator::new(wallet.address(), 100))
+            .collect::<Vec<_>>();
+        let mut staking = StakingState::default();
+        let mut proofs = Vec::new();
+        for index in 1..=3 {
+            let reward_address = format!("0x{index:040x}");
+            staking
+                .delegate_at(
+                    &reward_address,
+                    &wallets[0].address(),
+                    SERVICE_BOND,
+                    timestamp - SERVICE_BOND_MATURITY_SECONDS,
+                )
+                .unwrap();
+            proofs.extend(wallets[..3].iter().map(|wallet| {
+                service_proof(
+                    wallet,
+                    &format!("public-peer-{index}"),
+                    &reward_address,
+                    timestamp,
+                    "ipv4:203.0.113.0/24",
+                )
+            }));
+        }
+        let payments = calculate_service_payments(
+            timestamp,
+            &proofs,
+            &validators,
+            &HashSet::new(),
+            &staking,
+            2_000 * IEUM,
+        )
+        .unwrap();
+        assert_eq!(payments.len(), SERVICE_MAX_REWARDED_PER_NETWORK_GROUP);
+        assert_eq!(
+            payments.iter().map(|payment| payment.amount).sum::<u128>(),
+            SERVICE_DAILY_POOL_CAP
         );
     }
 }

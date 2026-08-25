@@ -3,6 +3,7 @@ use crate::communication::{CommunicationAck, CommunicationEnvelope};
 use crate::consensus::{ConsensusMessage, DoubleVoteEvidence, FinalityCertificate, SignedProposal};
 use crate::consensus_era::SignedRoundChange;
 use crate::model::{Block, Transaction};
+use crate::node_emission::NodeServiceAttestation;
 use crate::peer_guard::{PeerDecision, PeerGuard};
 use crate::snapshot_sync::{SnapshotAttestation, SyncTip};
 use futures::StreamExt;
@@ -98,6 +99,9 @@ pub struct NodeRewardRegistration {
     pub registration_signer: String,
     pub node_public_key_hex: String,
     pub node_signature_hex: String,
+    /// 보상용 secp256k1 지갑이 reward_address를 실제 소유함을 증명합니다.
+    #[serde(default)]
+    pub reward_signature_hex: String,
 }
 
 impl NodeRewardRegistration {
@@ -130,6 +134,17 @@ impl NodeRewardRegistration {
             return Err("PeerId 개인키 소유권 서명이 올바르지 않습니다.".into());
         }
         Ok(())
+    }
+
+    pub fn verify_reward_address(&self) -> Result<(), String> {
+        if self.reward_signature_hex.is_empty() {
+            return Err("보상 주소 소유권 서명이 없습니다.".into());
+        }
+        crate::account::verify_account_signature(
+            &self.reward_address,
+            &Self::bytes_to_sign(&self.reward_address, &self.peer_id),
+            &self.reward_signature_hex,
+        )
     }
 }
 
@@ -197,6 +212,7 @@ pub enum WireMessage {
     SnapshotAttestation(SnapshotAttestation),
     // 새 variant는 bincode enum index 호환성을 위해 항상 기존 variant 뒤에 추가합니다.
     RoundChange(SignedRoundChange),
+    NodeServiceAttestation(NodeServiceAttestation),
 }
 
 /// GossipSub 토픽 상태와 무관하게 연결된 피어에게 직접 보내는 원장 동기화 요청입니다.
@@ -230,6 +246,7 @@ pub enum NetworkCommand {
     PublishEvidence(DoubleVoteEvidence),
     PublishValidatorRegistration(ValidatorRegistration),
     PublishNodeRewardRegistration(NodeRewardRegistration),
+    PublishNodeServiceAttestation(NodeServiceAttestation),
     PublishUpdateAvailable {
         version: String,
     },
@@ -313,6 +330,10 @@ pub enum NetworkEvent {
     NodeRewardRegistrationReceived {
         source: PeerId,
         registration: NodeRewardRegistration,
+    },
+    NodeServiceAttestationReceived {
+        source: PeerId,
+        attestation: NodeServiceAttestation,
     },
     UpdateAvailableReceived {
         source: PeerId,
@@ -442,6 +463,14 @@ impl fmt::Display for NetworkEvent {
                 formatter,
                 "[노드 보상 등록 수신] PeerId: {source}, 보상 주소: {}",
                 registration.reward_address
+            ),
+            Self::NodeServiceAttestationReceived {
+                source,
+                attestation,
+            } => write!(
+                formatter,
+                "[노드 활동 증명 수신] PeerId: {source}, 대상: {}, 검증자: {}, 가동률: {}bp",
+                attestation.peer_id, attestation.validator_id, attestation.uptime_bps
             ),
             Self::UpdateAvailableReceived { source, version } => write!(
                 formatter,
@@ -759,6 +788,13 @@ impl P2pNode {
                                     &mut swarm,
                                     CONSENSUS_TOPIC,
                                     &WireMessage::NodeRewardRegistration(registration),
+                                );
+                            }
+                            Some(NetworkCommand::PublishNodeServiceAttestation(attestation)) => {
+                                publish(
+                                    &mut swarm,
+                                    CONSENSUS_TOPIC,
+                                    &WireMessage::NodeServiceAttestation(attestation),
                                 );
                             }
                             Some(NetworkCommand::PublishUpdateAvailable { version }) => {
@@ -1273,6 +1309,12 @@ async fn handle_swarm_event(
                         registration,
                     }
                 }
+                WireMessage::NodeServiceAttestation(attestation) => {
+                    NetworkEvent::NodeServiceAttestationReceived {
+                        source: propagation_source,
+                        attestation,
+                    }
+                }
                 WireMessage::UpdateAvailable { version } => NetworkEvent::UpdateAvailableReceived {
                     source: propagation_source,
                     version,
@@ -1637,9 +1679,27 @@ fn format_duration(duration: Duration) -> String {
 mod connection_log_tests {
     use super::*;
     use crate::{
-        Block, CommunicationKind, ScheduledEvent, ScheduledEventAction, SignedProposal,
-        SignedRoundChange, Wallet,
+        AccountWallet, Block, CommunicationKind, ScheduledEvent, ScheduledEventAction,
+        SignedProposal, SignedRoundChange, Wallet,
     };
+
+    #[test]
+    fn node_reward_registration_requires_reward_wallet_ownership() {
+        let reward_wallet = AccountWallet::from_private_key([7; 32]).unwrap();
+        let bytes = NodeRewardRegistration::bytes_to_sign(&reward_wallet.address(), "peer-1");
+        let mut registration = NodeRewardRegistration {
+            reward_address: reward_wallet.address(),
+            peer_id: "peer-1".into(),
+            signature_hex: String::new(),
+            registration_signer: String::new(),
+            node_public_key_hex: String::new(),
+            node_signature_hex: String::new(),
+            reward_signature_hex: reward_wallet.sign_bytes(&bytes),
+        };
+        registration.verify_reward_address().unwrap();
+        registration.reward_address = "0x1111111111111111111111111111111111111111".into();
+        assert!(registration.verify_reward_address().is_err());
+    }
 
     #[test]
     fn signed_round_change_round_trips_on_consensus_wire() {

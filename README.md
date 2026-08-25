@@ -1,6 +1,15 @@
-# IEUM Chain v1.0.2.1 메인넷 실행 안내
+# 일반 공개 노드 보상: 100 IEUM 담보 필수
 
-최신 변경과 배포 절차는 [`docs/VERSION_1.0.2.1_DIRECT_SYNC_RECOVERY.md`](docs/VERSION_1.0.2.1_DIRECT_SYNC_RECOVERY.md)를 참고하세요.
+`--server`로 운영하는 **일반 공개 노드**는 보상 지갑 주소가 활성 검증자에게 합계
+**100 IEUM 이상을 위임하고 7일이 지난 뒤**, 하루 80% 이상 가동을 3개 이상의 독립
+검증자가 서명한 경우에만 해당 일의 노드 보상(운영상 이자)을 받을 수 있습니다.
+금액은 고정 이율이 아니라 당일 적격 노드 수와 재단 보상 풀에 따라 달라집니다.
+메인 검증 서버 주소·PeerId는 이 일반 공개 노드 보상에서 제외됩니다.
+
+# IEUM Chain v1.0.5.1 메인넷 실행 안내
+
+최신 변경과 배포 절차는 [`docs/VERSION_1.0.5.1_RAW_IDLE_E2E.md`](docs/VERSION_1.0.5.1_RAW_IDLE_E2E.md)를 참고하세요.
+
 
 v0.23.12는 Wallet의 중복 nonce 전송을 막기 위해 pending nonce 조회를 보완합니다.
 자세한 내용은 [`docs/VERSION_0.23.12_PENDING_NONCE.md`](docs/VERSION_0.23.12_PENDING_NONCE.md)를

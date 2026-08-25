@@ -403,6 +403,22 @@ mod tests {
     }
 
     #[test]
+    fn four_process_raw_fixture_matches_ci_faucet_and_network() {
+        let raw = "0xf8698001825208943252b7b65e50b54508974db8d634134b0bd6be9088016345785d8a00008082a43da075c45042269a144a256fd866208f5916e81eb3d8bdd4adec84559f51ad5b0166a03cd6037082115234b573a7b92e775edf6c21d327bd94bafab7cb5d2a9e6a4d1a";
+        let transaction = decode_legacy(raw, 21_005).unwrap();
+        let faucet = crate::AccountWallet::from_private_key([42; 32])
+            .unwrap()
+            .address();
+
+        assert_eq!(transaction.from, faucet);
+        assert_eq!(transaction.to, "0x3252b7b65e50b54508974db8d634134b0bd6be90");
+        assert_eq!(transaction.amount, 100_000_000_000_000_000);
+        assert_eq!(transaction.fee, 21_000);
+        assert_eq!(transaction.nonce, 0);
+        verify_embedded(&transaction, 21_005).unwrap();
+    }
+
+    #[test]
     fn native_transaction_fee_terms_preserve_exact_total_fee() {
         let wallet = crate::Wallet::from_seed([9; 32]);
         let transaction = wallet.sign_transfer(
