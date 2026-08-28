@@ -15,11 +15,14 @@ use libp2p::{
     multiaddr::Protocol,
     noise, ping, relay, request_response,
     swarm::{ConnectionId, NetworkBehaviour, SwarmEvent},
+    upnp,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
+use std::fs;
 use std::net::{IpAddr, Ipv4Addr};
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tokio::net::lookup_host;
 use tokio::sync::mpsc;
@@ -58,7 +61,7 @@ impl LocalNetworkView {
     fn accepts_learned_address(&self, address: &Multiaddr, same_lan_peer: bool) -> bool {
         address.iter().all(|protocol| match protocol {
             Protocol::Ip4(ip) => is_public_ipv4(ip) || (same_lan_peer && is_lan_ipv4(ip)),
-            Protocol::Ip6(ip) => !ip.is_loopback() && !ip.is_unspecified(),
+            Protocol::Ip6(ip) => is_public_ipv6(ip) || (same_lan_peer && is_lan_ipv6(ip)),
             _ => true,
         })
     }
@@ -161,6 +164,8 @@ pub struct NetworkConfig {
     /// CI 테스트에서는 호스트의 LAN/Docker 인터페이스를 사용하지 않습니다.
     pub loopback_only: bool,
     pub bootstrap_peers: Vec<Multiaddr>,
+    /// 메인 bootstrap이 중단되어도 재시작 후 기존 공개/릴레이 피어를 복구하는 캐시입니다.
+    pub peer_cache_path: Option<PathBuf>,
     /// NAT 포트포워딩 뒤에서 다른 피어에게 알릴 공개 주소입니다.
     pub external_addresses: Vec<Multiaddr>,
     pub identity_key: Option<Keypair>,
@@ -175,6 +180,7 @@ impl Default for NetworkConfig {
             listen_port: 7001,
             loopback_only: false,
             bootstrap_peers: Vec::new(),
+            peer_cache_path: None,
             external_addresses: Vec::new(),
             identity_key: None,
             max_message_bytes: 2 * 1024 * 1024,
@@ -182,6 +188,75 @@ impl Default for NetworkConfig {
             ban_duration: Duration::from_secs(10 * 60),
         }
     }
+}
+
+const MAX_PERSISTED_PEERS: usize = 256;
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct PersistentPeerCache {
+    #[serde(default)]
+    addresses: Vec<String>,
+}
+
+impl PersistentPeerCache {
+    fn load(path: Option<&Path>) -> Self {
+        let Some(path) = path else {
+            return Self::default();
+        };
+        let Ok(contents) = fs::read_to_string(path) else {
+            return Self::default();
+        };
+        match serde_json::from_str::<Self>(&contents) {
+            Ok(mut cache) => {
+                cache
+                    .addresses
+                    .retain(|value| value.parse::<Multiaddr>().is_ok());
+                cache.addresses.sort();
+                cache.addresses.dedup();
+                cache.addresses.truncate(MAX_PERSISTED_PEERS);
+                cache
+            }
+            Err(error) => {
+                crate::log_error!("[P2P 피어 캐시 무시] {}: {error}", path.display());
+                Self::default()
+            }
+        }
+    }
+
+    fn parsed_addresses(&self) -> Vec<Multiaddr> {
+        self.addresses
+            .iter()
+            .filter_map(|value| value.parse().ok())
+            .collect()
+    }
+
+    fn remember(&mut self, path: Option<&Path>, address: Multiaddr) {
+        let value = address.to_string();
+        if self.addresses.contains(&value) {
+            return;
+        }
+        self.addresses.push(value);
+        self.addresses.sort();
+        if self.addresses.len() > MAX_PERSISTED_PEERS {
+            self.addresses.remove(0);
+        }
+        if let Some(path) = path
+            && let Err(error) = write_peer_cache(path, self)
+        {
+            crate::logger::write_repeated_error(&format!(
+                "[P2P 피어 캐시 저장 실패] {}: {error}",
+                path.display()
+            ));
+        }
+    }
+}
+
+fn write_peer_cache(path: &Path, cache: &PersistentPeerCache) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    let contents = serde_json::to_vec_pretty(cache).map_err(|error| error.to_string())?;
+    fs::write(path, contents).map_err(|error| error.to_string())
 }
 
 /// Gossipsub으로 전파하는 메시지의 허용 종류입니다.
@@ -518,6 +593,7 @@ struct IeumBehaviour {
     dcutr: dcutr::Behaviour,
     autonat: autonat::Behaviour,
     ping: ping::Behaviour,
+    upnp: upnp::tokio::Behaviour,
     gossipsub: gossipsub::Behaviour,
     mdns: mdns::tokio::Behaviour,
     kademlia: kad::Behaviour<kad::store::MemoryStore>,
@@ -533,6 +609,7 @@ enum IeumBehaviourEvent {
     Dcutr(Box<dcutr::Event>),
     Autonat(Box<autonat::Event>),
     Ping(ping::Event),
+    Upnp(upnp::Event),
     Gossipsub(gossipsub::Event),
     Mdns(mdns::Event),
     Kademlia(kad::Event),
@@ -564,6 +641,11 @@ impl From<autonat::Event> for IeumBehaviourEvent {
 impl From<ping::Event> for IeumBehaviourEvent {
     fn from(value: ping::Event) -> Self {
         Self::Ping(value)
+    }
+}
+impl From<upnp::Event> for IeumBehaviourEvent {
+    fn from(value: upnp::Event) -> Self {
+        Self::Upnp(value)
     }
 }
 impl From<gossipsub::Event> for IeumBehaviourEvent {
@@ -621,6 +703,8 @@ impl P2pNode {
         let max_message_bytes = config.max_message_bytes;
         let idle_timeout = config.idle_timeout;
         let loopback_only = config.loopback_only;
+        let peer_cache_path = config.peer_cache_path.clone();
+        let mut peer_cache = PersistentPeerCache::load(peer_cache_path.as_deref());
 
         let identity_key = config
             .identity_key
@@ -688,6 +772,7 @@ impl P2pNode {
                         ping: ping::Behaviour::new(
                             ping::Config::new().with_interval(Duration::from_secs(20)),
                         ),
+                        upnp: upnp::tokio::Behaviour::default(),
                         gossipsub,
                         mdns,
                         kademlia,
@@ -721,7 +806,24 @@ impl P2pNode {
         // 설정에는 /dns4/도메인 주소를 유지하되 QUIC dial 직전에 IPv4로 변환합니다.
         let bootstrap_addresses = config.bootstrap_peers.clone();
         for address in config.bootstrap_peers {
-            add_bootstrap_address(&mut swarm, address, local_peer_id, loopback_only).await?;
+            if let Err(error) =
+                add_bootstrap_address(&mut swarm, address, local_peer_id, loopback_only).await
+            {
+                // 중앙 bootstrap/DNS 장애가 노드 자체의 시작을 막아서는 안 됩니다.
+                // 저장 피어, mDNS 및 DHT 경로로 계속 복구를 시도합니다.
+                crate::logger::write_repeated_error(&error);
+            }
+        }
+        let cached_addresses = peer_cache.parsed_addresses();
+        for address in &cached_addresses {
+            if let Err(error) =
+                add_bootstrap_address(&mut swarm, address.clone(), local_peer_id, loopback_only)
+                    .await
+            {
+                crate::logger::write_repeated_error(&format!(
+                    "[P2P 저장 피어 접속 실패] {address}: {error}"
+                ));
+            }
         }
         let _ = swarm.behaviour_mut().kademlia.bootstrap();
 
@@ -730,6 +832,7 @@ impl P2pNode {
         let mut guard = PeerGuard::new(config.ban_duration);
         let mut connected_at: HashMap<ConnectionId, Instant> = HashMap::new();
         let mut same_lan_peers = HashSet::new();
+        let mut relay_candidates = HashSet::new();
         let mut pending_sync_responses = HashMap::<
             PeerId,
             VecDeque<request_response::ResponseChannel<DirectSyncResponse>>,
@@ -741,11 +844,21 @@ impl P2pNode {
             loop {
                 tokio::select! {
                     _ = bootstrap_redial_tick.tick() => {
+                        // Bitcoin의 addrman, Ethereum의 discovery table과 같은 역할입니다.
+                        // 알려진 DHT를 주기적으로 순회해 중앙 bootstrap 없이도 새 피어를
+                        // 계속 발견하고, 라우팅 테이블이 끊겼을 때 재구성합니다.
+                        let _ = swarm.behaviour_mut().kademlia.bootstrap();
+                        swarm.behaviour_mut().kademlia.get_closest_peers(PeerId::random());
                         if swarm.connected_peers().next().is_none() {
                             crate::log_info!(
                                 "[P2P 자동 복구] 연결된 피어가 없어 원본 bootstrap DNS 주소로 재접속합니다."
                             );
                             for address in &bootstrap_addresses {
+                                if let Err(error) = dial_address(&mut swarm, address.clone()).await {
+                                    crate::logger::write_repeated_error(&error);
+                                }
+                            }
+                            for address in peer_cache.parsed_addresses() {
                                 if let Err(error) = dial_address(&mut swarm, address.clone()).await {
                                     crate::logger::write_repeated_error(&error);
                                 }
@@ -906,14 +1019,17 @@ impl P2pNode {
                             local_network: &local_network,
                             max_message_bytes,
                             loopback_only,
+                            guard: &mut guard,
+                            connected_at: &mut connected_at,
+                            same_lan_peers: &mut same_lan_peers,
+                            relay_candidates: &mut relay_candidates,
+                            peer_cache: &mut peer_cache,
+                            peer_cache_path: peer_cache_path.as_deref(),
+                            pending_sync_responses: &mut pending_sync_responses,
                         };
                         if let Err(error) = handle_swarm_event(
                             &mut swarm,
                             event,
-                            &mut guard,
-                            &mut connected_at,
-                            &mut same_lan_peers,
-                            &mut pending_sync_responses,
                             context,
                         ).await {
                             crate::log_error!("P2P 이벤트 처리 오류: {error}");
@@ -1114,18 +1230,19 @@ struct SwarmEventContext<'a> {
     local_network: &'a LocalNetworkView,
     max_message_bytes: usize,
     loopback_only: bool,
+    guard: &'a mut PeerGuard,
+    connected_at: &'a mut HashMap<ConnectionId, Instant>,
+    same_lan_peers: &'a mut HashSet<PeerId>,
+    relay_candidates: &'a mut HashSet<PeerId>,
+    peer_cache: &'a mut PersistentPeerCache,
+    peer_cache_path: Option<&'a Path>,
+    pending_sync_responses:
+        &'a mut HashMap<PeerId, VecDeque<request_response::ResponseChannel<DirectSyncResponse>>>,
 }
 
 async fn handle_swarm_event(
     swarm: &mut libp2p::Swarm<IeumBehaviour>,
     event: SwarmEvent<IeumBehaviourEvent>,
-    guard: &mut PeerGuard,
-    connected_at: &mut HashMap<ConnectionId, Instant>,
-    same_lan_peers: &mut HashSet<PeerId>,
-    pending_sync_responses: &mut HashMap<
-        PeerId,
-        VecDeque<request_response::ResponseChannel<DirectSyncResponse>>,
-    >,
     context: SwarmEventContext<'_>,
 ) -> Result<(), String> {
     let SwarmEventContext {
@@ -1133,6 +1250,13 @@ async fn handle_swarm_event(
         local_network,
         max_message_bytes,
         loopback_only,
+        guard,
+        connected_at,
+        same_lan_peers,
+        relay_candidates,
+        peer_cache,
+        peer_cache_path,
+        pending_sync_responses,
     } = context;
 
     match event {
@@ -1169,6 +1293,9 @@ async fn handle_swarm_event(
                     event.peer
                 ));
             }
+        }
+        SwarmEvent::Behaviour(IeumBehaviourEvent::Upnp(event)) => {
+            crate::log_info!("[공유기 UPnP 포트 매핑] {event:?}");
         }
         SwarmEvent::Behaviour(IeumBehaviourEvent::Mdns(mdns::Event::Discovered(peers))) => {
             if loopback_only {
@@ -1238,7 +1365,12 @@ async fn handle_swarm_event(
                         swarm
                             .behaviour_mut()
                             .kademlia
-                            .add_address(&peer_id, resolved_address);
+                            .add_address(&peer_id, resolved_address.clone());
+                        if address_is_persistable(&resolved_address) {
+                            let mut dial_address = resolved_address;
+                            dial_address.push(Protocol::P2p(peer_id));
+                            peer_cache.remember(peer_cache_path, dial_address);
+                        }
                     }
                 }
             }
@@ -1494,6 +1626,19 @@ async fn handle_swarm_event(
                 "[P2P 토픽 연결] PeerId: {peer_id} · sync/consensus/block 전파 대상으로 등록"
             );
             let remote_address = endpoint.get_remote_address().clone();
+            if !loopback_only
+                && let Some(relay_address) = relay_reservation_address(&remote_address, peer_id)
+                && relay_candidates.insert(peer_id)
+            {
+                match swarm.listen_on(relay_address.clone()) {
+                    Ok(_) => crate::log_info!(
+                        "[분산 NAT 릴레이 예약 시도] PeerId: {peer_id} · {relay_address}"
+                    ),
+                    Err(error) => crate::logger::write_repeated_error(&format!(
+                        "[분산 NAT 릴레이 예약 실패] PeerId: {peer_id} · {error}"
+                    )),
+                }
+            }
             let unique_peers = swarm.connected_peers().count();
             let _ = event_tx
                 .send(NetworkEvent::PeerConnected {
@@ -1516,6 +1661,7 @@ async fn handle_swarm_event(
             ..
         } => {
             if num_established == 0 && !same_lan_peers.contains(&peer_id) {
+                relay_candidates.remove(&peer_id);
                 swarm
                     .behaviour_mut()
                     .gossipsub
@@ -1626,6 +1772,47 @@ fn is_public_ipv4(ip: Ipv4Addr) -> bool {
         && !(a == 198 && (b == 18 || b == 19))
         && !(a == 198 && b == 51)
         && !(a == 203 && b == 0)
+}
+
+fn is_lan_ipv6(ip: std::net::Ipv6Addr) -> bool {
+    ip.is_unique_local() || ip.is_unicast_link_local()
+}
+
+fn is_public_ipv6(ip: std::net::Ipv6Addr) -> bool {
+    !ip.is_loopback()
+        && !ip.is_unspecified()
+        && !ip.is_multicast()
+        && !is_lan_ipv6(ip)
+        && ip.segments()[..2] != [0x2001, 0x0db8]
+}
+
+fn address_is_persistable(address: &Multiaddr) -> bool {
+    address.iter().any(|protocol| match protocol {
+        Protocol::Ip4(ip) => is_public_ipv4(ip),
+        Protocol::Ip6(ip) => is_public_ipv6(ip),
+        Protocol::Dns4(_) | Protocol::Dns6(_) | Protocol::Dns(_) | Protocol::P2pCircuit => true,
+        _ => false,
+    })
+}
+
+fn relay_reservation_address(address: &Multiaddr, peer_id: PeerId) -> Option<Multiaddr> {
+    if address
+        .iter()
+        .any(|protocol| matches!(protocol, Protocol::P2pCircuit))
+        || !address_is_persistable(address)
+    {
+        return None;
+    }
+    let mut relay = address.clone();
+    if !relay
+        .iter()
+        .last()
+        .is_some_and(|protocol| matches!(protocol, Protocol::P2p(found) if found == peer_id))
+    {
+        relay.push(Protocol::P2p(peer_id));
+    }
+    relay.push(Protocol::P2pCircuit);
+    Some(relay)
 }
 
 fn validate_direct_communication(
@@ -1903,6 +2090,60 @@ mod connection_log_tests {
         assert!(local_network.accepts_learned_address(&lan, true));
         assert!(!local_network.accepts_learned_address(&other_lan, false));
         assert!(local_network.accepts_learned_address(&public, false));
+    }
+
+    #[test]
+    fn peer_cache_persists_only_reconnectable_addresses() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("ieum-known-peers-{unique}.json"));
+        let public: Multiaddr = "/ip4/122.35.243.20/udp/7001/quic-v1".parse().unwrap();
+        let private: Multiaddr = "/ip4/192.168.1.20/udp/7001/quic-v1".parse().unwrap();
+        assert!(address_is_persistable(&public));
+        assert!(!address_is_persistable(&private));
+
+        let peer = PeerId::random();
+        let mut cached_address = public;
+        cached_address.push(Protocol::P2p(peer));
+        let mut cache = PersistentPeerCache::default();
+        cache.remember(Some(&path), cached_address.clone());
+        cache.remember(Some(&path), cached_address);
+
+        let loaded = PersistentPeerCache::load(Some(&path));
+        assert_eq!(loaded.addresses.len(), 1);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn public_peer_becomes_a_decentralized_relay_candidate() {
+        let peer = PeerId::random();
+        let public: Multiaddr = "/ip4/122.35.243.20/udp/7001/quic-v1".parse().unwrap();
+        let relay = relay_reservation_address(&public, peer).unwrap();
+        assert_eq!(
+            relay.to_string(),
+            format!("/ip4/122.35.243.20/udp/7001/quic-v1/p2p/{peer}/p2p-circuit")
+        );
+
+        let private: Multiaddr = "/ip4/192.168.1.20/udp/7001/quic-v1".parse().unwrap();
+        assert!(relay_reservation_address(&private, peer).is_none());
+        assert!(relay_reservation_address(&relay, peer).is_none());
+    }
+
+    #[test]
+    fn only_global_ipv6_is_persisted_for_internet_recovery() {
+        let global: Multiaddr = "/ip6/2001:4860:4860::8888/udp/7001/quic-v1"
+            .parse()
+            .unwrap();
+        let unique_local: Multiaddr = "/ip6/fd00::1/udp/7001/quic-v1".parse().unwrap();
+        let link_local: Multiaddr = "/ip6/fe80::1/udp/7001/quic-v1".parse().unwrap();
+        let documentation: Multiaddr = "/ip6/2001:db8::1/udp/7001/quic-v1".parse().unwrap();
+
+        assert!(address_is_persistable(&global));
+        assert!(!address_is_persistable(&unique_local));
+        assert!(!address_is_persistable(&link_local));
+        assert!(!address_is_persistable(&documentation));
     }
 
     #[test]

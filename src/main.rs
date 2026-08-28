@@ -460,6 +460,10 @@ struct NodeArgs {
     /// CI·폐쇄형 개발망에서 내장 운영 bootstrap 접속을 비활성화합니다.
     #[arg(long, default_value_t = false)]
     no_default_bootstrap: bool,
+
+    /// 재시작 후 복구할 분산 P2P 피어 주소 캐시
+    #[arg(long, default_value = "data/network/known-peers.json")]
+    peer_cache: PathBuf,
 }
 
 #[derive(Debug, ClapArgs)]
@@ -501,6 +505,7 @@ fn default_node_args() -> NodeArgs {
         direct_sync_block_limit: 12,
         peer: Vec::new(),
         no_default_bootstrap: false,
+        peer_cache: PathBuf::from("data/network/known-peers.json"),
     }
 }
 
@@ -759,6 +764,7 @@ async fn main() -> Result<(), String> {
         listen_port: args.port,
         loopback_only: args.git_action_test,
         bootstrap_peers,
+        peer_cache_path: Some(args.peer_cache.clone()),
         external_addresses,
         identity_key: Some(identity_key),
         max_message_bytes: args.max_message_bytes,
