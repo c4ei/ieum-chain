@@ -1,5 +1,22 @@
 # 변경 기록
 
+## 1.0.7.1 - 2026-08-27
+
+- 가정용 공유기의 UPnP UDP 포트 매핑 자동 요청
+- DCUtR QUIC 홀펀칭 실패 시 연결된 공개 사용자 노드에 분산 Circuit Relay 예약
+- 메인 bootstrap 릴레이가 없어도 공개 사용자 피어를 NAT 우회 경로로 활용
+- 휴대폰 CGNAT·이중 NAT의 직접 연결 불가 상황과 릴레이 운영 조건 문서화
+- P2P 이벤트 상태를 컨텍스트로 묶어 Clippy `too_many_arguments` 실패 수정
+- 사설 IPv6 주소의 인터넷 피어 캐시 저장을 차단하고 공인 연결 전환 시 릴레이 예약 재시도 보장
+- 자동 업데이트 URL을 GitHub Release의 최신 서명 manifest로 변경해 저장소의 구버전 manifest 고정 문제 해결
+
+## 1.0.6.1 - 2026-08-27
+
+- 메인 bootstrap/DNS 장애가 있어도 노드 시작을 계속하도록 변경
+- 학습한 공개·IPv6·DNS·릴레이 피어 주소를 `data/network/known-peers.json`에 최대 256개 저장
+- 재시작 시 저장 피어로 우선 복구하고 60초마다 Kademlia 분산 탐색 수행
+- `--peer-cache`로 피어 캐시 경로를 노드별 지정 가능
+
 ## 1.0.5.1 - 2026-08-25
 
 - 4프로세스 BFT 시험의 첫 거래를 `eth_sendRawTransaction` EIP-155 실제 서명 경로로 전환

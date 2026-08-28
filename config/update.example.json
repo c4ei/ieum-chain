@@ -1,6 +1,6 @@
 {
   "enabled": true,
-  "manifest_url": "https://example.com/ieum-chain/update-manifest.json",
+  "manifest_url": "https://github.com/c4ei/ieum-chain/releases/latest/download/update-manifest.json",
   "release_public_key": "REPLACE_WITH_32_BYTE_ED25519_PUBLIC_KEY_HEX",
   "check_interval_secs": 21600
 }

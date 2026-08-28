@@ -1,9 +1,9 @@
-# IEUM Chain v1.0.5.1 사용자·운영자 매뉴얼
+# IEUM Chain v1.0.7.1 사용자·운영자 매뉴얼
 
 ## 네트워크
 
 - 메인넷 Chain ID: `21004`
-- 표시 버전: `1.0.5.1`
+- 표시 버전: `1.0.7.1`
 - 기본 P2P/RPC: UDP `7001`, TCP `8989`
 - 운영 Genesis: `config/genesis.json`
 
@@ -34,6 +34,30 @@ curl -fsS -H 'content-type: application/json' \
 ```
 
 네 노드의 `chainId`, genesis hash, 높이, tip hash와 state root가 일치해야 합니다. 거래가 없으면 새 블록을 만들지 않으므로 높이가 일정한 것은 정상입니다. 한 노드가 뒤처지면 1분 이내 차이는 확정 블록으로, 큰 차이 또는 인증서 공백은 2/3 인증 snapshot으로 자동 복구합니다.
+
+## 메인 서버 장애 시 자동 복구
+
+노드는 정상 운영 시 메인 bootstrap을 먼저 사용합니다. 연결 과정에서 확인한 공개·IPv6·DNS·릴레이
+피어 주소는 `data/network/known-peers.json`에 자동 저장하며, 메인 서버나 DNS가 중단되어도
+재시작할 때 저장 피어와 Kademlia 분산 검색으로 사용자망 복구를 시도합니다.
+
+- 이 파일은 노드별 `data/` 영구 볼륨에 보존합니다.
+- 4노드가 같은 호스트 경로를 공유한다면 `--peer-cache`로 서로 다른 파일을 지정합니다.
+- 파일을 수동 편집할 필요는 없습니다. 삭제해도 키·지갑·원장은 지워지지 않지만 장애 복구 후보가 사라집니다.
+- 네트워크가 살아 있어도 검증자 3/4 정족수가 사라지면 새 블록 확정은 멈춥니다.
+- 모든 생존 노드가 NAT 내부이고 공개 포트와 릴레이가 전혀 없으면 외부 재접속은 보장할 수 없습니다.
+
+## 휴대폰·가정용 공유기 연결
+
+v1.0.7.1은 다음 순서로 실제 연결을 시도합니다.
+
+1. 공유기가 UPnP를 지원하면 UDP P2P 포트를 자동 매핑합니다.
+2. 직접 연결이 안 되면 기존 릴레이 연결을 이용해 DCUtR QUIC 홀펀칭을 시도합니다.
+3. 홀펀칭도 안 되면 메인 서버뿐 아니라 연결된 공개 사용자 노드에 Circuit Relay를 예약합니다.
+
+휴대폰 LTE/5G는 통신사 CGNAT 때문에 외부에서 직접 접속할 수 없는 경우가 많습니다. 이때는
+다른 공개 사용자 노드나 메인 노드 중 하나가 릴레이로 살아 있어야 합니다. 공유기에서 UPnP를
+꺼 둔 경우에도 홀펀칭과 릴레이 경로는 계속 동작합니다.
 
 ## 자동 진단
 
@@ -76,4 +100,4 @@ cargo test --all-targets --all-features --locked
 cargo build --release --locked
 ```
 
-릴리스와 Git 절차는 [`VERSION_1.0.3.1_CHECKPOINT_P2P_RECOVERY.md`](VERSION_1.0.3.1_CHECKPOINT_P2P_RECOVERY.md)를 참고합니다.
+릴리스와 Git 절차는 [`VERSION_1.0.7.1_NAT_TRAVERSAL.md`](VERSION_1.0.7.1_NAT_TRAVERSAL.md)를 참고합니다.
