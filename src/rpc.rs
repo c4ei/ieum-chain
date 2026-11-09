@@ -113,11 +113,29 @@ pub struct RpcNodeHandle {
 
 impl RpcNodeHandle {
     pub fn pending_snapshot_certification(&self) -> Result<Option<StateSnapshot>, String> {
-        self.state
+        let state = self
+            .state
             .read()
-            .map_err(|_| "RPC 상태 읽기 잠금이 손상되었습니다.".to_string())?
-            .archive
-            .pending_certification()
+            .map_err(|_| "RPC 상태 읽기 잠금이 손상되었습니다.".to_string())?;
+        let Some(snapshot) = state.archive.pending_certification()? else {
+            return Ok(None);
+        };
+        let Some(canonical) = state.chain.block_by_height(snapshot.height) else {
+            crate::logger::write_repeated_info(&format!(
+                "[snapshot 인증 보류] 높이 {} 블록이 현재 canonical 메모리 체인에 없어 서명하지 않습니다 · 현재 높이 {}",
+                snapshot.height,
+                state.chain.tip_height()
+            ));
+            return Ok(None);
+        };
+        if snapshot.block_hash != canonical.hash {
+            crate::logger::write_repeated_error(&format!(
+                "[snapshot 인증 보류] 높이 {} 체크포인트 hash가 canonical 블록과 달라 서명하지 않습니다",
+                snapshot.height
+            ));
+            return Ok(None);
+        }
+        Ok(Some(snapshot))
     }
 
     pub fn certify_snapshot(&self, certificate: SnapshotCertificate) -> Result<(), String> {
@@ -1788,6 +1806,7 @@ fn write_state(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static TEST_DATA_DIR_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -1803,6 +1822,85 @@ mod tests {
                 .join("ledger"),
             ..RpcConfig::default()
         }
+    }
+
+    #[test]
+    fn stale_checkpoint_after_state_restore_is_skipped_without_losing_current_checkpoint() {
+        let config = test_rpc_config("stale-checkpoint-after-state-restore");
+        let base_chain = RpcServer::new(config.clone())
+            .state
+            .read()
+            .unwrap()
+            .chain
+            .clone();
+        let mut stale_checkpoint = StateSnapshot::from_chain(&base_chain);
+        stale_checkpoint.height = 82;
+        stale_checkpoint.block_hash = "a".repeat(64);
+
+        let tip_chain = Blockchain::from_snapshot_with_staking(
+            base_chain.chain_id,
+            base_chain.genesis_commitment.clone(),
+            90,
+            "b".repeat(64),
+            base_chain.balances_snapshot(),
+            base_chain.nonces_snapshot(),
+            base_chain.executed_events().clone(),
+            base_chain.staking_snapshot(),
+        )
+        .unwrap();
+        StateStore::new(&config.data_dir)
+            .unwrap()
+            .commit(&tip_chain)
+            .unwrap();
+
+        let checkpoint_dir = config.data_dir.join("checkpoints");
+        fs::create_dir_all(&checkpoint_dir).unwrap();
+        fs::write(
+            checkpoint_dir.join("202610M-h000000000082.json"),
+            serde_json::to_vec(&stale_checkpoint).unwrap(),
+        )
+        .unwrap();
+
+        let server = RpcServer::new(config.clone());
+        let handle = RpcNodeHandle {
+            state: server.state.clone(),
+        };
+        assert_eq!(
+            handle.pending_snapshot_certification().unwrap(),
+            None,
+            "a checkpoint whose historical block is absent after state restore must not be signed"
+        );
+        assert_eq!(server.state.read().unwrap().chain.tip_height(), 90);
+
+        let current_checkpoint = StateSnapshot::from_chain(&tip_chain);
+        let current_checkpoint_path = checkpoint_dir.join("202611M-h000000000090.json");
+        let mut mismatched_checkpoint = current_checkpoint.clone();
+        mismatched_checkpoint.block_hash = "c".repeat(64);
+        fs::write(
+            &current_checkpoint_path,
+            serde_json::to_vec(&mismatched_checkpoint).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            handle.pending_snapshot_certification().unwrap(),
+            None,
+            "a checkpoint with a non-canonical block hash must not be signed"
+        );
+
+        fs::write(
+            current_checkpoint_path,
+            serde_json::to_vec(&current_checkpoint).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            handle.pending_snapshot_certification().unwrap(),
+            Some(current_checkpoint),
+            "a checkpoint anchored to the current canonical block must remain eligible"
+        );
+
+        drop(handle);
+        drop(server);
+        fs::remove_dir_all(config.data_dir.parent().unwrap()).unwrap();
     }
 
     #[test]
