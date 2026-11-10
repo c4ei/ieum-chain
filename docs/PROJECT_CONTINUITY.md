@@ -51,7 +51,7 @@ IEUM은 한국에서 시작하지만 국가·언어에 묶이지 않는 실사�
 
 | 저장소 | 소스 버전 | 표시/태그 | 안정 릴리스 |
 | --- | --- | --- | --- |
-| Chain | `1.0.5-1` | `1.0.5.1`, `v1.0.5.1` | 버전별 GitHub Release |
+| Chain | `1.0.7-2` | `1.0.7.2`, `v1.0.7.2` | 버전별 GitHub Release |
 | Manager | `1.0.0-12` | `1.0.0.12` | 서버/Docker 배포 |
 | Cold Wallet | `1.0.1-0` | `1.0.1.0`, `v1.0.1.0` | `cold-wallet-latest` |
 | Wallet | `1.0.2-1` | `1.0.2.1`, `v1.0.2.1` | `wallet-light-latest`, `wallet-normal-latest` |

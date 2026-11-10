@@ -2,6 +2,7 @@
 
 현재 Git에는 최신 버전 문서와 사용자·운영 매뉴얼만 유지합니다.
 
+- [`VERSION_1.0.7.2_RESTART_SNAPSHOT_GUARD.md`](VERSION_1.0.7.2_RESTART_SNAPSHOT_GUARD.md): 재시작 뒤 오래된 snapshot 체크포인트의 안전한 서명 보류와 회귀 검증
 - [`VERSION_1.0.7.1_NAT_TRAVERSAL.md`](VERSION_1.0.7.1_NAT_TRAVERSAL.md): 공유기 UPnP·QUIC 홀펀칭·분산 사용자 릴레이와 실제 NAT 시험 절차
 - [`VERSION_1.0.6.1_DECENTRALIZED_PEER_RECOVERY.md`](VERSION_1.0.6.1_DECENTRALIZED_PEER_RECOVERY.md): 메인 서버 장애 시 저장 피어·DHT 자동 복구, 검증 및 Git 배포 절차
 - [`VERSION_1.0.5.1_RAW_IDLE_E2E.md`](VERSION_1.0.5.1_RAW_IDLE_E2E.md): 실제 서명 raw 거래·유휴 후 첫 거래 E2E, 100 IEUM 공개 노드 담보·활동 증명 합의 보상
