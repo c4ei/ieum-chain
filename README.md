@@ -6,9 +6,9 @@
 금액은 고정 이율이 아니라 당일 적격 노드 수와 재단 보상 풀에 따라 달라집니다.
 메인 검증 서버 주소·PeerId는 이 일반 공개 노드 보상에서 제외됩니다.
 
-# IEUM Chain v1.0.7.2 메인넷 실행 안내
+# IEUM Chain v1.0.8.0 메인넷 실행 안내
 
-최신 변경과 배포 절차는 [`docs/VERSION_1.0.7.2_RESTART_SNAPSHOT_GUARD.md`](docs/VERSION_1.0.7.2_RESTART_SNAPSHOT_GUARD.md)를 참고하세요.
+정식 릴리스와 배포 절차는 [`docs/VERSION_1.0.8.0_RELEASE.md`](docs/VERSION_1.0.8.0_RELEASE.md)를 참고하세요. snapshot 보호 변경은 [`docs/VERSION_1.0.7.2_RESTART_SNAPSHOT_GUARD.md`](docs/VERSION_1.0.7.2_RESTART_SNAPSHOT_GUARD.md)를 참고하세요.
 
 
 v0.23.12는 Wallet의 중복 nonce 전송을 막기 위해 pending nonce 조회를 보완합니다.
