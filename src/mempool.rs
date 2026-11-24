@@ -99,7 +99,7 @@ impl Mempool {
         let wanted = hash.strip_prefix("0x").unwrap_or(hash);
         self.transactions
             .iter()
-            .find(|transaction| transaction.id().eq_ignore_ascii_case(wanted))
+            .find(|transaction| transaction.matches_hash(wanted))
     }
 
     /// 확정 nonce 뒤에 연속으로 대기 중인 거래까지 포함한 다음 nonce입니다.

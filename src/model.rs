@@ -128,6 +128,14 @@ impl Transaction {
     }
 
     /// mempool 중복 검사와 블록 해시에 사용할 거래 식별자입니다.
+    /// IEUM 거래 ID 또는 Ethereum 해시(keccak256(raw)) 중 하나와 일치하는지 확인합니다.
+    pub fn matches_hash(&self, wanted: &str) -> bool {
+        let wanted = wanted.trim_start_matches("0x");
+        self.id().eq_ignore_ascii_case(wanted)
+            || crate::raw_transaction::ethereum_hash(self)
+                .is_some_and(|hash| hash[2..].eq_ignore_ascii_case(wanted))
+    }
+
     pub fn id(&self) -> String {
         let mut hasher = Sha256::new();
         hasher.update(self.signing_bytes());
