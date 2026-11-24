@@ -585,22 +585,31 @@ impl fmt::Display for NetworkEvent {
     }
 }
 
-#[derive(NetworkBehaviour)]
-#[behaviour(to_swarm = "IeumBehaviourEvent")]
-struct IeumBehaviour {
-    relay_client: relay::client::Behaviour,
-    relay_server: relay::Behaviour,
-    dcutr: dcutr::Behaviour,
-    autonat: autonat::Behaviour,
-    ping: ping::Behaviour,
-    upnp: upnp::tokio::Behaviour,
-    gossipsub: gossipsub::Behaviour,
-    mdns: mdns::tokio::Behaviour,
-    kademlia: kad::Behaviour<kad::store::MemoryStore>,
-    identify: identify::Behaviour,
-    communication: request_response::cbor::Behaviour<CommunicationEnvelope, CommunicationAck>,
-    sync: request_response::cbor::Behaviour<DirectSyncRequest, DirectSyncResponse>,
+// 최신 rustc가 libp2p NetworkBehaviour derive의 Infallible 분기를 unreachable_code로 보고합니다.
+// 허용 범위를 derive 생성 코드가 들어가는 이 모듈로만 좁힙니다.
+#[allow(unreachable_code)]
+mod behaviour {
+    use super::*;
+
+    #[derive(NetworkBehaviour)]
+    #[behaviour(to_swarm = "IeumBehaviourEvent")]
+    pub(super) struct IeumBehaviour {
+        pub(super) relay_client: relay::client::Behaviour,
+        pub(super) relay_server: relay::Behaviour,
+        pub(super) dcutr: dcutr::Behaviour,
+        pub(super) autonat: autonat::Behaviour,
+        pub(super) ping: ping::Behaviour,
+        pub(super) upnp: upnp::tokio::Behaviour,
+        pub(super) gossipsub: gossipsub::Behaviour,
+        pub(super) mdns: mdns::tokio::Behaviour,
+        pub(super) kademlia: kad::Behaviour<kad::store::MemoryStore>,
+        pub(super) identify: identify::Behaviour,
+        pub(super) communication:
+            request_response::cbor::Behaviour<CommunicationEnvelope, CommunicationAck>,
+        pub(super) sync: request_response::cbor::Behaviour<DirectSyncRequest, DirectSyncResponse>,
+    }
 }
+use behaviour::IeumBehaviour;
 
 #[derive(Debug)]
 enum IeumBehaviourEvent {
