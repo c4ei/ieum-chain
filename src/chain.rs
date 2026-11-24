@@ -188,7 +188,7 @@ impl Blockchain {
                 .transactions
                 .iter()
                 .enumerate()
-                .find(|(_, transaction)| transaction.id() == hash)
+                .find(|(_, transaction)| transaction.matches_hash(hash))
                 .map(|(index, transaction)| (block, index, transaction))
         })
     }

@@ -6,9 +6,12 @@
 금액은 고정 이율이 아니라 당일 적격 노드 수와 재단 보상 풀에 따라 달라집니다.
 메인 검증 서버 주소·PeerId는 이 일반 공개 노드 보상에서 제외됩니다.
 
-# IEUM Chain v1.0.7.2 메인넷 실행 안내
+# IEUM Chain v1.0.8.0 메인넷 실행 안내
 
-최신 변경과 배포 절차는 [`docs/VERSION_1.0.7.2_RESTART_SNAPSHOT_GUARD.md`](docs/VERSION_1.0.7.2_RESTART_SNAPSHOT_GUARD.md)를 참고하세요.
+최신 릴리스와 배포 절차는 [`docs/VERSION_1.0.8.0_RELEASE.md`](docs/VERSION_1.0.8.0_RELEASE.md)를,
+snapshot 체크포인트 보호 변경은
+[`docs/VERSION_1.0.7.2_RESTART_SNAPSHOT_GUARD.md`](docs/VERSION_1.0.7.2_RESTART_SNAPSHOT_GUARD.md)를
+참고하세요.
 
 
 v0.23.12는 Wallet의 중복 nonce 전송을 막기 위해 pending nonce 조회를 보완합니다.
@@ -351,3 +354,12 @@ v0.21.9가 만든 구형 Ed25519 보상 keystore는 첫 로드 때
 secp256k1 계정 keystore가 생성됩니다. 백업은 삭제하지 마세요.
 
 개발자용 빌드, 테스트, 구조 설명은 [README_DEV.md](README_DEV.md)를 참고하세요.
+
+## 로드맵: 스마트 계약 (EVM → 이음 스크립트)
+
+이음 체인에 EVM을 탑재해 Solidity 계약(ERC-20, NFT, DEX)을 그대로 실행하고, 그 위에 하루 만에 배울 수 있는 쉬운 계약 언어 **이음 스크립트**를 얹을 계획입니다.
+
+- **A. EVM 탑재 (약 13주):** 상태 저장 → revm 실행·가스 → MetaMask·Remix 호환 → 테스트넷과 aah.name 이전 리허설 → v4 활성화
+- **B. 이음 스크립트 (A2 이후 병행, 약 8주):** Solidity 0.8로 변환하는 컴파일러, `ieum` CLI, 브라우저 Playground, 하루 과정 교재
+
+구조도, 문법 초안과 예제, 단계별 완료 기준, 위험은 [docs/SMART_CONTRACT_DESIGN.md](docs/SMART_CONTRACT_DESIGN.md)에 있습니다.

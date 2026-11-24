@@ -273,7 +273,7 @@ impl ArchiveStore {
                 .transactions
                 .iter()
                 .enumerate()
-                .find(|(_, transaction)| transaction.id() == hash)
+                .find(|(_, transaction)| transaction.matches_hash(hash))
             {
                 return Ok(Some((block.clone(), index, transaction.clone())));
             }

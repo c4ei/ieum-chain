@@ -804,6 +804,33 @@ fn dispatch(
         "eth_call" => Ok(json!("0x")),
         "eth_getLogs" => Ok(json!([])),
         "eth_getUncleCountByBlockHash" | "eth_getUncleCountByBlockNumber" => Ok(json!("0x0")),
+        // EIP-1559가 없는 legacy 체인입니다. 우선 수수료는 0, 기본 수수료는 0으로 응답합니다.
+        "eth_maxPriorityFeePerGas" => Ok(json!("0x0")),
+        "eth_feeHistory" => {
+            let count = params
+                .first()
+                .and_then(|value| match value {
+                    Value::String(text) => parse_quantity_u64(text).ok(),
+                    Value::Number(number) => number.as_u64(),
+                    _ => None,
+                })
+                .unwrap_or(1)
+                .clamp(1, 1024);
+            let percentiles = params
+                .get(2)
+                .and_then(Value::as_array)
+                .map(Vec::len)
+                .unwrap_or(0);
+            let state = read_state(state)?;
+            let newest = state.chain.tip_height();
+            let count = count.min(newest.saturating_add(1));
+            Ok(json!({
+                "oldestBlock": quantity(newest + 1 - count),
+                "baseFeePerGas": vec!["0x0"; count as usize + 1],
+                "gasUsedRatio": vec![0.0; count as usize],
+                "reward": vec![vec!["0x0"; percentiles]; if percentiles > 0 { count as usize } else { 0 }]
+            }))
+        }
         "eth_getBlockByNumber" => {
             let selector = string_param(params, 0)?;
             let full = params.get(1).and_then(Value::as_bool).unwrap_or(false);
@@ -823,7 +850,7 @@ fn dispatch(
             };
             Ok(block
                 .as_ref()
-                .map(|block| block_json(block, full))
+                .map(|block| block_json(block, full, state.chain_id))
                 .unwrap_or(Value::Null))
         }
         "eth_getBlockByHash" => {
@@ -837,7 +864,7 @@ fn dispatch(
                 .or_else(|| state.chain.block_by_hash(hash).cloned());
             Ok(block
                 .as_ref()
-                .map(|block| block_json(block, full))
+                .map(|block| block_json(block, full, state.chain_id))
                 .unwrap_or(Value::Null))
         }
         "eth_getTransactionByHash" => {
@@ -856,12 +883,12 @@ fn dispatch(
                         })
                 });
             if let Some((block, index, transaction)) = transaction.as_ref() {
-                return Ok(transaction_json(block, *index, transaction));
+                return Ok(transaction_json(block, *index, transaction, state.chain_id));
             }
             Ok(state
                 .pool
                 .transaction_by_hash(hash)
-                .map(pending_transaction_json)
+                .map(|transaction| pending_transaction_json(transaction, state.chain_id))
                 .unwrap_or(Value::Null))
         }
         "eth_getBlockTransactionCountByNumber" => {
@@ -898,10 +925,9 @@ fn dispatch(
             Ok(block
                 .as_ref()
                 .and_then(|block| {
-                    block
-                        .transactions
-                        .get(index)
-                        .map(|transaction| transaction_json(block, index, transaction))
+                    block.transactions.get(index).map(|transaction| {
+                        transaction_json(block, index, transaction, state.chain_id)
+                    })
                 })
                 .unwrap_or(Value::Null))
         }
@@ -942,7 +968,10 @@ fn dispatch(
                         "effectiveGasPrice": quantity_u128(gas_price),
                         "logs": [],
                         "logsBloom": format!("0x{}", "0".repeat(512)),
-                        "status": "0x1"
+                        "status": "0x1",
+                        "type": "0x0",
+                        "contractAddress": Value::Null,
+                        "ethereumHash": crate::raw_transaction::ethereum_hash(&transaction)
                     })
                 })
                 .unwrap_or(Value::Null))
@@ -1506,8 +1535,10 @@ fn send_raw_transaction(
             "현재 활성 이음지기에게만 새 위임을 할 수 있습니다.".into(),
         ));
     }
-    // 반환 해시를 확정 블록과 eth_getTransactionByHash가 사용하는 원장 거래 ID로 통일합니다.
-    let transaction_hash = format!("0x{}", transaction.id());
+    // Ethereum 지갑(ethers, MetaMask)은 keccak256(raw)을 기대하므로 그 값을 돌려줍니다.
+    // 조회 API는 이 해시와 IEUM 거래 ID를 모두 받습니다.
+    let transaction_hash = crate::raw_transaction::ethereum_hash(&transaction)
+        .unwrap_or_else(|| format!("0x{}", transaction.id()));
     state
         .pool
         .add(transaction)
@@ -1682,13 +1713,32 @@ fn quantity_u128(value: u128) -> String {
     format!("0x{value:x}")
 }
 
-fn block_json(block: &Block, full_transactions: bool) -> Value {
+const ZERO_HASH: &str = "0x0000000000000000000000000000000000000000000000000000000000000000";
+/// keccak256(rlp([])) - Ethereum 도구가 기대하는 빈 uncle 목록 해시입니다.
+const EMPTY_UNCLES_HASH: &str =
+    "0x1dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347";
+/// EVM 실행이 없으므로 표시용 블록 가스 한도입니다.
+const DISPLAY_BLOCK_GAS_LIMIT: u64 = 30_000_000;
+
+/// 검증자 ID(Ed25519 공개키 hex 등)를 ethers/MetaMask가 읽을 수 있는 20바이트 주소로 바꿉니다.
+/// 이미 0x 주소이면 그대로 쓰고, 아니면 keccak256(ID 바이트)의 뒤 20바이트를 씁니다.
+fn evm_address(id: &str) -> String {
+    let trimmed = id.trim_start_matches("0x");
+    if trimmed.len() == 40 && trimmed.chars().all(|c| c.is_ascii_hexdigit()) {
+        return format!("0x{}", trimmed.to_ascii_lowercase());
+    }
+    let bytes = hex::decode(trimmed).unwrap_or_else(|_| id.as_bytes().to_vec());
+    let digest = sha3::Keccak256::digest(bytes);
+    format!("0x{}", hex::encode(&digest[12..]))
+}
+
+fn block_json(block: &Block, full_transactions: bool, chain_id: u64) -> Value {
     let transactions = if full_transactions {
         block
             .transactions
             .iter()
             .enumerate()
-            .map(|(index, transaction)| transaction_json(block, index, transaction))
+            .map(|(index, transaction)| transaction_json(block, index, transaction, chain_id))
             .collect::<Vec<_>>()
     } else {
         block
@@ -1697,12 +1747,30 @@ fn block_json(block: &Block, full_transactions: bool) -> Value {
             .map(|transaction| json!(format!("0x{}", transaction.id())))
             .collect::<Vec<_>>()
     };
+    let gas_used = block
+        .transactions
+        .iter()
+        .map(|transaction| crate::raw_transaction::ethereum_fee_terms(transaction).1)
+        .fold(0_u128, u128::saturating_add);
     json!({
         "number": quantity(block.height),
         "hash": format!("0x{}", block.hash),
         "parentHash": format!("0x{}", block.previous_hash),
         "timestamp": quantity(block.timestamp),
-        "miner": block.producer,
+        "miner": evm_address(&block.producer),
+        "ieumProducer": block.producer,
+        "difficulty": "0x0",
+        "totalDifficulty": "0x0",
+        "nonce": "0x0000000000000000",
+        "mixHash": ZERO_HASH,
+        "sha3Uncles": EMPTY_UNCLES_HASH,
+        "uncles": [],
+        "extraData": "0x",
+        "gasLimit": quantity(DISPLAY_BLOCK_GAS_LIMIT),
+        "gasUsed": quantity_u128(gas_used),
+        "stateRoot": ZERO_HASH,
+        "receiptsRoot": ZERO_HASH,
+        "logsBloom": format!("0x{}", "0".repeat(512)),
         "transactions": transactions,
         "ieumSystemEvents": block.system_events,
         "transactionsRoot": format!("0x{}", block.hash),
@@ -1710,9 +1778,27 @@ fn block_json(block: &Block, full_transactions: bool) -> Value {
     })
 }
 
-fn transaction_json(block: &Block, index: usize, transaction: &Transaction) -> Value {
+/// legacy(type 0) 서명 필드입니다. IEUM 자체 서명 거래는 v=27, r=s=0으로 표시합니다.
+fn ethereum_signature_json(transaction: &Transaction) -> (String, String, String) {
+    crate::raw_transaction::ethereum_signature_parts(transaction)
+        .unwrap_or_else(|| ("0x1b".into(), ZERO_HASH.into(), ZERO_HASH.into()))
+}
+
+fn transaction_json(
+    block: &Block,
+    index: usize,
+    transaction: &Transaction,
+    chain_id: u64,
+) -> Value {
     let (gas_price, gas_limit) = crate::raw_transaction::ethereum_fee_terms(transaction);
+    let (v, r, s) = ethereum_signature_json(transaction);
     json!({
+        "type": "0x0",
+        "chainId": quantity(chain_id),
+        "v": v,
+        "r": r,
+        "s": s,
+        "ethereumHash": crate::raw_transaction::ethereum_hash(transaction),
         "hash": format!("0x{}", transaction.id()),
         "nonce": quantity(transaction.nonce),
         "blockHash": format!("0x{}", block.hash),
@@ -1731,9 +1817,16 @@ fn transaction_json(block: &Block, index: usize, transaction: &Transaction) -> V
     })
 }
 
-fn pending_transaction_json(transaction: &Transaction) -> Value {
+fn pending_transaction_json(transaction: &Transaction, chain_id: u64) -> Value {
     let (gas_price, gas_limit) = crate::raw_transaction::ethereum_fee_terms(transaction);
+    let (v, r, s) = ethereum_signature_json(transaction);
     json!({
+        "type": "0x0",
+        "chainId": quantity(chain_id),
+        "v": v,
+        "r": r,
+        "s": s,
+        "ethereumHash": crate::raw_transaction::ethereum_hash(transaction),
         "hash": format!("0x{}", transaction.id()),
         "nonce": quantity(transaction.nonce),
         "blockHash": Value::Null,
@@ -2010,7 +2103,7 @@ mod tests {
             "validator".into(),
             vec![transaction],
         );
-        let value = block_json(&block, true);
+        let value = block_json(&block, true, 21_004);
 
         assert_eq!(value["number"], "0x1");
         assert_eq!(value["transactions"][0]["blockHash"], value["hash"]);
@@ -2018,6 +2111,90 @@ mod tests {
         assert_eq!(value["transactions"][0]["gas"], "0x1");
         assert_eq!(value["transactions"][0]["gasPrice"], "0x5208");
         assert!(value["transactions"][0].get("signature").is_none());
+    }
+
+    #[test]
+    fn ethereum_tooling_fields_and_keccak_hash_lookup() {
+        let config = test_rpc_config("ethereum-tooling-fields");
+        let server = RpcServer::new(config);
+        let handle = server.node_handle();
+        let shared = Arc::clone(&server.state);
+        let receiver: [u8; 20] = [0x22; 20];
+        let raw = crate::raw_transaction::sign_legacy_for_test(
+            [42; 32],
+            receiver,
+            100,
+            &[],
+            21_004,
+            0,
+            1,
+            21_000,
+        );
+        let returned = dispatch(&shared, "eth_sendRawTransaction", &[json!(raw)]).unwrap();
+        let transactions = handle.drain_transactions(10).unwrap();
+        let ethereum_hash = crate::raw_transaction::ethereum_hash(&transactions[0]).unwrap();
+        let ieum_id = format!("0x{}", transactions[0].id());
+        assert_eq!(
+            returned,
+            json!(ethereum_hash),
+            "ethers는 keccak256(raw)을 기대한다"
+        );
+        let before = handle.chain().unwrap();
+        let mut after = before.clone();
+        after
+            .add_block(
+                transactions,
+                "d475e3a8a10a569c05c3d6406bb37adc681f5372e5855ffd76d24d5df91cad5d".into(),
+            )
+            .unwrap();
+        let finalized = after.blocks.last().unwrap().clone();
+        handle
+            .install_finalized(&before, after, &finalized)
+            .unwrap();
+
+        let block = dispatch(
+            &shared,
+            "eth_getBlockByNumber",
+            &[json!("latest"), json!(false)],
+        )
+        .unwrap();
+        for field in [
+            "difficulty",
+            "gasLimit",
+            "gasUsed",
+            "nonce",
+            "extraData",
+            "logsBloom",
+            "stateRoot",
+        ] {
+            assert!(block.get(field).is_some(), "블록 필드 누락: {field}");
+        }
+        let miner = block["miner"].as_str().unwrap();
+        assert!(miner.starts_with("0x") && miner.len() == 42);
+        assert!(block.get("baseFeePerGas").is_none());
+
+        // IEUM ID와 keccak256(raw) 두 해시 모두로 같은 거래를 찾는다.
+        let by_id = dispatch(&shared, "eth_getTransactionByHash", &[json!(ieum_id)]).unwrap();
+        let by_eth =
+            dispatch(&shared, "eth_getTransactionByHash", &[json!(ethereum_hash)]).unwrap();
+        assert_eq!(by_id, by_eth);
+        assert_eq!(by_id["type"], "0x0");
+        assert_eq!(by_id["chainId"], "0x520c");
+        assert_eq!(by_id["ethereumHash"], json!(ethereum_hash));
+        let receipt = dispatch(
+            &shared,
+            "eth_getTransactionReceipt",
+            &[json!(ethereum_hash)],
+        )
+        .unwrap();
+        assert_eq!(receipt["status"], "0x1");
+        assert_eq!(receipt["type"], "0x0");
+
+        if let Ok(path) = std::env::var("IEUM_RPC_DUMP") {
+            let dump = json!({"raw": raw, "block": block, "transaction": by_id, "receipt": receipt,
+                "feeHistory": dispatch(&shared, "eth_feeHistory", &[json!("0x2"), json!("latest"), json!([50])]).unwrap()});
+            std::fs::write(path, serde_json::to_vec_pretty(&dump).unwrap()).unwrap();
+        }
     }
 
     #[test]

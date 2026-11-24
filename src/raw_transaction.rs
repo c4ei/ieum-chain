@@ -115,6 +115,31 @@ pub fn verify_embedded(transaction: &Transaction, expected_chain_id: u64) -> Res
     }
 }
 
+/// Ethereum 지갑이 계산하는 거래 해시(keccak256(raw))입니다. raw 거래가 아니면 None.
+pub fn ethereum_hash(transaction: &Transaction) -> Option<String> {
+    let raw = transaction.signature.strip_prefix("ethraw:")?;
+    let bytes = hex::decode(raw).ok()?;
+    Some(format!("0x{}", hex::encode(Keccak256::digest(bytes))))
+}
+
+/// raw legacy 거래의 (v, r, s)를 0x 16진 문자열로 돌려줍니다.
+pub fn ethereum_signature_parts(transaction: &Transaction) -> Option<(String, String, String)> {
+    let raw = transaction.signature.strip_prefix("ethraw:")?;
+    let bytes = hex::decode(raw).ok()?;
+    let fields = decode_list(&bytes).ok()?;
+    if fields.len() != 9 {
+        return None;
+    }
+    let v = value_u64(fields[6], "v").ok()?;
+    let r = padded_scalar(fields[7], "r").ok()?;
+    let s = padded_scalar(fields[8], "s").ok()?;
+    Some((
+        format!("0x{v:x}"),
+        format!("0x{}", hex::encode(r)),
+        format!("0x{}", hex::encode(s)),
+    ))
+}
+
 /// Ethereum 조회 응답에서 원본 legacy 거래의 gasPrice/gasLimit을 보존합니다.
 ///
 /// IEUM 자체 서명 거래는 총 수수료만 합의 필드로 가지므로 gas=1,
