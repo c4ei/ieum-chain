@@ -410,7 +410,8 @@ index, transaction_hash, receipt_raw, nonce_raw = sys.argv[1:]
 receipt = json.loads(receipt_raw).get("result")
 if not isinstance(receipt, dict):
     raise SystemExit(f"노드 {index} raw 거래 확정 영수증 없음")
-if receipt.get("transactionHash") != transaction_hash or receipt.get("status") != "0x1":
+# v1.0.9부터 raw 거래 제출은 keccak256(raw)을 반환하고, 영수증은 IEUM ID와 ethereumHash를 함께 준다.
+if transaction_hash not in (receipt.get("transactionHash"), receipt.get("ethereumHash")) or receipt.get("status") != "0x1":
     raise SystemExit(f"노드 {index} raw 거래 영수증 불일치: {receipt}")
 nonce = int(json.loads(nonce_raw).get("result", "0x0"), 16)
 if nonce != 1:

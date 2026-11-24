@@ -1,5 +1,16 @@
 # 변경 기록
 
+## 1.0.9.0 - 2026-11-24
+
+- ethers v6·MetaMask가 블록·거래·영수증을 파싱할 수 있도록 RPC 응답에 Ethereum 표준 필드 추가
+  (`difficulty`, `gasLimit`, `gasUsed`, `nonce`, `extraData`, `logsBloom`, `stateRoot`, 거래 `type`·`chainId`·`v`/`r`/`s`, 영수증 `type`·`contractAddress`)
+- 블록 `miner`를 20바이트 주소로 표시하고 원래 검증자 ID는 `ieumProducer`로 제공
+- `eth_sendRawTransaction`이 keccak256(raw) 해시를 반환하도록 변경해 ethers `sendTransaction` 해시 검증 통과
+- 거래·영수증 조회가 IEUM 거래 ID와 keccak 해시를 모두 받도록 변경, 응답에 `ethereumHash` 추가
+- `eth_feeHistory`, `eth_maxPriorityFeePerGas` 추가 (legacy 체인이므로 0 응답)
+- 스마트 계약 설계 문서 `docs/SMART_CONTRACT_DESIGN.md` 추가
+- Chain ID, genesis, 프로토콜 버전과 합의 규칙은 변경하지 않음
+
 ## 1.0.8.0 - 2026-11-10
 
 - v1.0.7.2의 snapshot 체크포인트 서명 보호 변경을 포함한 정식 메인넷 바이너리 릴리스 버전으로 승격
