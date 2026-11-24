@@ -50,12 +50,14 @@ done
 docker compose version >/dev/null
 
 # compose.yml의 서비스명과 이미지명이 예상과 같은지 확인합니다.
+# pipefail 상태에서 `docker ... | grep -q`는 grep이 먼저 끝나면 SIGPIPE로 실패할 수 있어
+# 목록을 한 번 받아 둔 뒤 검사합니다.
+compose_services="$(docker compose -f "$COMPOSE_FILE" config --services)"
+compose_images="$(docker compose -f "$COMPOSE_FILE" config --images)"
 for service in "${services[@]}"; do
-  docker compose -f "$COMPOSE_FILE" config --services |
-    grep -Fxq "$service" || die "compose.yml에 $service 서비스가 없습니다."
+  grep -Fxq "$service" <<< "$compose_services" || die "compose.yml에 $service 서비스가 없습니다."
 done
-docker compose -f "$COMPOSE_FILE" config --images |
-  grep -Fxq "$LATEST_IMAGE" || die "compose.yml이 $LATEST_IMAGE 이미지를 사용하지 않습니다."
+grep -Fxq "$LATEST_IMAGE" <<< "$compose_images" || die "compose.yml이 $LATEST_IMAGE 이미지를 사용하지 않습니다."
 
 # 지정한 UDP 포트를 사용 중인 PID를 중복 없이 출력합니다.
 udp_owner_pids() {
