@@ -1,5 +1,15 @@
 # 변경 기록
 
+## 1.0.10.0 - 2026-11-24
+
+- Docker 재시작·PC 재부팅 시 노드가 종료 신호를 놓쳐 30초 뒤 강제 종료(SIGKILL)되던 문제 수정
+  - 종료 신호 future를 루프 밖에서 한 번만 만들고 `biased` select로 우선 처리
+  - SIGTERM과 SIGINT를 모두 받음 (compose `stop_signal` 설정이 없어도 안전 종료)
+  - 자동 업데이트 확인(동기 HTTP)을 `spawn_blocking`으로 옮기고 확인 중에도 종료 신호를 받음
+- snapshot 인증 서명 실패 시 노드 전체가 종료되던 문제 수정: 로그만 남기고 계속 동작
+  (월 백업 롤오버 직후 재시작하면 재시작 루프에 빠지던 원인)
+- Chain ID, genesis, 프로토콜 버전과 합의 규칙은 변경하지 않음
+
 ## 1.0.9.0 - 2026-11-24
 
 - ethers v6·MetaMask가 블록·거래·영수증을 파싱할 수 있도록 RPC 응답에 Ethereum 표준 필드 추가

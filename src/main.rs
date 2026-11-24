@@ -985,8 +985,18 @@ async fn main() -> Result<(), String> {
     }
     log_info!("같은 LAN의 노드는 mDNS로 자동 검색합니다. 종료: Ctrl+C");
 
+    // 종료 신호 future를 한 번만 만들어 고정해야 다른 분기 실행 중 들어온 신호도 유실되지 않음
+    let shutdown = shutdown_signal();
+    tokio::pin!(shutdown);
     loop {
         tokio::select! {
+            biased;
+            _ = &mut shutdown => {
+                println!();
+                log_info!("노드를 안전하게 종료합니다.");
+                rpc_task.abort();
+                break;
+            }
             _ = sync_tick.tick() => {
                 ieum_chain::logger::write_repeated_info(&format!(
                     "[동기화 요청] 현재 높이 {} · 요청 시작 높이 {}",
@@ -1000,10 +1010,17 @@ async fn main() -> Result<(), String> {
             _ = update_tick.tick(), if auto_update.is_some() => {
                 let (_, config) = auto_update.as_ref().expect("guarded by is_some");
                 log_info!("[자동 업데이트 확인] 서명된 최신 manifest를 확인합니다.");
-                match ieum_chain::updater::install_if_newer(
-                    &config.manifest_url,
-                    &config.release_public_key,
-                ) {
+                let (url, key) = (config.manifest_url.clone(), config.release_public_key.clone());
+                let result = tokio::select! {
+                    r = tokio::task::spawn_blocking(move || ieum_chain::updater::install_if_newer(&url, &key)) =>
+                        r.unwrap_or_else(|e| Err(e.to_string())),
+                    _ = &mut shutdown => {
+                        log_info!("노드를 안전하게 종료합니다. (업데이트 확인 중단)");
+                        rpc_task.abort();
+                        break;
+                    }
+                };
+                match result {
                     Ok(ieum_chain::updater::UpdateResult::Current) => {}
                     Ok(ieum_chain::updater::UpdateResult::Installed) => {
                         log_info!("[자동 업데이트 완료] 새 실행 파일을 설치했습니다. 서비스를 재시작합니다.");
@@ -1081,7 +1098,16 @@ async fn main() -> Result<(), String> {
                 if local_is_validator
                     && let Some(snapshot) = rpc.pending_snapshot_certification()?
                 {
-                    let attestation = consensus.sign_snapshot_attestation(&snapshot)?;
+                    // 월 롤오버 직후엔 snapshot 높이 블록이 메모리에 없을 수 있어, 실패해도 노드는 계속 동작
+                    let attestation = match consensus.sign_snapshot_attestation(&snapshot) {
+                        Ok(value) => value,
+                        Err(error) => {
+                            ieum_chain::logger::write_repeated_error(&format!(
+                                "[snapshot 인증 보류] 높이 {} · {error}", snapshot.height
+                            ));
+                            continue;
+                        }
+                    };
                     let votes = snapshot_votes
                         .entry((attestation.height, attestation.block_hash.clone(), attestation.state_root.clone()))
                         .or_default();
@@ -1548,10 +1574,17 @@ async fn main() -> Result<(), String> {
                             "[P2P 업데이트 알림] PeerId: {source}, 버전: {version}. \
                              로컬 릴리스 공개키로 재검증합니다."
                         );
-                        match ieum_chain::updater::install_if_newer(
-                            &config.manifest_url,
-                            &config.release_public_key,
-                        ) {
+                        let (url, key) = (config.manifest_url.clone(), config.release_public_key.clone());
+                        let result = tokio::select! {
+                            r = tokio::task::spawn_blocking(move || ieum_chain::updater::install_if_newer(&url, &key)) =>
+                                r.unwrap_or_else(|e| Err(e.to_string())),
+                            _ = &mut shutdown => {
+                                log_info!("노드를 안전하게 종료합니다. (업데이트 확인 중단)");
+                                rpc_task.abort();
+                                break;
+                            }
+                        };
+                        match result {
                             Ok(ieum_chain::updater::UpdateResult::Current) => {}
                             Ok(ieum_chain::updater::UpdateResult::Installed) => {
                                 log_info!(
@@ -1658,8 +1691,15 @@ async fn main() -> Result<(), String> {
                             (certificates, None, None)
                         } else if from_height <= tip_height {
                             let snapshot = StateSnapshot::from_chain(&consensus.chain);
-                            let attestation = consensus.sign_snapshot_attestation(&snapshot)?;
-                            (Vec::new(), Some(Box::new(snapshot)), Some(attestation))
+                            match consensus.sign_snapshot_attestation(&snapshot) {
+                                Ok(attestation) => (Vec::new(), Some(Box::new(snapshot)), Some(attestation)),
+                                Err(error) => {
+                                    ieum_chain::logger::write_repeated_error(&format!(
+                                        "[동기화 snapshot 서명 실패] {error}"
+                                    ));
+                                    (Vec::new(), None, None)
+                                }
+                            }
                         } else {
                             (Vec::new(), None, None)
                         };
@@ -1870,15 +1910,22 @@ async fn main() -> Result<(), String> {
                     }
                 }
             }
-            _ = tokio::signal::ctrl_c() => {
-                println!();
-                log_info!("노드를 안전하게 종료합니다.");
-                rpc_task.abort();
-                break;
-            }
         }
     }
     Ok(())
+}
+
+/// Docker는 SIGTERM, compose 설정과 Ctrl+C는 SIGINT를 보내므로 둘 다 받는다.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut term = signal(SignalKind::terminate()).expect("SIGTERM 핸들러 등록 실패");
+        let mut int = signal(SignalKind::interrupt()).expect("SIGINT 핸들러 등록 실패");
+        tokio::select! { _ = term.recv() => {}, _ = int.recv() => {} }
+    }
+    #[cfg(not(unix))]
+    let _ = tokio::signal::ctrl_c().await;
 }
 
 fn run_recovery_command(command: RecoveryCommand) -> Result<(), String> {
