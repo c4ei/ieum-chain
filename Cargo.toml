@@ -1,6 +1,6 @@
 [package]
 name = "ieum-chain"
-version = "1.0.11-0"
+version = "1.0.12-0"
 edition = "2024"
 
 [dependencies]

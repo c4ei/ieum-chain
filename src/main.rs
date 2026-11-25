@@ -1141,6 +1141,7 @@ async fn main() -> Result<(), String> {
                     consensus.restart_phase_timeout(timeout_now);
                 }
                 if consensus_is_active {
+                    let round_before = consensus.round();
                     let (timed_out, round_change) =
                         consensus.timeout_if_due_with_round_change(timeout_now)?;
                     if timed_out {
@@ -1151,10 +1152,17 @@ async fn main() -> Result<(), String> {
                                 .await
                                 .map_err(|error| error.to_string())?;
                         }
-                        print!(
-                            "\r\x1b[2K[BFT 라운드 변경] 단계별 제한 시간 초과, 새 라운드 {}",
-                            consensus.round()
-                        );
+                        if consensus.round() == round_before {
+                            print!(
+                                "\r\x1b[2K[BFT 라운드 대기] 제한 시간 초과, 라운드 {} round-change quorum 대기",
+                                round_before
+                            );
+                        } else {
+                            print!(
+                                "\r\x1b[2K[BFT 라운드 변경] round-change quorum 확인, 새 라운드 {}",
+                                consensus.round()
+                            );
+                        }
                         io::stdout().flush().map_err(|error| error.to_string())?;
                     }
                     if timeout_now.duration_since(last_round_change_rebroadcast)
