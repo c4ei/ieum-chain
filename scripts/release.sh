@@ -49,7 +49,12 @@ if has_gh; then
   body="$(sed -n "$((${changelog_line%%:*}+1)),/^## /p" CHANGELOG.md | sed '/^## /d')"
   gh pr view "$BRANCH" >/dev/null 2>&1 || gh pr create --base main --head "$BRANCH" --title "$TITLE" \
     --body "$body"
-  sleep 15
+  # PR 직후에는 CI가 아직 등록되지 않아 "no checks reported"가 나오므로 등록될 때까지 기다립니다.
+  for _ in $(seq 1 36); do
+    checks="$(gh pr checks "$BRANCH" 2>&1 || true)"
+    [[ "$checks" == *"no checks reported"* ]] || break
+    sleep 5
+  done
   gh pr checks "$BRANCH" --watch --fail-fast || { echo "CI 실패: GitHub에서 로그를 확인하세요."; exit 1; }
   gh pr merge "$BRANCH" --merge --delete-branch
 else

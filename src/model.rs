@@ -16,6 +16,8 @@ pub enum TransactionAction {
         validator: Address,
     },
     ClaimUnbonded,
+    /// 계약 배포(`to`가 빈 값) 또는 calldata가 있는 계약 호출입니다. Ethereum raw 거래로만 만듭니다.
+    Evm,
 }
 
 /// 사용자가 서명해 네트워크에 제출하는 가장 기본적인 코인 송금 거래입니다.
@@ -53,6 +55,7 @@ impl TransactionAction {
                 out
             }
             Self::ClaimUnbonded => vec![3],
+            Self::Evm => vec![4],
         }
     }
 }

@@ -1,5 +1,20 @@
 # 변경 기록
 
+## 1.0.11.0 - 2026-11-25
+
+- EVM(revm 43, Prague 규칙) 탑재: 계약 배포·호출을 확정 블록 적용 단계에서 실행 (프로토콜 v4)
+  - 기본은 꺼져 있음. `config/upgrades.json`에 `protocol_version: 4` 활성 높이를 적으면 4노드가 같은 블록에서 켬
+  - legacy(EIP-155) raw 거래만 사용, 누구나 배포 가능, 블록 가스 한도 30,000,000
+  - 수수료는 실제 사용 가스 × gasPrice이며 기존 송금과 같이 생산자 80% · 재단 20%로 나눔
+  - revert·halt된 거래도 블록에 남고 수수료와 nonce만 반영, 상태는 되돌림
+  - 계약 코드·스토리지를 상태 해시·snapshot·상태 DB에 포함 (계약이 없으면 기존 상태 해시와 동일)
+- RPC: `eth_call`, `eth_estimateGas`, `eth_getCode`, `eth_getStorageAt`, `eth_getLogs` 실제 값으로 응답,
+  영수증에 `status`·`gasUsed`·`contractAddress`·`logs`·`logsBloom` 반영, revert 이유를 오류 `data`로 반환
+- 합의 안정성: 제안자가 블록에 넣기 전에 거래를 실제로 적용해 보고 실패 거래를 빼며,
+  검증자도 적용에 실패할 제안 블록에는 투표하지 않음 (확정 후 적용 실패로 인한 체인 정지 방지)
+- 실제 메인넷 원장(높이 106)을 genesis와 h82 체크포인트에서 각각 재생해 상태 루트가 같음을 확인
+- `scripts/release.sh`: PR 생성 직후 CI 등록을 기다린 뒤 결과를 확인
+
 ## 1.0.10.0 - 2026-11-24
 
 - Docker 재시작·PC 재부팅 시 노드가 종료 신호를 놓쳐 30초 뒤 강제 종료(SIGKILL)되던 문제 수정

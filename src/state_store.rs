@@ -20,6 +20,10 @@ pub struct CanonicalState {
     pub executed_events: HashSet<String>,
     #[serde(default)]
     pub staking: crate::staking::StakingState,
+    #[serde(default, skip_serializing_if = "crate::evm::EvmState::is_empty")]
+    pub evm: crate::evm::EvmState,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub evm_receipts: HashMap<String, crate::evm::EvmReceipt>,
     pub height_to_hash: HashMap<u64, String>,
     pub transaction_index: HashMap<String, (u64, usize)>,
 }
@@ -48,6 +52,8 @@ impl CanonicalState {
             nonces: chain.nonces_snapshot(),
             executed_events: chain.executed_events().clone(),
             staking: chain.staking_snapshot(),
+            evm: chain.evm().clone(),
+            evm_receipts: chain.evm_receipts().clone(),
             height_to_hash,
             transaction_index,
         }

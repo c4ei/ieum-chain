@@ -30,7 +30,7 @@ const DEFAULT_BOOTSTRAP_PEERS: [&str; 4] = [
 ];
 const SERVER_INSTANCE_PORT: u16 = 49_889;
 const CLIENT_INSTANCE_PORT: u16 = 49_890;
-const SUPPORTED_PROTOCOL_VERSION: u32 = 3;
+const SUPPORTED_PROTOCOL_VERSION: u32 = 4;
 
 #[derive(Clone, Debug)]
 struct ServiceObservation {
@@ -1354,7 +1354,37 @@ async fn main() -> Result<(), String> {
                         && (rpc.has_pending_transactions()? || !due_events.is_empty())
                     {
                         // 제안자만 거래 큐를 비웁니다. 비제안자 RPC에 들어온 거래를 보존합니다.
-                        let pending = rpc.drain_transactions(1_000)?;
+                        let drained = rpc.drain_transactions(1_000)?;
+                        let next_height = consensus.chain.tip_height() + 1;
+                        let evm_active = upgrades.version_at(next_height) >= ieum_chain::evm::EVM_PROTOCOL_VERSION;
+                        let (allowed, too_early): (Vec<_>, Vec<_>) = drained.into_iter().partition(|tx| {
+                            evm_active || !matches!(tx.action, ieum_chain::model::TransactionAction::Evm)
+                        });
+                        // 실제로 적용해 보고 실패하는 거래는 빼서, 확정 뒤 적용 실패로 체인이 멈추지 않게 합니다.
+                        let (pending, rejected) = consensus.chain.select_executable(
+                            next_height,
+                            timestamp,
+                            &local_validator_address,
+                            allowed,
+                        );
+                        let mut deferred = too_early;
+                        for (transaction, reason) in rejected {
+                            if transaction.nonce > consensus.chain.next_nonce(&transaction.from)
+                                || reason.contains("가스 한도")
+                            {
+                                deferred.push(transaction);
+                            } else {
+                                ieum_chain::logger::write_repeated_error(&format!(
+                                    "[거래 제외] {} · {reason}", transaction.id()
+                                ));
+                            }
+                        }
+                        if !deferred.is_empty() {
+                            rpc.restore_transactions(deferred)?;
+                        }
+                        if pending.is_empty() && due_events.is_empty() {
+                            continue;
+                        }
                         let previous = consensus.chain.blocks.last().unwrap();
                         let block = ieum_chain::Block::new(
                             previous.height + 1,

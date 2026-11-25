@@ -2,8 +2,8 @@ use crate::model::{Transaction, TransactionAction};
 use k256::ecdsa::{RecoveryId, Signature, VerifyingKey};
 use sha3::{Digest, Keccak256};
 
-/// EIP-155 legacy(9개 RLP 필드) 송금 거래를 검증해 IEUM 거래로 변환합니다.
-/// 컨트랙트 생성과 calldata 실행은 EVM이 추가되기 전까지 거부합니다.
+/// EIP-155 legacy(9개 RLP 필드) 거래를 검증해 IEUM 거래로 변환합니다.
+/// 계약 배포·호출은 `TransactionAction::Evm`이 되며, 활성 높이 검사는 RPC와 합의가 합니다.
 pub fn decode_legacy(raw_hex: &str, expected_chain_id: u64) -> Result<Transaction, String> {
     let raw = hex::decode(raw_hex.trim_start_matches("0x"))
         .map_err(|_| "raw transaction이 올바른 hex가 아닙니다.")?;
@@ -15,8 +15,8 @@ pub fn decode_legacy(raw_hex: &str, expected_chain_id: u64) -> Result<Transactio
     let gas_price = value_u64(fields[1], "gasPrice")?;
     let gas_limit = value_u64(fields[2], "gasLimit")?;
     let to = fields[3];
-    if to.len() != 20 {
-        return Err("현재는 20바이트 수신 주소 송금만 지원합니다.".into());
+    if !to.is_empty() && to.len() != 20 {
+        return Err("수신 주소는 20바이트이거나, 계약 배포라면 비어 있어야 합니다.".into());
     }
     let amount = value_u128(fields[4], "value")?;
     let action = decode_action(to, fields[5])?;
@@ -58,7 +58,11 @@ pub fn decode_legacy(raw_hex: &str, expected_chain_id: u64) -> Result<Transactio
         .ok_or("gasPrice와 gasLimit의 곱이 u128 범위를 넘습니다.")?;
     Ok(Transaction {
         from,
-        to: format!("0x{}", hex::encode(to)),
+        to: if to.is_empty() {
+            String::new()
+        } else {
+            format!("0x{}", hex::encode(to))
+        },
         amount,
         fee,
         nonce,
@@ -68,11 +72,18 @@ pub fn decode_legacy(raw_hex: &str, expected_chain_id: u64) -> Result<Transactio
 }
 
 fn decode_action(to: &[u8], data: &[u8]) -> Result<TransactionAction, String> {
+    if to.is_empty() {
+        if data.is_empty() {
+            return Err("계약 배포 거래에 바이트코드가 없습니다.".into());
+        }
+        return Ok(TransactionAction::Evm);
+    }
     if data.is_empty() {
         return Ok(TransactionAction::Transfer);
     }
     if format!("0x{}", hex::encode(to)) != crate::staking::STAKING_SYSTEM_ADDRESS {
-        return Err("EVM calldata는 스테이킹 시스템 주소에서만 지원합니다.".into());
+        // 스테이킹 시스템 주소가 아닌 곳의 calldata는 계약 호출입니다(프로토콜 v4부터 허용).
+        return Ok(TransactionAction::Evm);
     }
     let text = std::str::from_utf8(data).map_err(|_| "스테이킹 calldata는 UTF-8이어야 합니다.")?;
     if text == "claim" {
@@ -113,6 +124,43 @@ pub fn verify_embedded(transaction: &Transaction, expected_chain_id: u64) -> Res
     } else {
         Err("raw transaction과 원장 거래 필드가 일치하지 않습니다.".into())
     }
+}
+
+/// EVM으로 실행할 거래의 호출 내용입니다. 계약 거래가 아니면 None.
+/// 일반 송금(raw)도 받는 주소에 코드가 있으면 EVM으로 실행하므로 Transfer도 내용을 돌려줍니다.
+pub fn evm_call(transaction: &Transaction) -> Result<Option<crate::evm::EvmCall>, String> {
+    let Some(raw) = transaction.signature.strip_prefix("ethraw:") else {
+        if matches!(transaction.action, TransactionAction::Evm) {
+            return Err("계약 거래는 Ethereum raw 서명으로만 보낼 수 있습니다.".into());
+        }
+        return Ok(None);
+    };
+    if !matches!(
+        transaction.action,
+        TransactionAction::Evm | TransactionAction::Transfer
+    ) {
+        return Ok(None);
+    }
+    let bytes = hex::decode(raw).map_err(|_| "raw transaction이 올바른 hex가 아닙니다.")?;
+    let fields = decode_list(&bytes)?;
+    if fields.len() != 9 {
+        return Err("legacy RLP 거래 필드 수가 9개가 아닙니다.".into());
+    }
+    let caller = crate::evm::parse_address(&transaction.from)?;
+    let to = if fields[3].is_empty() {
+        None
+    } else {
+        Some(revm::primitives::Address::from_slice(fields[3]))
+    };
+    Ok(Some(crate::evm::EvmCall {
+        caller,
+        to,
+        value: transaction.amount,
+        data: fields[5].to_vec(),
+        gas_limit: value_u64(fields[2], "gasLimit")?,
+        gas_price: u128::from(value_u64(fields[1], "gasPrice")?),
+        nonce: transaction.nonce,
+    }))
 }
 
 /// Ethereum 지갑이 계산하는 거래 해시(keccak256(raw))입니다. raw 거래가 아니면 None.
@@ -311,13 +359,38 @@ pub(crate) fn sign_legacy_for_test(
     gas_price: u64,
     gas_limit: u64,
 ) -> String {
+    sign_legacy_raw_for_test(
+        private_key,
+        &to,
+        amount,
+        data,
+        chain_id,
+        nonce,
+        gas_price,
+        gas_limit,
+    )
+}
+
+/// 계약 배포(`to` 빈 값)도 서명할 수 있는 테스트용 서명 함수입니다.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn sign_legacy_raw_for_test(
+    private_key: [u8; 32],
+    to: &[u8],
+    amount: u128,
+    data: &[u8],
+    chain_id: u64,
+    nonce: u64,
+    gas_price: u64,
+    gas_limit: u64,
+) -> String {
     use k256::ecdsa::SigningKey;
 
     let fields = [
         encode_u64(nonce),
         encode_u64(gas_price),
         encode_u64(gas_limit),
-        encode_bytes(&to),
+        encode_bytes(to),
         encode_u128(amount),
         encode_bytes(data),
         encode_u64(chain_id),
@@ -336,7 +409,7 @@ pub(crate) fn sign_legacy_for_test(
             encode_u64(nonce),
             encode_u64(gas_price),
             encode_u64(gas_limit),
-            encode_bytes(&to),
+            encode_bytes(to),
             encode_u128(amount),
             encode_bytes(data),
             encode_u64(35 + chain_id * 2 + u64::from(recovery_id.to_byte())),

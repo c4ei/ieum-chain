@@ -262,6 +262,8 @@ impl ConsensusRuntime {
             return Err("제안 블록이 현재 체인의 다음 블록이 아닙니다.".into());
         }
         self.validate_scheduled_block(&proposal.block)?;
+        // 확정 뒤 적용에 실패할 블록(잔액·nonce·EVM 오류)에는 투표하지 않아 체인 정지를 막습니다.
+        self.chain.check_block(&proposal.block)?;
         self.consensus.handle_proposal(&proposal)?;
         self.pending = Some(proposal.block.clone());
         self.reset_deadline();
@@ -671,7 +673,7 @@ impl ConsensusRuntime {
         if snapshot.height <= self.chain.tip_height() {
             return Ok(());
         }
-        let chain = Blockchain::from_snapshot_with_staking(
+        let mut chain = Blockchain::from_snapshot_with_staking(
             snapshot.chain_id,
             snapshot.genesis_commitment.clone(),
             snapshot.height,
@@ -681,6 +683,7 @@ impl ConsensusRuntime {
             snapshot.executed_events.clone(),
             snapshot.staking.clone(),
         )?;
+        chain.restore_evm(snapshot.evm.clone(), Default::default());
         if chain.state_hash() != snapshot.state_hash {
             return Err("snapshot을 복원한 상태 루트가 인증 값과 다릅니다.".into());
         }
@@ -867,6 +870,16 @@ impl ConsensusRuntime {
         let protocol = self.upgrade_schedule.version_at(block.height);
         if protocol<3 && (block.transactions.iter().any(|tx|!tx.action.is_transfer()) || block.system_events.iter().any(|event|matches!(&event.action,crate::scheduled_event::ScheduledEventAction::DoubleVoteSlash{..}|crate::scheduled_event::ScheduledEventAction::DelegationDailyReward{..}|crate::scheduled_event::ScheduledEventAction::NodeServiceDailyReward{..}))) {
             return Err("위임·페널티 기능은 프로토콜 v3 활성화 높이 이전에 사용할 수 없습니다.".into());
+        }
+        if protocol < crate::evm::EVM_PROTOCOL_VERSION
+            && block
+                .transactions
+                .iter()
+                .any(|tx| matches!(tx.action, crate::model::TransactionAction::Evm))
+        {
+            return Err(
+                "계약 거래는 프로토콜 v4(EVM) 활성화 높이 이전에 사용할 수 없습니다.".into(),
+            );
         }
         for transaction in &block.transactions {
             if let crate::model::TransactionAction::Delegate { validator } = &transaction.action

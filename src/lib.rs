@@ -10,6 +10,7 @@ pub mod consensus_runtime;
 pub mod consensus_wal;
 pub mod embedded_db;
 pub mod evidence_store;
+pub mod evm;
 pub mod finality_store;
 pub mod genesis;
 pub mod holder_rewards;
