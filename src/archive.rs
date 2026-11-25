@@ -24,6 +24,8 @@ pub struct StateSnapshot {
     pub executed_events: HashSet<String>,
     #[serde(default)]
     pub staking: crate::staking::StakingState,
+    #[serde(default, skip_serializing_if = "crate::evm::EvmState::is_empty")]
+    pub evm: crate::evm::EvmState,
 }
 
 impl StateSnapshot {
@@ -38,6 +40,7 @@ impl StateSnapshot {
             next_nonces: chain.nonces_snapshot(),
             executed_events: chain.executed_events().clone(),
             staking: chain.staking_snapshot(),
+            evm: chain.evm().clone(),
         }
     }
 }

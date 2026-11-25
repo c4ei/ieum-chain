@@ -382,6 +382,7 @@ mod tests {
             next_nonces: HashMap::new(),
             executed_events: std::collections::HashSet::new(),
             staking: crate::staking::StakingState::default(),
+            evm: Default::default(),
         }
     }
 

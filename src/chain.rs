@@ -1,3 +1,4 @@
+use crate::evm::{EvmReceipt, EvmState};
 use crate::model::{Address, Block, Transaction, TransactionAction};
 use crate::staking::StakingState;
 use crate::wallet::verify_transaction;
@@ -27,6 +28,12 @@ pub struct Blockchain {
     executed_events: HashSet<String>,
     #[serde(default)]
     staking: StakingState,
+    /// 계약 코드·스토리지(프로토콜 v4). 비어 있으면 기존 형식과 같게 저장합니다.
+    #[serde(default, skip_serializing_if = "EvmState::is_empty")]
+    evm: EvmState,
+    /// 계약 거래 영수증(거래 ID → 결과). 조회용이며 상태 해시에는 넣지 않습니다.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    evm_receipts: HashMap<String, EvmReceipt>,
 }
 
 impl Blockchain {
@@ -46,6 +53,8 @@ impl Blockchain {
             next_nonces: HashMap::new(),
             executed_events: HashSet::new(),
             staking: StakingState::default(),
+            evm: EvmState::default(),
+            evm_receipts: HashMap::new(),
         }
     }
 
@@ -111,6 +120,8 @@ impl Blockchain {
             next_nonces,
             executed_events,
             staking: StakingState::default(),
+            evm: EvmState::default(),
+            evm_receipts: HashMap::new(),
         })
     }
 
@@ -168,6 +179,29 @@ impl Blockchain {
     pub fn staking(&self) -> &StakingState {
         &self.staking
     }
+    pub fn evm(&self) -> &EvmState {
+        &self.evm
+    }
+
+    pub fn evm_receipt(&self, transaction_id: &str) -> Option<&EvmReceipt> {
+        self.evm_receipts.get(transaction_id)
+    }
+
+    pub fn evm_receipts(&self) -> &HashMap<String, EvmReceipt> {
+        &self.evm_receipts
+    }
+
+    /// snapshot·상태 DB에서 복원한 계약 상태를 넣습니다. 상태 해시 비교 전에 호출해야 합니다.
+    pub fn restore_evm(&mut self, evm: EvmState, receipts: HashMap<String, EvmReceipt>) {
+        self.evm = evm;
+        self.evm_receipts = receipts;
+    }
+
+    /// 확정된 상태에서 시뮬레이션(eth_call)할 때 쓰는 읽기 전용 상태입니다.
+    pub fn execution_state(&self) -> (&HashMap<Address, u128>, &HashMap<Address, u64>, &EvmState) {
+        (&self.balances, &self.next_nonces, &self.evm)
+    }
+
     pub fn staking_snapshot(&self) -> StakingState {
         self.staking.clone()
     }
@@ -231,14 +265,16 @@ impl Blockchain {
         let mut balances = self.balances.clone();
         let mut nonces = self.next_nonces.clone();
         let mut staking = self.staking.clone();
+        let mut evm = self.evm.clone();
+        let mut receipts = HashMap::new();
         apply_transactions(
             self.chain_id,
-            &block.transactions,
-            &block.producer,
+            &block,
             &mut balances,
             &mut nonces,
             &mut staking,
-            block.timestamp,
+            &mut evm,
+            &mut receipts,
         )?;
         let mut executed_events = self.executed_events.clone();
         apply_system_events(
@@ -254,7 +290,94 @@ impl Blockchain {
         self.next_nonces = nonces;
         self.executed_events = executed_events;
         self.staking = staking;
+        self.evm = evm;
+        self.evm_receipts.extend(receipts);
         Ok(self.blocks.last().unwrap())
+    }
+
+    /// 확정 전에 블록을 실제로 적용해 보고, 실패하면 이유를 돌려줍니다(상태는 바꾸지 않음).
+    pub fn check_block(&self, block: &Block) -> Result<(), String> {
+        let mut balances = self.balances.clone();
+        let mut nonces = self.next_nonces.clone();
+        let mut staking = self.staking.clone();
+        let mut evm = self.evm.clone();
+        let mut receipts = HashMap::new();
+        apply_transactions(
+            self.chain_id,
+            block,
+            &mut balances,
+            &mut nonces,
+            &mut staking,
+            &mut evm,
+            &mut receipts,
+        )?;
+        let mut executed_events = self.executed_events.clone();
+        apply_system_events(
+            &block.system_events,
+            block.timestamp,
+            &mut balances,
+            &mut executed_events,
+            &mut staking,
+        )?;
+        validate_supply_cap(&balances, &staking)
+    }
+
+    /// 제안자가 블록에 넣을 거래를 고릅니다. 앞 거래부터 차례로 적용해 보고 실패하는 거래는 뺍니다.
+    /// 반환값: (넣을 거래, 뺀 거래와 이유)
+    pub fn select_executable(
+        &self,
+        height: u64,
+        timestamp: u64,
+        producer: &str,
+        candidates: Vec<Transaction>,
+    ) -> (Vec<Transaction>, Vec<(Transaction, String)>) {
+        let mut balances = self.balances.clone();
+        let mut nonces = self.next_nonces.clone();
+        let mut staking = self.staking.clone();
+        let mut evm = self.evm.clone();
+        let mut selected = Vec::new();
+        let mut rejected = Vec::new();
+        let mut gas = 0u64;
+        for transaction in candidates {
+            let tx_gas = crate::evm::block_gas(std::slice::from_ref(&transaction)).unwrap_or(0);
+            if gas.saturating_add(tx_gas) > crate::evm::BLOCK_GAS_LIMIT {
+                rejected.push((transaction, "블록 가스 한도 초과(다음 블록으로)".into()));
+                continue;
+            }
+            let probe = Block {
+                height,
+                previous_hash: String::new(),
+                timestamp,
+                producer: producer.to_string(),
+                transactions: vec![transaction.clone()],
+                system_events: vec![],
+                hash: String::new(),
+            };
+            let (mut b, mut n, mut s, mut e) = (
+                balances.clone(),
+                nonces.clone(),
+                staking.clone(),
+                evm.clone(),
+            );
+            let mut receipts = HashMap::new();
+            match apply_transactions(
+                self.chain_id,
+                &probe,
+                &mut b,
+                &mut n,
+                &mut s,
+                &mut e,
+                &mut receipts,
+            ) {
+                Ok(()) => {
+                    (balances, nonces, staking, evm) = (b, n, s, e);
+                    gas += tx_gas;
+                    selected.push(transaction);
+                }
+                Err(error) => rejected.push((transaction, error)),
+            }
+        }
+        (selected, rejected)
     }
 
     /// 저장 파일을 읽은 뒤 제네시스부터 모든 잔액과 nonce를 다시 계산합니다.
@@ -263,6 +386,8 @@ impl Blockchain {
         let mut nonces = HashMap::new();
         let mut executed_events = HashSet::new();
         let mut staking = StakingState::default();
+        let mut evm = EvmState::default();
+        let mut receipts = HashMap::new();
         let Some(genesis) = self.blocks.first() else {
             return Err("제네시스 블록이 없습니다.".into());
         };
@@ -285,12 +410,12 @@ impl Blockchain {
                 }
                 apply_transactions(
                     self.chain_id,
-                    &block.transactions,
-                    &block.producer,
+                    block,
                     &mut balances,
                     &mut nonces,
                     &mut staking,
-                    block.timestamp,
+                    &mut evm,
+                    &mut receipts,
                 )?;
                 apply_system_events(
                     &block.system_events,
@@ -306,6 +431,8 @@ impl Blockchain {
         self.next_nonces = nonces;
         self.executed_events = executed_events;
         self.staking = staking;
+        self.evm = evm;
+        self.evm_receipts = receipts;
         Ok(())
     }
 
@@ -331,6 +458,9 @@ impl Blockchain {
         {
             hasher.update(b"staking-v1:");
             hasher.update(self.staking.state_bytes());
+        }
+        if !self.evm.is_empty() {
+            self.evm.hash_into(&mut hasher, &self.next_nonces);
         }
         hex::encode(hasher.finalize())
     }
@@ -470,31 +600,38 @@ fn transfer_from_foundation(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn apply_transactions(
     chain_id: u64,
-    transactions: &[Transaction],
-    producer: &str,
+    block: &Block,
     balances: &mut HashMap<Address, u128>,
     nonces: &mut HashMap<Address, u64>,
     staking: &mut StakingState,
-    block_timestamp: u64,
+    evm: &mut EvmState,
+    receipts: &mut HashMap<String, EvmReceipt>,
 ) -> Result<(), String> {
+    let producer = block.producer.as_str();
+    let block_timestamp = block.timestamp;
+    let mut block_gas = 0u64;
     // 블록 하나를 원자적으로 처리하기 위해 복제된 상태에 먼저 적용합니다.
     // 하나라도 실패하면 호출자가 원래 balances/nonces를 그대로 유지합니다.
-    for tx in transactions {
+    for (index, tx) in block.transactions.iter().enumerate() {
         if tx.signature.starts_with("ethraw:") {
             crate::raw_transaction::verify_embedded(tx, chain_id)?;
         } else {
             verify_transaction(tx)?;
         }
-        if !tx.action.is_transfer()
-            && normalize_address(&tx.to) != crate::staking::STAKING_SYSTEM_ADDRESS
-        {
+        let is_evm = crate::evm::is_evm_transaction(tx, evm);
+        let is_staking = matches!(
+            &tx.action,
+            TransactionAction::Delegate { .. }
+                | TransactionAction::Undelegate { .. }
+                | TransactionAction::ClaimUnbonded
+        );
+        if is_staking && normalize_address(&tx.to) != crate::staking::STAKING_SYSTEM_ADDRESS {
             return Err("위임 거래의 수신 주소는 스테이킹 시스템 주소여야 합니다.".into());
         }
-        if tx.action.is_transfer()
-            && normalize_address(&tx.to) == crate::staking::STAKING_SYSTEM_ADDRESS
-        {
+        if !is_staking && normalize_address(&tx.to) == crate::staking::STAKING_SYSTEM_ADDRESS {
             return Err(
                 "스테이킹 시스템 주소로 일반 송금할 수 없습니다. 위임 calldata가 필요합니다."
                     .into(),
@@ -503,7 +640,7 @@ fn apply_transactions(
         if matches!(&tx.action, TransactionAction::ClaimUnbonded) && tx.amount != 0 {
             return Err("해제 청구 거래의 amount는 0이어야 합니다.".into());
         }
-        if tx.amount == 0 && !matches!(&tx.action, TransactionAction::ClaimUnbonded) {
+        if tx.amount == 0 && !is_evm && !matches!(&tx.action, TransactionAction::ClaimUnbonded) {
             return Err("송금액은 0보다 커야 합니다.".into());
         }
         let expected_nonce = nonces.get(&tx.from).copied().unwrap_or(0);
@@ -512,6 +649,28 @@ fn apply_transactions(
                 "nonce 오류: 기대 {expected_nonce}, 입력 {}",
                 tx.nonce
             ));
+        }
+        if is_evm {
+            let call =
+                crate::raw_transaction::evm_call(tx)?.ok_or("EVM 거래 내용을 읽지 못했습니다.")?;
+            block_gas = block_gas
+                .checked_add(call.gas_limit)
+                .filter(|gas| *gas <= crate::evm::BLOCK_GAS_LIMIT)
+                .ok_or("블록 가스 한도(30,000,000)를 넘었습니다.")?;
+            let context = crate::evm::BlockContext {
+                chain_id,
+                height: block.height,
+                timestamp: block_timestamp,
+                producer,
+            };
+            let (mut receipt, fee) =
+                crate::evm::execute_transaction(context, &call, balances, nonces, evm)?;
+            receipt.height = block.height;
+            receipt.index = index;
+            receipts.insert(tx.id(), receipt);
+            distribute_fee(balances, producer, fee)?;
+            nonces.insert(tx.from.clone(), expected_nonce + 1);
+            continue;
         }
         let debit_amount = if matches!(
             &tx.action,
@@ -551,30 +710,38 @@ fn apply_transactions(
                     "해제 청구 잔액이 u128 범위를 넘습니다.",
                 )?;
             }
+            TransactionAction::Evm => unreachable!("EVM 거래는 위에서 처리합니다."),
         }
-        // 재단 몫을 먼저 내림 계산하고 나머지 전부를 생성자에게 지급합니다.
-        // 따라서 아주 작은 수수료의 나머지도 소각되거나 유실되지 않습니다.
-        let foundation_fee = tx
-            .fee
-            .checked_mul(FOUNDATION_FEE_BPS)
-            .ok_or("재단 수수료 계산이 u128 범위를 넘습니다.")?
-            / FEE_BPS_DENOMINATOR;
-        let producer_fee = tx.fee - foundation_fee;
-        credit_balance(
-            balances,
-            producer,
-            producer_fee,
-            "블록 생성자 보상 잔액이 u128 범위를 넘습니다.",
-        )?;
-        credit_balance(
-            balances,
-            FOUNDATION_FEE_ADDRESS,
-            foundation_fee,
-            "재단 수수료 잔액이 u128 범위를 넘습니다.",
-        )?;
+        distribute_fee(balances, producer, tx.fee)?;
         nonces.insert(tx.from.clone(), expected_nonce + 1);
     }
     Ok(())
+}
+
+/// 재단 몫을 먼저 내림 계산하고 나머지 전부를 생성자에게 지급합니다.
+/// 따라서 아주 작은 수수료의 나머지도 소각되거나 유실되지 않습니다.
+fn distribute_fee(
+    balances: &mut HashMap<Address, u128>,
+    producer: &str,
+    fee: u128,
+) -> Result<(), String> {
+    let foundation_fee = fee
+        .checked_mul(FOUNDATION_FEE_BPS)
+        .ok_or("재단 수수료 계산이 u128 범위를 넘습니다.")?
+        / FEE_BPS_DENOMINATOR;
+    let producer_fee = fee - foundation_fee;
+    credit_balance(
+        balances,
+        producer,
+        producer_fee,
+        "블록 생성자 보상 잔액이 u128 범위를 넘습니다.",
+    )?;
+    credit_balance(
+        balances,
+        FOUNDATION_FEE_ADDRESS,
+        foundation_fee,
+        "재단 수수료 잔액이 u128 범위를 넘습니다.",
+    )
 }
 
 fn credit_balance(

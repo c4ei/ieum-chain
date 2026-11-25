@@ -16,7 +16,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const PROTOCOL_VERSION: &str = "3";
+const PROTOCOL_VERSION: &str = "4";
 const MIN_COMPATIBLE_PROTOCOL_VERSION: &str = "2";
 
 /// geth/web3 도구가 접속할 HTTP JSON-RPC 설정입니다.
@@ -252,6 +252,7 @@ impl RpcNodeHandle {
                 &transaction.action,
                 crate::model::TransactionAction::Transfer
                     | crate::model::TransactionAction::Delegate { .. }
+                    | crate::model::TransactionAction::Evm
             ) {
                 transaction.amount
             } else {
@@ -292,7 +293,7 @@ impl RpcNodeHandle {
         {
             return Err("다른 체인의 snapshot을 RPC 상태에 설치할 수 없습니다.".into());
         }
-        let chain = Blockchain::from_snapshot_with_staking(
+        let mut chain = Blockchain::from_snapshot_with_staking(
             snapshot.chain_id,
             snapshot.genesis_commitment.clone(),
             snapshot.height,
@@ -302,6 +303,7 @@ impl RpcNodeHandle {
             snapshot.executed_events.clone(),
             snapshot.staking.clone(),
         )?;
+        chain.restore_evm(snapshot.evm.clone(), Default::default());
         if chain.state_hash() != snapshot.state_hash {
             return Err("snapshot RPC 복원 상태 루트가 인증 값과 다릅니다.".into());
         }
@@ -438,6 +440,7 @@ impl RpcServer {
                 state.staking,
             )
             .expect("embedded DB 상태를 복원할 수 있어야 합니다.");
+            chain.restore_evm(state.evm, state.evm_receipts);
             assert_eq!(
                 chain.state_hash(),
                 state.state_root,
@@ -463,6 +466,7 @@ impl RpcServer {
                 snapshot.staking,
             )
             .expect("체크포인트 상태를 복원할 수 있어야 합니다.");
+            chain.restore_evm(snapshot.evm, Default::default());
             assert_eq!(
                 chain.state_hash(),
                 snapshot.state_hash,
@@ -603,6 +607,11 @@ fn rpc_response(state: &Arc<RwLock<RpcState>>, request: &Value) -> Value {
     }
     match result {
         Ok(value) => json!({"jsonrpc": "2.0", "id": id, "result": value}),
+        // 코드 3(execution reverted)은 "메시지\n0x데이터" 형식으로 revert 데이터를 함께 돌려줍니다.
+        Err((3, message)) => {
+            let (message, data) = message.split_once('\n').unwrap_or((message.as_str(), "0x"));
+            json!({"jsonrpc": "2.0", "id": id, "error": {"code": 3, "message": message, "data": data}})
+        }
         Err((code, message)) => {
             json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}})
         }
@@ -799,10 +808,47 @@ fn dispatch(
             Ok(json!(quantity(nonce)))
         }
         "eth_gasPrice" => Ok(json!("0x1")),
-        "eth_estimateGas" => Ok(json!("0x5208")),
-        "eth_getCode" => Ok(json!("0x")),
-        "eth_call" => Ok(json!("0x")),
-        "eth_getLogs" => Ok(json!([])),
+        "eth_estimateGas" => {
+            let state = read_state(state)?;
+            estimate_gas(&state, params)
+        }
+        "eth_getCode" => {
+            let address = string_param(params, 0)?;
+            let state = read_state(state)?;
+            Ok(json!(
+                state
+                    .chain
+                    .evm()
+                    .code_of(address)
+                    .cloned()
+                    .unwrap_or_else(|| "0x".into())
+            ))
+        }
+        "eth_getStorageAt" => {
+            let address = string_param(params, 0)?;
+            let slot = parse_u256(string_param(params, 1)?)?;
+            let state = read_state(state)?;
+            let value = state.chain.evm().storage_at(address, slot);
+            Ok(json!(format!(
+                "0x{}",
+                hex::encode(value.to_be_bytes::<32>())
+            )))
+        }
+        "eth_call" => {
+            let state = read_state(state)?;
+            let call = simulation_call(&state, params, crate::evm::CALL_GAS_LIMIT)?;
+            let result = simulate_call(&state, &call)?;
+            if result.success {
+                Ok(json!(format!("0x{}", hex::encode(result.output))))
+            } else {
+                Err(revert_error(&result))
+            }
+        }
+        "eth_getLogs" => {
+            let filter = params.first().cloned().unwrap_or(Value::Null);
+            let state = read_state(state)?;
+            Ok(Value::Array(logs_matching(&state.chain, &filter)?))
+        }
         "eth_getUncleCountByBlockHash" | "eth_getUncleCountByBlockNumber" => Ok(json!("0x0")),
         // EIP-1559가 없는 legacy 체인입니다. 우선 수수료는 0, 기본 수수료는 0으로 응답합니다.
         "eth_maxPriorityFeePerGas" => Ok(json!("0x0")),
@@ -948,14 +994,57 @@ fn dispatch(
                 });
             Ok(transaction
                 .map(|(block, index, transaction)| {
-                    let (gas_price, gas_limit) =
+                    let (gas_price, mut gas_limit) =
                         crate::raw_transaction::ethereum_fee_terms(&transaction);
+                    let gas_of = |item: &Transaction| {
+                        state
+                            .chain
+                            .evm_receipt(&item.id())
+                            .map(|receipt| u128::from(receipt.gas_used))
+                            .unwrap_or_else(|| crate::raw_transaction::ethereum_fee_terms(item).1)
+                    };
                     let cumulative_gas = block
                         .transactions
                         .iter()
                         .take(index.saturating_add(1))
-                        .map(|item| crate::raw_transaction::ethereum_fee_terms(item).1)
+                        .map(gas_of)
                         .fold(0_u128, u128::saturating_add);
+                    if let Some(receipt) = state.chain.evm_receipt(&transaction.id()) {
+                        gas_limit = u128::from(receipt.gas_used);
+                        let first_log_index = block
+                            .transactions
+                            .iter()
+                            .take(index)
+                            .filter_map(|item| state.chain.evm_receipt(&item.id()))
+                            .map(|item| item.logs.len())
+                            .sum::<usize>();
+                        let logs: Vec<Value> = receipt
+                            .logs
+                            .iter()
+                            .enumerate()
+                            .map(|(position, log)| {
+                                log_json(log, &block, index, &transaction, first_log_index + position)
+                            })
+                            .collect();
+                        return json!({
+                            "transactionHash": format!("0x{}", transaction.id()),
+                            "transactionIndex": quantity(index as u64),
+                            "blockHash": format!("0x{}", block.hash),
+                            "blockNumber": quantity(block.height),
+                            "from": transaction.from,
+                            "to": if transaction.to.is_empty() { Value::Null } else { json!(transaction.to) },
+                            "cumulativeGasUsed": quantity_u128(cumulative_gas),
+                            "gasUsed": quantity_u128(gas_limit),
+                            "effectiveGasPrice": quantity_u128(gas_price),
+                            "logs": logs,
+                            "logsBloom": logs_bloom(&receipt.logs),
+                            "status": if receipt.status { "0x1" } else { "0x0" },
+                            "type": "0x0",
+                            "contractAddress": receipt.contract_address,
+                            "revertData": if receipt.status { Value::Null } else { json!(receipt.output) },
+                            "ethereumHash": crate::raw_transaction::ethereum_hash(&transaction)
+                        });
+                    }
                     json!({
                         "transactionHash": format!("0x{}", transaction.id()),
                         "transactionIndex": quantity(index as u64),
@@ -1431,6 +1520,13 @@ fn dispatch(
             let transaction: Transaction = serde_json::from_value(value)
                 .map_err(|error| (-32602, format!("서명 거래 형식 오류: {error}")))?;
             crate::wallet::verify_transaction(&transaction).map_err(|message| (-32000, message))?;
+            if matches!(transaction.action, crate::model::TransactionAction::Evm) {
+                return Err((
+                    -32000,
+                    "계약 거래는 eth_sendRawTransaction(Ethereum 서명)으로만 보낼 수 있습니다."
+                        .into(),
+                ));
+            }
             {
                 let guard = read_state(state)?;
                 if !transaction.action.is_transfer()
@@ -1513,12 +1609,42 @@ fn send_raw_transaction(
     let mut state = write_state(shared)?;
     let transaction = crate::raw_transaction::decode_legacy(raw, state.chain_id)
         .map_err(|message| (-32000, message))?;
-    if !transaction.action.is_transfer()
-        && state
-            .upgrade_schedule
-            .version_at(state.chain.tip_height().saturating_add(1))
-            < 3
-    {
+    let protocol = state
+        .upgrade_schedule
+        .version_at(state.chain.tip_height().saturating_add(1));
+    if crate::evm::is_evm_transaction(&transaction, state.chain.evm()) {
+        if protocol < crate::evm::EVM_PROTOCOL_VERSION {
+            return Err((
+                -32000,
+                "계약 배포·호출은 프로토콜 v4(EVM) 활성화 높이 이후에 제출할 수 있습니다.".into(),
+            ));
+        }
+        let call = crate::raw_transaction::evm_call(&transaction)
+            .map_err(|message| (-32000, message))?
+            .ok_or_else(|| (-32000, "계약 거래 내용을 읽지 못했습니다.".to_string()))?;
+        if call.gas_limit > crate::evm::BLOCK_GAS_LIMIT {
+            return Err((
+                -32000,
+                "gasLimit이 블록 가스 한도(30,000,000)를 넘습니다.".into(),
+            ));
+        }
+        let required = u128::from(call.gas_limit)
+            .checked_mul(call.gas_price)
+            .and_then(|fee| fee.checked_add(call.value));
+        if required.is_none_or(|needed| state.chain.balance_of(&transaction.from) < needed) {
+            return Err((
+                -32000,
+                "잔액이 value + gasLimit × gasPrice보다 적습니다.".into(),
+            ));
+        }
+    }
+    let is_staking = matches!(
+        &transaction.action,
+        crate::model::TransactionAction::Delegate { .. }
+            | crate::model::TransactionAction::Undelegate { .. }
+            | crate::model::TransactionAction::ClaimUnbonded
+    );
+    if is_staking && protocol < 3 {
         return Err((
             -32000,
             "프로토콜 v3 활성화 높이 전에는 위임 거래를 제출할 수 없습니다.".into(),
@@ -1784,6 +1910,261 @@ fn ethereum_signature_json(transaction: &Transaction) -> (String, String, String
         .unwrap_or_else(|| ("0x1b".into(), ZERO_HASH.into(), ZERO_HASH.into()))
 }
 
+/// 거래 조회 응답의 input: raw 거래는 실제 calldata, IEUM 위임 거래는 기존처럼 action JSON입니다.
+fn transaction_input(transaction: &Transaction) -> String {
+    match &transaction.action {
+        crate::model::TransactionAction::Transfer | crate::model::TransactionAction::Evm => {
+            match crate::raw_transaction::evm_call(transaction) {
+                Ok(Some(call)) => format!("0x{}", hex::encode(call.data)),
+                _ => "0x".into(),
+            }
+        }
+        action => format!(
+            "0x{}",
+            hex::encode(serde_json::to_vec(action).unwrap_or_default())
+        ),
+    }
+}
+
+fn parse_u256(text: &str) -> Result<revm::primitives::U256, (i64, String)> {
+    revm::primitives::U256::from_str_radix(text.trim_start_matches("0x"), 16)
+        .map_err(|_| (-32602, format!("256비트 16진 값이 아닙니다: {text}")))
+}
+
+/// eth_call·eth_estimateGas의 호출 객체({from,to,data|input,value,gas})를 읽습니다.
+fn simulation_call(
+    state: &RpcState,
+    params: &[Value],
+    default_gas: u64,
+) -> Result<crate::evm::EvmCall, (i64, String)> {
+    let object = params
+        .first()
+        .and_then(Value::as_object)
+        .ok_or_else(|| (-32602, "호출 객체가 필요합니다.".to_string()))?;
+    let text = |key: &str| object.get(key).and_then(Value::as_str);
+    let caller = text("from")
+        .and_then(|from| crate::evm::parse_address(from).ok())
+        .unwrap_or_default();
+    let to = match text("to") {
+        Some(to) if !to.is_empty() => {
+            Some(crate::evm::parse_address(to).map_err(|message| (-32602, message))?)
+        }
+        _ => None,
+    };
+    let data = text("input")
+        .or_else(|| text("data"))
+        .map(|data| hex::decode(data.trim_start_matches("0x")))
+        .transpose()
+        .map_err(|_| (-32602, "data가 올바른 hex가 아닙니다.".to_string()))?
+        .unwrap_or_default();
+    let value = text("value")
+        .map(parse_quantity_u128)
+        .transpose()?
+        .unwrap_or(0);
+    let gas_limit = text("gas")
+        .map(parse_quantity_u64)
+        .transpose()?
+        .unwrap_or(default_gas)
+        .min(crate::evm::BLOCK_GAS_LIMIT);
+    let caller_key = crate::evm::address_key(caller);
+    Ok(crate::evm::EvmCall {
+        caller,
+        to,
+        value,
+        data,
+        gas_limit,
+        gas_price: 0,
+        nonce: state.chain.next_nonce(&caller_key),
+    })
+}
+
+fn simulate_call(
+    state: &RpcState,
+    call: &crate::evm::EvmCall,
+) -> Result<crate::evm::SimulationResult, (i64, String)> {
+    let (balances, nonces, evm) = state.chain.execution_state();
+    let context = crate::evm::BlockContext {
+        chain_id: state.chain_id,
+        height: state.chain.tip_height().saturating_add(1),
+        timestamp: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .unwrap_or_default(),
+        producer: "simulation",
+    };
+    crate::evm::simulate(context, call, balances, nonces, evm).map_err(|message| (-32000, message))
+}
+
+fn revert_error(result: &crate::evm::SimulationResult) -> (i64, String) {
+    let data = format!("0x{}", hex::encode(&result.output));
+    let reason = revert_reason(&result.output)
+        .map(|reason| format!("execution reverted: {reason}"))
+        .unwrap_or_else(|| {
+            if result.halted {
+                "execution halted (out of gas 또는 잘못된 명령)".into()
+            } else {
+                "execution reverted".into()
+            }
+        });
+    (3, format!("{reason}\n{data}"))
+}
+
+/// Solidity `Error(string)` revert 데이터에서 이유 문자열을 꺼냅니다.
+fn revert_reason(output: &[u8]) -> Option<String> {
+    if output.len() < 68 || output[..4] != [0x08, 0xc3, 0x79, 0xa0] {
+        return None;
+    }
+    let length = usize::try_from(revm::primitives::U256::from_be_slice(&output[36..68])).ok()?;
+    let bytes = output.get(68..68usize.checked_add(length)?)?;
+    String::from_utf8(bytes.to_vec()).ok()
+}
+
+/// 성공하는 가장 작은 gasLimit을 이분 탐색으로 찾습니다(환불·63/64 규칙 때문에 gasUsed보다 클 수 있음).
+fn estimate_gas(state: &RpcState, params: &[Value]) -> Result<Value, (i64, String)> {
+    let mut call = simulation_call(state, params, crate::evm::CALL_GAS_LIMIT)?;
+    let upper = call.gas_limit;
+    let first = simulate_call(state, &call)?;
+    if !first.success {
+        return Err(revert_error(&first));
+    }
+    let (mut low, mut high) = (first.gas_used.saturating_sub(1), upper);
+    while low + 1 < high {
+        let middle = low + (high - low) / 2;
+        call.gas_limit = middle;
+        match simulate_call(state, &call) {
+            Ok(result) if result.success => high = middle,
+            _ => low = middle,
+        }
+    }
+    Ok(json!(quantity(high)))
+}
+
+fn log_json(
+    log: &crate::evm::EvmLog,
+    block: &Block,
+    index: usize,
+    transaction: &Transaction,
+    log_index: usize,
+) -> Value {
+    json!({
+        "address": log.address,
+        "topics": log.topics,
+        "data": log.data,
+        "blockNumber": quantity(block.height),
+        "blockHash": format!("0x{}", block.hash),
+        "transactionHash": format!("0x{}", transaction.id()),
+        "transactionIndex": quantity(index as u64),
+        "logIndex": quantity(log_index as u64),
+        "removed": false
+    })
+}
+
+/// 2048비트 블룸 필터(EIP 표준: 주소·토픽마다 keccak의 3개 11비트 위치)입니다.
+fn logs_bloom(logs: &[crate::evm::EvmLog]) -> String {
+    let mut bloom = [0u8; 256];
+    let mut add = |item: &[u8]| {
+        let hash = sha3::Keccak256::digest(item);
+        for pair in [0usize, 2, 4] {
+            let bit = (usize::from(hash[pair]) << 8 | usize::from(hash[pair + 1])) & 2047;
+            bloom[255 - bit / 8] |= 1 << (bit % 8);
+        }
+    };
+    for log in logs {
+        if let Ok(address) = hex::decode(log.address.trim_start_matches("0x")) {
+            add(&address);
+        }
+        for topic in &log.topics {
+            if let Ok(topic) = hex::decode(topic.trim_start_matches("0x")) {
+                add(&topic);
+            }
+        }
+    }
+    format!("0x{}", hex::encode(bloom))
+}
+
+/// eth_getLogs 필터(fromBlock, toBlock, blockHash, address, topics)를 활성 블록에 적용합니다.
+fn logs_matching(chain: &Blockchain, filter: &Value) -> Result<Vec<Value>, (i64, String)> {
+    let tip = chain.tip_height();
+    let block_number = |key: &str, default: u64| -> Result<u64, (i64, String)> {
+        match filter.get(key).and_then(Value::as_str) {
+            None | Some("latest") | Some("pending") | Some("safe") | Some("finalized") => {
+                Ok(default)
+            }
+            Some("earliest") => Ok(0),
+            Some(text) => parse_quantity_u64(text),
+        }
+    };
+    let (from, to) = match filter.get("blockHash").and_then(Value::as_str) {
+        Some(hash) => {
+            let block = chain
+                .block_by_hash(hash.trim_start_matches("0x"))
+                .ok_or_else(|| (-32602, "블록을 찾을 수 없습니다.".to_string()))?;
+            (block.height, block.height)
+        }
+        None => (
+            block_number("fromBlock", tip)?,
+            block_number("toBlock", tip)?,
+        ),
+    };
+    if to.saturating_sub(from) > 10_000 {
+        return Err((
+            -32005,
+            "한 번에 10,000블록까지만 조회할 수 있습니다.".into(),
+        ));
+    }
+    let lower = |text: &str| text.to_ascii_lowercase();
+    let addresses: Vec<String> = match filter.get("address") {
+        Some(Value::String(address)) => vec![lower(address)],
+        Some(Value::Array(items)) => items.iter().filter_map(Value::as_str).map(lower).collect(),
+        _ => Vec::new(),
+    };
+    let topics: Vec<Vec<String>> = filter
+        .get("topics")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .map(|item| match item {
+                    Value::String(topic) => vec![lower(topic)],
+                    Value::Array(options) => options
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(lower)
+                        .collect(),
+                    _ => Vec::new(),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut found = Vec::new();
+    for height in from..=to.min(tip) {
+        let Some(block) = chain.block_by_height(height) else {
+            continue;
+        };
+        let mut log_index = 0;
+        for (index, transaction) in block.transactions.iter().enumerate() {
+            let Some(receipt) = chain.evm_receipt(&transaction.id()) else {
+                continue;
+            };
+            for log in &receipt.logs {
+                let address_ok = addresses.is_empty() || addresses.contains(&log.address);
+                let topics_ok = topics.iter().enumerate().all(|(position, options)| {
+                    options.is_empty()
+                        || log
+                            .topics
+                            .get(position)
+                            .is_some_and(|topic| options.contains(&lower(topic)))
+                });
+                if address_ok && topics_ok {
+                    found.push(log_json(log, block, index, transaction, log_index));
+                }
+                log_index += 1;
+            }
+        }
+    }
+    Ok(found)
+}
+
 fn transaction_json(
     block: &Block,
     index: usize,
@@ -1805,14 +2186,11 @@ fn transaction_json(
         "blockNumber": quantity(block.height),
         "transactionIndex": quantity(index as u64),
         "from": transaction.from,
-        "to": transaction.to,
+        "to": if transaction.to.is_empty() { Value::Null } else { json!(transaction.to) },
         "value": quantity_u128(transaction.amount),
         "gas": quantity_u128(gas_limit),
         "gasPrice": quantity_u128(gas_price),
-        "input": match &transaction.action {
-            crate::model::TransactionAction::Transfer=>"0x".into(),
-            action=>format!("0x{}",hex::encode(serde_json::to_vec(action).unwrap_or_default()))
-        },
+        "input": transaction_input(transaction),
         "ieumAction": &transaction.action
     })
 }
@@ -1833,17 +2211,11 @@ fn pending_transaction_json(transaction: &Transaction, chain_id: u64) -> Value {
         "blockNumber": Value::Null,
         "transactionIndex": Value::Null,
         "from": transaction.from,
-        "to": transaction.to,
+        "to": if transaction.to.is_empty() { Value::Null } else { json!(transaction.to) },
         "value": quantity_u128(transaction.amount),
         "gas": quantity_u128(gas_limit),
         "gasPrice": quantity_u128(gas_price),
-        "input": match &transaction.action {
-            crate::model::TransactionAction::Transfer => "0x".into(),
-            action => format!(
-                "0x{}",
-                hex::encode(serde_json::to_vec(action).unwrap_or_default())
-            ),
-        },
+        "input": transaction_input(transaction),
         "ieumAction": &transaction.action,
         "ieumPending": true
     })
@@ -2111,6 +2483,111 @@ mod tests {
         assert_eq!(value["transactions"][0]["gas"], "0x1");
         assert_eq!(value["transactions"][0]["gasPrice"], "0x5208");
         assert!(value["transactions"][0].get("signature").is_none());
+    }
+
+    #[test]
+    fn evm_contract_rpc_flow() {
+        let config = test_rpc_config("evm-contract-flow");
+        let server = RpcServer::new(config);
+        let handle = server.node_handle();
+        let shared = Arc::clone(&server.state);
+        let vault_code =
+            hex::decode(include_str!("../tests/fixtures/evm/Vault.hex").trim()).unwrap();
+        let sign = |to: &[u8], value: u128, data: &[u8], nonce: u64, gas: u64| {
+            crate::raw_transaction::sign_legacy_raw_for_test(
+                [42; 32], to, value, data, 21_004, nonce, 1, gas,
+            )
+        };
+        let finalize = |handle: &RpcNodeHandle| {
+            let transactions = handle.drain_transactions(10).unwrap();
+            let before = handle.chain().unwrap();
+            let mut after = before.clone();
+            after
+                .add_block(
+                    transactions,
+                    "d475e3a8a10a569c05c3d6406bb37adc681f5372e5855ffd76d24d5df91cad5d".into(),
+                )
+                .unwrap();
+            let finalized = after.blocks.last().unwrap().clone();
+            handle
+                .install_finalized(&before, after, &finalized)
+                .unwrap();
+        };
+
+        // 활성 높이 전에는 배포 거래를 받지 않는다
+        let deploy = sign(&[], 0, &vault_code, 0, 1_000_000);
+        let error = dispatch(&shared, "eth_sendRawTransaction", &[json!(deploy)]).unwrap_err();
+        assert!(error.1.contains("v4"), "{}", error.1);
+
+        shared.write().unwrap().upgrade_schedule = crate::upgrade::UpgradeSchedule {
+            upgrades: vec![crate::upgrade::ProtocolUpgrade {
+                name: "evm-v1".into(),
+                activation_height: 0,
+                protocol_version: crate::evm::EVM_PROTOCOL_VERSION,
+            }],
+        };
+        let hash = dispatch(&shared, "eth_sendRawTransaction", &[json!(deploy)]).unwrap();
+        finalize(&handle);
+        let receipt = dispatch(&shared, "eth_getTransactionReceipt", &[hash]).unwrap();
+        assert_eq!(receipt["status"], json!("0x1"));
+        let vault = receipt["contractAddress"].as_str().unwrap().to_string();
+        let code = dispatch(&shared, "eth_getCode", &[json!(vault), json!("latest")]).unwrap();
+        assert!(code.as_str().unwrap().len() > 10);
+
+        let gas = dispatch(
+            &shared,
+            "eth_estimateGas",
+            &[json!({"from": receipt["from"], "to": vault, "value": "0x64"})],
+        )
+        .unwrap();
+        let gas = u64::from_str_radix(gas.as_str().unwrap().trim_start_matches("0x"), 16).unwrap();
+        assert!(gas > 21_000, "receive()가 실행되므로 21000보다 크다: {gas}");
+
+        let to = hex::decode(vault.trim_start_matches("0x")).unwrap();
+        dispatch(
+            &shared,
+            "eth_sendRawTransaction",
+            &[json!(sign(&to, 100, &[], 1, gas))],
+        )
+        .unwrap();
+        finalize(&handle);
+        let logs = dispatch(
+            &shared,
+            "eth_getLogs",
+            &[json!({"fromBlock": "0x0", "address": vault})],
+        )
+        .unwrap();
+        assert_eq!(logs.as_array().unwrap().len(), 1);
+
+        let mut query = revm::primitives::keccak256("deposits(address)")[..4].to_vec();
+        query.extend([0u8; 12]);
+        query.extend(
+            hex::decode(receipt["from"].as_str().unwrap().trim_start_matches("0x")).unwrap(),
+        );
+        let deposited = dispatch(
+            &shared,
+            "eth_call",
+            &[
+                json!({"to": vault, "data": format!("0x{}", hex::encode(query))}),
+                json!("latest"),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            u128::from_str_radix(deposited.as_str().unwrap().trim_start_matches("0x"), 16).unwrap(),
+            100
+        );
+    }
+
+    #[test]
+    fn revert_reason_is_decoded() {
+        let mut output = vec![0x08, 0xc3, 0x79, 0xa0];
+        output.extend(revm::primitives::U256::from(32).to_be_bytes::<32>());
+        output.extend(revm::primitives::U256::from(4).to_be_bytes::<32>());
+        let mut text = b"boom".to_vec();
+        text.resize(32, 0);
+        output.extend(text);
+        assert_eq!(revert_reason(&output).as_deref(), Some("boom"));
     }
 
     #[test]

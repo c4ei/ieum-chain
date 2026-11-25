@@ -1,6 +1,6 @@
 [package]
 name = "ieum-chain"
-version = "1.0.10-0"
+version = "1.0.11-0"
 edition = "2024"
 
 [dependencies]
@@ -32,6 +32,7 @@ libp2p = { version = "0.56", features = [
     "yamux",
 ] }
 rand_core = { version = "0.6", features = ["getrandom"] }
+revm = { version = "43.0.3", default-features = false, features = ["std", "optional_balance_check"] }
 serde = { version = "1", features = ["derive"] }
 # P2P/원장 JSON에는 IEUM 최소 단위와 수수료를 담는 u128이 포함됩니다.
 # 기본 serde_json 역직렬화기는 u128을 거부하므로 숫자 정밀도 지원을 명시합니다.
