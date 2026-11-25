@@ -78,5 +78,5 @@ if has_gh; then
   gh run watch "$run_id" --exit-status && echo "릴리스 $TAG 게시 완료. 이제 update-four-nodes.sh로 4노드를 업데이트하세요."
 else
   echo "빌드 진행: https://github.com/c4ei/ieum-chain/actions/workflows/chain-release.yml"
-  echo "Release에 $TAG 가 올라오면 update-four-nodes.sh로 4노드를 업데이트하세요."
+  echo "Release에 $TAG 가 올라오면 sudo /opt/ieum-docker-four-node/update-four-nodes.sh 로 4노드를 업데이트하세요."
 fi

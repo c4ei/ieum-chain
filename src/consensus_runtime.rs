@@ -265,6 +265,14 @@ impl ConsensusRuntime {
         // 확정 뒤 적용에 실패할 블록(잔액·nonce·EVM 오류)에는 투표하지 않아 체인 정지를 막습니다.
         self.chain.check_block(&proposal.block)?;
         self.consensus.handle_proposal(&proposal)?;
+        if let Some(valid_round) = proposal.valid_round
+            && self.consensus.valid_value() == Some((proposal.block.hash.as_str(), valid_round))
+        {
+            // 재제안된 valid value의 본문과 증명을 보관해야, 이 노드가 제안자가 됐을 때
+            // "본문을 복구하지 못해 충돌 제안을 보류"하며 라운드를 비우지 않습니다.
+            self.valid_block = Some(proposal.block.clone());
+            self.valid_round_prevotes = proposal.valid_round_prevotes.clone();
+        }
         self.pending = Some(proposal.block.clone());
         self.reset_deadline();
         self.sign_vote(
@@ -403,15 +411,12 @@ impl ConsensusRuntime {
         {
             votes.push(vote);
         }
-        let signed_power: u64 = votes
-            .iter()
-            .filter_map(|message| {
-                self.validators
-                    .iter()
-                    .find(|validator| validator.id == message.validator_id)
-                    .map(|validator| validator.voting_power)
-            })
-            .sum();
+        let signed_power = self.round_change_power(
+            self.round_change_votes
+                .get(&key)
+                .map(Vec::as_slice)
+                .unwrap_or_default(),
+        );
         let total_power: u64 = self
             .validators
             .iter()
@@ -422,16 +427,15 @@ impl ConsensusRuntime {
         {
             self.round_change_votes.remove(&oldest);
         }
-        let catch_up = signed_power.saturating_mul(3) > total_power;
-        let round_change_quorum = signed_power.saturating_mul(3) > total_power.saturating_mul(2);
-        let target_round = if round_change_quorum {
-            key.1
+        let mut target_round = self.highest_round_with_one_third(key.0, total_power);
+        if signed_power.saturating_mul(3) > total_power.saturating_mul(2) {
+            let after_quorum = key
+                .1
                 .checked_add(1)
-                .ok_or("합의 라운드 번호가 범위를 넘었습니다.")?
-        } else {
-            key.1
-        };
-        if catch_up && target_round > self.consensus.round() {
+                .ok_or("합의 라운드 번호가 범위를 넘었습니다.")?;
+            target_round = target_round.max(after_quorum);
+        }
+        if target_round > self.consensus.round() {
             self.consensus.start_round(key.0, target_round)?;
             self.pending = None;
             self.precommits.clear();
@@ -444,6 +448,52 @@ impl ConsensusRuntime {
             return Ok(true);
         }
         Ok(false)
+    }
+
+    fn round_change_power(&self, votes: &[SignedRoundChange]) -> u64 {
+        votes
+            .iter()
+            .filter_map(|message| {
+                self.validators
+                    .iter()
+                    .find(|validator| validator.id == message.validator_id)
+                    .map(|validator| validator.voting_power)
+            })
+            .sum()
+    }
+
+    /// 검증자별 최신 round-change 라운드를 높은 순으로 모아, 투표권 1/3 초과가
+    /// 그 라운드 이상에 있다고 확인되는 가장 높은 라운드를 돌려줍니다. 서로 다른
+    /// 라운드에 흩어진 노드도 정직한 노드가 이미 도달한 라운드까지 따라갑니다.
+    fn highest_round_with_one_third(&self, height: u64, total_power: u64) -> u32 {
+        let mut latest: HashMap<&str, u32> = HashMap::new();
+        for (&(known_height, round), votes) in &self.round_change_votes {
+            if known_height != height {
+                continue;
+            }
+            for vote in votes {
+                let entry = latest.entry(vote.validator_id.as_str()).or_insert(round);
+                *entry = (*entry).max(round);
+            }
+        }
+        let mut rounds: Vec<(u32, u64)> = latest
+            .into_iter()
+            .filter_map(|(validator_id, round)| {
+                self.validators
+                    .iter()
+                    .find(|validator| validator.id == validator_id)
+                    .map(|validator| (round, validator.voting_power))
+            })
+            .collect();
+        rounds.sort_by_key(|entry| std::cmp::Reverse(entry.0));
+        let mut power = 0_u64;
+        for (round, voting_power) in rounds {
+            power = power.saturating_add(voting_power);
+            if power.saturating_mul(3) > total_power {
+                return round;
+            }
+        }
+        0
     }
 
     /// GossipSub에서 제안보다 먼저 도착한 정상 투표를 단계 전환 때까지 보관합니다.
@@ -537,13 +587,11 @@ impl ConsensusRuntime {
             valid_value,
             signature,
         )?;
+        // 혼자 제한 시간이 지났다고 다음 라운드로 가면 그 노드만 앞서 나가 다시는
+        // 라운드가 맞지 않습니다. 2/3 초과 round-change가 모일 때만 다음 라운드로
+        // 넘어가고, 그 전에는 같은 라운드에서 round-change를 재전파하며 기다립니다.
         self.receive_round_change(round_change.clone())?;
-        if self.consensus.round() == round_change.round {
-            self.consensus.on_timeout()?;
-        }
-        self.pending = None;
-        self.precommits.clear();
-        self.deadline = now + self.timeouts.propose;
+        self.deadline = now + self.timeouts.for_phase(self.consensus.phase());
         Ok((true, Some(round_change)))
     }
 
@@ -1330,9 +1378,62 @@ mod tests {
         let vote = vote.unwrap();
 
         assert!(timed_out);
-        assert_eq!(runtime.round(), 1);
+        // 혼자 제한 시간이 지난 것만으로는 라운드를 넘기지 않습니다.
+        assert_eq!(runtime.round(), 0);
         assert_eq!(vote.round, 0);
         vote.verify().unwrap();
+
+        let chain_id = runtime.chain.chain_id;
+        let genesis_commitment = runtime.chain.genesis_commitment.clone();
+        for key in &keys[1..3] {
+            runtime
+                .receive_round_change(SignedRoundChange::new(
+                    chain_id,
+                    genesis_commitment.clone(),
+                    1,
+                    0,
+                    key,
+                ))
+                .unwrap();
+        }
+        assert_eq!(runtime.round(), 1);
+    }
+
+    #[test]
+    fn scattered_rounds_follow_the_one_third_highest_round() {
+        let keys: Vec<_> = (1..=4)
+            .map(|value| Wallet::from_seed([value; 32]))
+            .collect();
+        let validators = keys
+            .iter()
+            .map(|key| Validator::new(key.address(), 100))
+            .collect();
+        let chain = Blockchain::new(vec![(keys[0].address(), 1_000)]);
+        let mut runtime = ConsensusRuntime::new(
+            chain,
+            validators,
+            Wallet::from_seed([1; 32]),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        let chain_id = runtime.chain.chain_id;
+        let genesis_commitment = runtime.chain.genesis_commitment.clone();
+        let mut send = |round: u32, key: &Wallet| {
+            runtime
+                .receive_round_change(SignedRoundChange::new(
+                    chain_id,
+                    genesis_commitment.clone(),
+                    1,
+                    round,
+                    key,
+                ))
+                .unwrap();
+            runtime.round()
+        };
+        // 한 검증자만 앞서 있으면 따라가지 않습니다.
+        assert_eq!(send(40, &keys[2]), 0);
+        // 서로 다른 라운드라도 두 검증자가 12 이상에 있으면 12까지 따라갑니다.
+        assert_eq!(send(12, &keys[1]), 12);
     }
 
     #[test]
