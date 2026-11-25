@@ -75,8 +75,8 @@ step "6/6 릴리스 빌드"
 if has_gh; then
   sleep 20
   run_id="$(gh run list --workflow chain-release.yml --limit 1 --json databaseId -q '.[0].databaseId')"
-  gh run watch "$run_id" --exit-status && echo "릴리스 $TAG 게시 완료. 이제 update-four-nodes.sh로 4노드를 업데이트하세요."
+  gh run watch "$run_id" --exit-status && printf '%s\n  %s\n' "릴리스 $TAG 게시 완료. 4노드 업데이트:" 'sudo /opt/ieum-docker-four-node/update-four-nodes.sh                           # 실제로 한 대씩 교체'
 else
   echo "빌드 진행: https://github.com/c4ei/ieum-chain/actions/workflows/chain-release.yml"
-  echo "Release에 $TAG 가 올라오면 sudo /opt/ieum-docker-four-node/update-four-nodes.sh 로 4노드를 업데이트하세요."
+  printf '%s\n  %s\n' "Release에 $TAG 가 올라오면 4노드 업데이트:" 'sudo /opt/ieum-docker-four-node/update-four-nodes.sh                           # 실제로 한 대씩 교체'
 fi

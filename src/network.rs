@@ -14,7 +14,7 @@ use libp2p::{
     kad, mdns,
     multiaddr::Protocol,
     noise, ping, relay, request_response,
-    swarm::{ConnectionId, NetworkBehaviour, SwarmEvent},
+    swarm::{ConnectionId, NetworkBehaviour, SwarmEvent, dial_opts::DialOpts},
     upnp,
 };
 use serde::{Deserialize, Serialize};
@@ -839,7 +839,8 @@ impl P2pNode {
         let (command_tx, mut command_rx) = mpsc::channel(128);
         let (event_tx, event_rx) = mpsc::channel(256);
         let mut guard = PeerGuard::new(config.ban_duration);
-        let mut connected_at: HashMap<ConnectionId, Instant> = HashMap::new();
+        let mut connected_at: HashMap<ConnectionId, (PeerId, Instant)> = HashMap::new();
+        let mut stale_redials: HashMap<PeerId, Option<Multiaddr>> = HashMap::new();
         let mut same_lan_peers = HashSet::new();
         let mut relay_candidates = HashSet::new();
         let mut pending_sync_responses = HashMap::<
@@ -1030,6 +1031,7 @@ impl P2pNode {
                             loopback_only,
                             guard: &mut guard,
                             connected_at: &mut connected_at,
+                            stale_redials: &mut stale_redials,
                             same_lan_peers: &mut same_lan_peers,
                             relay_candidates: &mut relay_candidates,
                             peer_cache: &mut peer_cache,
@@ -1186,6 +1188,16 @@ fn publish_to_topic(
     }
 }
 
+/// 동시 dial로 생긴 중복 연결은 거의 같은 시각에 맺어지므로 제외하고,
+/// 이 시간보다 오래된 연결만 재시작 전에 남은 옛 연결로 봅니다.
+const STALE_CONNECTION_AGE: Duration = Duration::from_secs(5);
+
+fn has_stale_connection(previous: &[Instant], now: Instant) -> bool {
+    previous
+        .iter()
+        .any(|started| now.saturating_duration_since(*started) >= STALE_CONNECTION_AGE)
+}
+
 /// 작은 메시지는 기존 JSON 그대로 유지하고, 큰 JSON만 zstd로 압축합니다.
 /// 헤더에는 압축 해제 후 길이를 넣어 할당 전에 상한을 검사합니다.
 fn encode_wire_message(message: &WireMessage) -> Result<Vec<u8>, String> {
@@ -1240,7 +1252,8 @@ struct SwarmEventContext<'a> {
     max_message_bytes: usize,
     loopback_only: bool,
     guard: &'a mut PeerGuard,
-    connected_at: &'a mut HashMap<ConnectionId, Instant>,
+    connected_at: &'a mut HashMap<ConnectionId, (PeerId, Instant)>,
+    stale_redials: &'a mut HashMap<PeerId, Option<Multiaddr>>,
     same_lan_peers: &'a mut HashSet<PeerId>,
     relay_candidates: &'a mut HashSet<PeerId>,
     peer_cache: &'a mut PersistentPeerCache,
@@ -1261,6 +1274,7 @@ async fn handle_swarm_event(
         loopback_only,
         guard,
         connected_at,
+        stale_redials,
         same_lan_peers,
         relay_candidates,
         peer_cache,
@@ -1626,7 +1640,25 @@ async fn handle_swarm_event(
             num_established,
             ..
         } => {
-            connected_at.insert(connection_id, Instant::now());
+            let now = Instant::now();
+            let previous: Vec<Instant> = connected_at
+                .values()
+                .filter(|(peer, _)| *peer == peer_id)
+                .map(|(_, started)| *started)
+                .collect();
+            connected_at.insert(connection_id, (peer_id, now));
+            // 상대가 재시작하면 옛 연결이 idle timeout 전까지 살아 있어, gossipsub이
+            // 새 연결에 토픽 가입(SUBSCRIBE)을 보내지 않고 메시지도 죽은 연결로 흘려보냅니다.
+            // 오래된 연결이 남아 있으면 모두 끊고 깨끗한 단일 연결로 다시 맺습니다.
+            if num_established.get() > 1 && has_stale_connection(&previous, now) {
+                let redial = matches!(endpoint, ConnectedPoint::Dialer { .. })
+                    .then(|| endpoint.get_remote_address().clone());
+                stale_redials.insert(peer_id, redial);
+                let _ = swarm.disconnect_peer_id(peer_id);
+                crate::log_info!(
+                    "[P2P 재연결] PeerId: {peer_id} · 재시작 전 옛 연결이 남아 있어 전체 연결을 새로 맺습니다."
+                );
+            }
             // Bootstrap으로 직접 연결된 피어도 gossipsub의 명시적 피어로 등록합니다.
             // 과거에는 mDNS 발견 피어만 등록되어 Docker/LAN 재시작 뒤 물리 연결은
             // 존재하지만 sync/consensus 토픽의 전파 대상이 0명으로 남을 수 있었습니다.
@@ -1683,7 +1715,20 @@ async fn handle_swarm_event(
             let unique_peers = swarm.connected_peers().count();
             let connected_for = connected_at
                 .remove(&connection_id)
-                .map(|started| started.elapsed());
+                .map(|(_, started)| started.elapsed());
+            if num_established == 0
+                && let Some(address) = stale_redials.remove(&peer_id)
+            {
+                let options = DialOpts::peer_id(peer_id)
+                    .addresses(address.into_iter().collect())
+                    .extend_addresses_through_behaviour()
+                    .build();
+                if let Err(error) = swarm.dial(options) {
+                    crate::logger::write_repeated_error(&format!(
+                        "[P2P 재연결 실패] PeerId: {peer_id} · {error}"
+                    ));
+                }
+            }
             let _ = event_tx
                 .send(NetworkEvent::PeerDisconnected {
                     peer_id,
@@ -1878,6 +1923,16 @@ mod connection_log_tests {
         AccountWallet, Block, CommunicationKind, ScheduledEvent, ScheduledEventAction,
         SignedProposal, SignedRoundChange, Wallet,
     };
+
+    #[test]
+    fn only_old_duplicate_connections_count_as_stale() {
+        let now = Instant::now();
+        let fresh = now - Duration::from_millis(300);
+        let old = now - Duration::from_secs(30);
+        assert!(!has_stale_connection(&[], now));
+        assert!(!has_stale_connection(&[fresh], now));
+        assert!(has_stale_connection(&[fresh, old], now));
+    }
 
     #[test]
     fn node_reward_registration_requires_reward_wallet_ownership() {
