@@ -67,11 +67,16 @@ pub enum ScheduledEventAction {
         payments: Vec<EventPayment>,
     },
     /// 100 IEUM 성숙 담보와 3/4 독립 서비스 증명을 통과한 외부 공개 노드의 일일 보상입니다.
+    /// v5부터 담보 전 노드의 잠긴 적립(accruals)과 적립 소멸(expired)을 함께 담습니다.
     NodeServiceDailyReward {
         snapshot_height: u64,
         epoch: u64,
         attestations: Vec<crate::node_emission::NodeServiceAttestation>,
         payments: Vec<EventPayment>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        accruals: Vec<EventPayment>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        expired: Vec<EventPayment>,
     },
 }
 
@@ -280,13 +285,19 @@ impl ScheduledEvent {
                 epoch,
                 attestations,
                 payments,
+                accruals,
+                expired,
                 ..
             } => {
+                let rewards_nodes = !payments.is_empty() || !accruals.is_empty();
                 if self.id != crate::node_emission::service_event_id(*epoch)
-                    || attestations.len() < crate::node_emission::SERVICE_MINIMUM_VALIDATORS
+                    || (rewards_nodes
+                        && attestations.len() < crate::node_emission::SERVICE_MINIMUM_VALIDATORS)
+                    || (!rewards_nodes && expired.is_empty())
                     || attestations.len() > 10_000
-                    || payments.is_empty()
                     || payments.len() > 10_000
+                    || accruals.len() > 10_000
+                    || expired.len() > 10_000
                 {
                     return Err(
                         "공개 노드 일일 보상 증명 또는 지급 대상이 올바르지 않습니다.".into(),
@@ -298,7 +309,7 @@ impl ScheduledEvent {
                         return Err("공개 노드 서비스 증명의 epoch가 다릅니다.".into());
                     }
                 }
-                for payment in payments {
+                for payment in payments.iter().chain(accruals).chain(expired) {
                     validate_address(&payment.address)?;
                     if payment.amount == 0 {
                         return Err("공개 노드 일일 보상액은 0보다 커야 합니다.".into());

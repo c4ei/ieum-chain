@@ -30,7 +30,7 @@ const DEFAULT_BOOTSTRAP_PEERS: [&str; 4] = [
 ];
 const SERVER_INSTANCE_PORT: u16 = 49_889;
 const CLIENT_INSTANCE_PORT: u16 = 49_890;
-const SUPPORTED_PROTOCOL_VERSION: u32 = 4;
+const SUPPORTED_PROTOCOL_VERSION: u32 = 5;
 
 #[derive(Clone, Debug)]
 struct ServiceObservation {
@@ -1336,15 +1336,18 @@ async fn main() -> Result<(), String> {
                             .filter(|proof| proof.epoch == service_epoch)
                             .cloned()
                             .collect::<Vec<_>>();
-                        let payments = ieum_chain::node_emission::calculate_service_payments(
+                        let accrual_active = upgrades.version_at(consensus.chain.tip_height() + 1)
+                            >= ieum_chain::node_emission::ACCRUAL_PROTOCOL_VERSION;
+                        let settlement = ieum_chain::node_emission::calculate_service_settlement(
                             timestamp,
                             &proofs,
                             &validators,
                             &validator_peer_ids,
                             consensus.chain.staking(),
                             consensus.chain.balance_of(ieum_chain::FOUNDATION_FEE_ADDRESS),
+                            accrual_active,
                         )?;
-                        if !payments.is_empty() {
+                        if !settlement.is_empty() {
                             due_events.push(ScheduledEvent {
                                 id: service_reward_id,
                                 execute_at: timestamp,
@@ -1352,7 +1355,9 @@ async fn main() -> Result<(), String> {
                                     snapshot_height: consensus.chain.tip_height(),
                                     epoch: service_epoch,
                                     attestations: proofs,
-                                    payments,
+                                    payments: settlement.payments,
+                                    accruals: settlement.accruals,
+                                    expired: settlement.expired,
                                 },
                             });
                         }

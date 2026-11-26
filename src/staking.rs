@@ -29,6 +29,15 @@ pub struct UnbondingEntry {
     pub release_at: u64,
 }
 
+/// 담보 전 노드가 쌓은 잠긴 적립 잔액입니다(프로토콜 v5). 보낼 수 없고 같은 주소의 담보로만 인정됩니다.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LockedAccrual {
+    #[serde(with = "crate::model::decimal_u128")]
+    pub amount: u128,
+    /// 마지막으로 적립된 보상 epoch(일)입니다. 소멸 판단에 씁니다.
+    pub last_epoch: u64,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StakingState {
     #[serde(default)]
@@ -37,9 +46,52 @@ pub struct StakingState {
     pub unbonding: Vec<UnbondingEntry>,
     #[serde(default)]
     pub applied_slashes: Vec<String>,
+    /// 비어 있으면 직렬화하지 않아 v5 이전 상태 해시가 그대로 유지됩니다.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub accruals: BTreeMap<Address, LockedAccrual>,
 }
 
 impl StakingState {
+    pub fn locked_accrual_of(&self, address: &str) -> u128 {
+        self.accruals
+            .get(address)
+            .map(|entry| entry.amount)
+            .unwrap_or(0)
+    }
+
+    pub fn add_accrual(&mut self, address: &str, amount: u128, epoch: u64) -> Result<(), String> {
+        let entry = self
+            .accruals
+            .entry(address.into())
+            .or_insert(LockedAccrual {
+                amount: 0,
+                last_epoch: epoch,
+            });
+        entry.amount = entry
+            .amount
+            .checked_add(amount)
+            .ok_or("적립 잔액이 u128 범위를 넘습니다.")?;
+        entry.last_epoch = entry.last_epoch.max(epoch);
+        Ok(())
+    }
+
+    /// 소멸 대상 적립을 지우고 그 금액을 돌려줍니다. 금액이 다르면 거절합니다.
+    pub fn expire_accrual(&mut self, address: &str, amount: u128) -> Result<(), String> {
+        match self.accruals.get(address) {
+            Some(entry) if entry.amount == amount => {
+                self.accruals.remove(address);
+                Ok(())
+            }
+            _ => Err("소멸할 적립 잔액이 현재 상태와 다릅니다.".into()),
+        }
+    }
+
+    pub fn total_accruals(&self) -> u128 {
+        self.accruals
+            .values()
+            .fold(0u128, |sum, entry| sum.saturating_add(entry.amount))
+    }
+
     pub fn delegated_to(&self, delegator: &str, validator: &str) -> u128 {
         self.delegations
             .iter()
