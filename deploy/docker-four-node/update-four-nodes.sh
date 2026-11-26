@@ -92,9 +92,10 @@ check_existing_port_owners() {
 }
 
 # JSON-RPC 호출 함수입니다.
+# 재시작 직후에는 연결 거부(curl 7)가 정상이므로 오류는 숨기고 대기 함수가 진행 상황을 출력합니다.
 rpc() {
   local port="$1" method="$2"
-  curl -fsS --max-time 5 \
+  curl -fs --max-time 5 \
     -H 'content-type: application/json' \
     --data "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"$method\",\"params\":[]}" \
     "http://$RPC_HOST:$port"
@@ -105,34 +106,40 @@ node_healthy() {
   local container="$1" port="$2" expected_version="$3"
   local identity version status
 
+  HEALTH_REASON="컨테이너 미실행"
   [[ "$(docker inspect -f '{{.State.Running}}' "$container" 2>/dev/null)" == true ]] || return 1
+  HEALTH_REASON="RPC $port 응답 없음"
   identity="$(rpc "$port" ieum_networkIdentity)" || return 1
   version="$(rpc "$port" ieum_protocolVersion)" || return 1
   status="$(rpc "$port" ieum_nodeStatus)" || return 1
 
-  IDENTITY="$identity" VERSION="$version" STATUS="$status" \
+  HEALTH_REASON="$(IDENTITY="$identity" VERSION="$version" STATUS="$status" \
     EXPECTED_VERSION="$expected_version" EXPECTED_GENESIS="$EXPECTED_GENESIS" \
     EXPECTED_CHAIN_ID="$EXPECTED_CHAIN_ID" python3 - <<'PY'
 import json
 import os
-import sys
 
 identity = json.loads(os.environ["IDENTITY"]).get("result") or {}
 version = json.loads(os.environ["VERSION"]).get("result") or {}
 status = json.loads(os.environ["STATUS"]).get("result") or {}
+node_version = str(version.get("nodeVersion", "")).replace("-", ".")
 
-healthy = (
-    int(identity.get("chainId", -1)) == int(os.environ["EXPECTED_CHAIN_ID"])
-    and str(identity.get("genesisHash", "")).lower() == os.environ["EXPECTED_GENESIS"].lower()
-    and str(version.get("nodeVersion", "")).replace("-", ".") == os.environ["EXPECTED_VERSION"]
-    and status.get("syncing") is False
-    and int(status.get("peers", 0)) >= 2
-)
-sys.exit(0 if healthy else 1)
+if int(identity.get("chainId", -1)) != int(os.environ["EXPECTED_CHAIN_ID"]):
+    print("Chain ID 불일치")
+elif str(identity.get("genesisHash", "")).lower() != os.environ["EXPECTED_GENESIS"].lower():
+    print("Genesis 불일치")
+elif node_version != os.environ["EXPECTED_VERSION"]:
+    print(f"버전 {node_version} (기대 {os.environ['EXPECTED_VERSION']})")
+elif status.get("syncing") is not False:
+    print(f"동기화 중 (높이 {status.get('height')})")
+elif int(status.get("peers", 0)) < 2:
+    print(f"피어 {status.get('peers', 0)}개")
 PY
+)" || return 1
+  [[ -z "$HEALTH_REASON" ]]
 }
 
-# 최대 120초 동안 노드가 정상화되기를 기다립니다.
+# 최대 120초 동안 노드가 정상화되기를 기다립니다. 실패 사유를 HEALTH_REASON에 남깁니다.
 wait_healthy() {
   local container="$1" port="$2" expected_version="$3"
   local attempt
@@ -140,8 +147,23 @@ wait_healthy() {
     if node_healthy "$container" "$port" "$expected_version"; then
       return 0
     fi
+    (( attempt % 5 == 0 )) && echo "  [$container] 대기 $((attempt * 2))초: ${HEALTH_REASON:-확인 중}"
     sleep 2
   done
+  echo "[$container] 120초 안에 정상화되지 않음: ${HEALTH_REASON:-알 수 없음}" >&2
+  return 1
+}
+
+# 교체한 노드가 나머지 세 노드와 같은 높이·해시·State Root로 모이고 피어 3개를 유지하는지 기다립니다.
+# 다음 노드를 내리기 전에 확인해야 합의 정족수(3/4)를 잃지 않습니다.
+wait_cluster_consistent() {
+  local label="$1" attempt
+  for attempt in $(seq 1 45); do
+    cluster_consistent && return 0
+    (( attempt % 5 == 0 )) && echo "  [$label] 네 노드 블록 일치 대기 $((attempt * 2))초"
+    sleep 2
+  done
+  echo "[$label] 90초 안에 네 노드의 높이·해시·피어가 일치하지 않았습니다." >&2
   return 1
 }
 
@@ -333,20 +355,13 @@ for i in "${!services[@]}"; do
   wait_port_released "$p2p_port" || rollback "$service"
   docker compose -f "$COMPOSE_FILE" up -d --no-deps --force-recreate "$service" || rollback "$service"
   wait_healthy "$container" "$rpc_port" "$expected_version" || rollback "$service"
+  wait_cluster_consistent "$service" || rollback "$service"
 
-  echo "[$service] 포트·Chain ID·Genesis·버전·동기화·피어 확인 완료"
+  echo "[$service] 포트·Chain ID·Genesis·버전·동기화·피어·네 노드 블록 일치 확인 완료"
 done
 
 # 순차 교체가 끝난 뒤 네 노드가 같은 블록 상태로 모일 때까지 기다립니다.
-consistent=0
-for _ in $(seq 1 30); do
-  if cluster_consistent; then
-    consistent=1
-    break
-  fi
-  sleep 2
-done
-[[ "$consistent" -eq 1 ]] || rollback "cluster-consistency"
+wait_cluster_consistent "cluster" || rollback "cluster-consistency"
 
 echo "네 노드가 모두 IEUM Chain $expected_version으로 업데이트되었습니다."
 docker compose -f "$COMPOSE_FILE" ps

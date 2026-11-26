@@ -7,6 +7,7 @@
 
 ```bash
 sudo cp deploy/docker-four-node/Dockerfile /opt/ieum-docker-four-node/Dockerfile
+sudo install -m 755 deploy/docker-four-node/update-four-nodes.sh /opt/ieum-docker-four-node/update-four-nodes.sh
 sudo /opt/ieum-docker-four-node/update-four-nodes.sh
 ```
 
