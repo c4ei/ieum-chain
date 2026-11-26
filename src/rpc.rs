@@ -1347,6 +1347,33 @@ fn dispatch(
                 "expiresAt": record.as_ref().map(|r| r.expires_at),
             }))
         }
+        "ieum_accrualOverview" => {
+            // 운영자가 적립 주소가 갑자기 늘어나는지 지켜보는 용도입니다(주소별 금액은 이미 공개 상태입니다).
+            let state = read_state(state)?;
+            let staking = state.chain.staking();
+            let epoch = unix_now() / crate::node_emission::REWARD_EPOCH_SECONDS;
+            let protocol = state
+                .upgrade_schedule
+                .version_at(state.chain.tip_height().saturating_add(1));
+            let mut rows: Vec<_> = staking.accruals.iter().collect();
+            rows.sort_by(|left, right| {
+                right.1.amount.cmp(&left.1.amount).then(left.0.cmp(right.0))
+            });
+            Ok(json!({
+                "epoch": epoch,
+                "protocol": protocol,
+                "newAddressLimitActive": protocol >= crate::node_emission::ACCRUAL_LIMIT_PROTOCOL_VERSION,
+                "newAddressLimit": crate::node_emission::MAX_NEW_ACCRUAL_ADDRESSES_PER_EPOCH,
+                "addresses": staking.accruals.len(),
+                "accruedToday": staking.accruals.values().filter(|entry| entry.last_epoch == epoch).count(),
+                "totalLocked": staking.total_accruals().to_string(),
+                "top": rows.iter().take(200).map(|(address, entry)| json!({
+                    "address": address,
+                    "amount": entry.amount.to_string(),
+                    "lastEpoch": entry.last_epoch,
+                })).collect::<Vec<_>>(),
+            }))
+        }
         "ieum_accrualStatus" => {
             // 지갑·대시보드의 "담보 진행 막대"용입니다. 잠긴 적립은 보낼 수 없고 담보로만 인정됩니다.
             let raw_address = string_param(params, 0)?;
