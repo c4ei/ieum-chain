@@ -8,6 +8,11 @@ use std::fs;
 use std::path::Path;
 
 pub const MAX_CLOCK_DRIFT_SECONDS: u64 = 30;
+/// 동결 후 복구까지 최소 공개 유예 기간(7일)입니다.
+pub const RECOVERY_NOTICE_SECONDS: u64 = 7 * 24 * 60 * 60;
+/// 복구나 해제가 없으면 동결은 30일 뒤 자동으로 풀립니다.
+pub const FREEZE_MAX_SECONDS: u64 = 30 * 24 * 60 * 60;
+const MAX_RECOVERY_ADDRESSES: usize = 32;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -78,6 +83,38 @@ pub enum ScheduledEventAction {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         expired: Vec<EventPayment>,
     },
+    /// 해킹 피해 대응(v6): 해커 주소를 동결합니다. 모든 검증자 events 파일에 같은 내용이 있어야 확정됩니다.
+    AccountFreeze {
+        case_id: String,
+        addresses: Vec<Address>,
+        /// 공개 기록용 짧은 사유입니다(개인정보 금지).
+        reason: String,
+    },
+    /// 동결을 일찍 풀 때 씁니다(오판 등).
+    AccountUnfreeze {
+        case_id: String,
+        addresses: Vec<Address>,
+    },
+    /// 공개 유예(7일)가 지난 동결 계정의 잔액을 피해자에게 돌려줍니다.
+    AccountRecovery {
+        case_id: String,
+        from: Address,
+        payments: Vec<EventPayment>,
+        /// true면 복구 후 동결을 풉니다.
+        #[serde(default)]
+        release: bool,
+    },
+}
+
+impl ScheduledEventAction {
+    pub fn is_recovery(&self) -> bool {
+        matches!(
+            self,
+            Self::AccountFreeze { .. }
+                | Self::AccountUnfreeze { .. }
+                | Self::AccountRecovery { .. }
+        )
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -139,6 +176,45 @@ impl ScheduledEvent {
                 validate_address(victim)?;
                 if *amount == 0 {
                     return Err("사고 보상액은 0보다 커야 합니다.".into());
+                }
+                return Ok(());
+            }
+            ScheduledEventAction::AccountFreeze {
+                case_id,
+                addresses,
+                reason,
+            } => {
+                validate_case_id(case_id)?;
+                if reason.trim().is_empty() || reason.chars().count() > 200 {
+                    return Err("동결 사유는 1~200자여야 합니다.".into());
+                }
+                return validate_address_list(addresses);
+            }
+            ScheduledEventAction::AccountUnfreeze { case_id, addresses } => {
+                validate_case_id(case_id)?;
+                return validate_address_list(addresses);
+            }
+            ScheduledEventAction::AccountRecovery {
+                case_id,
+                from,
+                payments,
+                ..
+            } => {
+                validate_case_id(case_id)?;
+                validate_reward_address(from)?;
+                if payments.is_empty() || payments.len() > MAX_RECOVERY_ADDRESSES {
+                    return Err(format!(
+                        "복구 수령자는 1~{MAX_RECOVERY_ADDRESSES}명이어야 합니다."
+                    ));
+                }
+                for payment in payments {
+                    validate_reward_address(&payment.address)?;
+                    if payment.amount == 0 {
+                        return Err("복구 금액은 0보다 커야 합니다.".into());
+                    }
+                    if payment.address.eq_ignore_ascii_case(from) {
+                        return Err("동결 주소로 복구할 수 없습니다.".into());
+                    }
                 }
                 return Ok(());
             }
@@ -374,13 +450,28 @@ impl EventSchedule {
         due
     }
 
+    /// v6 이전에는 동결·복구 이벤트를 아직 실행하지 않고 기다립니다.
+    pub fn due_at_protocol(
+        &self,
+        timestamp: u64,
+        executed: &HashSet<String>,
+        protocol: u32,
+    ) -> Vec<ScheduledEvent> {
+        let mut due = self.due(timestamp, executed);
+        if protocol < crate::node_emission::RECOVERY_PROTOCOL_VERSION {
+            due.retain(|event| !event.action.is_recovery());
+        }
+        due
+    }
+
     pub fn validate_block_events(
         &self,
         timestamp: u64,
         events: &[ScheduledEvent],
         executed: &HashSet<String>,
+        protocol: u32,
     ) -> Result<(), String> {
-        let expected = self.due(timestamp, executed);
+        let expected = self.due_at_protocol(timestamp, executed, protocol);
         if events != expected {
             return Err("블록의 시스템 이벤트가 로컬 승인 일정과 일치하지 않습니다.".into());
         }
@@ -400,6 +491,34 @@ fn validate_address(address: &str) -> Result<(), String> {
     let value = address.strip_prefix("0x").unwrap_or(address);
     if value.len() != 40 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err(format!("잘못된 IEUM 주소: {address}"));
+    }
+    Ok(())
+}
+
+fn validate_case_id(case_id: &str) -> Result<(), String> {
+    if case_id.is_empty()
+        || case_id.len() > 64
+        || !case_id
+            .bytes()
+            .all(|value| value.is_ascii_alphanumeric() || matches!(value, b'-' | b'_'))
+    {
+        return Err("사건 ID는 1~64자의 영문, 숫자, -, _만 허용합니다.".into());
+    }
+    Ok(())
+}
+
+fn validate_address_list(addresses: &[Address]) -> Result<(), String> {
+    if addresses.is_empty() || addresses.len() > MAX_RECOVERY_ADDRESSES {
+        return Err(format!(
+            "동결 주소는 1~{MAX_RECOVERY_ADDRESSES}개여야 합니다."
+        ));
+    }
+    let mut seen = HashSet::new();
+    for address in addresses {
+        validate_reward_address(address)?;
+        if !seen.insert(address.to_ascii_lowercase()) {
+            return Err(format!("중복 동결 주소: {address}"));
+        }
     }
     Ok(())
 }
@@ -450,5 +569,43 @@ mod tests {
         assert_eq!(schedule.due(20, &executed)[0].id, "first");
         executed.insert("first".into());
         assert_eq!(schedule.due(20, &executed)[0].id, "second");
+    }
+
+    #[test]
+    fn recovery_events_wait_for_protocol_v6() {
+        let schedule = EventSchedule {
+            events: vec![ScheduledEvent {
+                id: "freeze-x".into(),
+                execute_at: 5,
+                action: ScheduledEventAction::AccountFreeze {
+                    case_id: "x".into(),
+                    addresses: vec!["0x1111111111111111111111111111111111111111".into()],
+                    reason: "test".into(),
+                },
+            }],
+        };
+        schedule.validate().unwrap();
+        let executed = HashSet::new();
+        assert!(schedule.due_at_protocol(10, &executed, 5).is_empty());
+        assert_eq!(schedule.due_at_protocol(10, &executed, 6).len(), 1);
+    }
+
+    #[test]
+    fn recovery_rejects_paying_back_to_frozen_address() {
+        let from = "0x1111111111111111111111111111111111111111";
+        let event = ScheduledEvent {
+            id: "recover-x".into(),
+            execute_at: 5,
+            action: ScheduledEventAction::AccountRecovery {
+                case_id: "x".into(),
+                from: from.into(),
+                payments: vec![EventPayment {
+                    address: from.into(),
+                    amount: 1,
+                }],
+                release: false,
+            },
+        };
+        assert!(event.validate().is_err());
     }
 }

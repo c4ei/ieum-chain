@@ -456,6 +456,8 @@ impl Blockchain {
             || !self.staking.unbonding.is_empty()
             || !self.staking.applied_slashes.is_empty()
             || !self.staking.accruals.is_empty()
+            || !self.staking.accrual_days.is_empty()
+            || !self.staking.frozen.is_empty()
         {
             hasher.update(b"staking-v1:");
             hasher.update(self.staking.state_bytes());
@@ -574,6 +576,79 @@ fn apply_system_events(
                     transfer_from_foundation(balances, &payment.address, payment.amount)?;
                 }
             }
+            ScheduledEventAction::AccountFreeze {
+                case_id, addresses, ..
+            } => {
+                for address in addresses {
+                    staking.frozen.insert(
+                        normalize_address(address),
+                        crate::staking::FreezeRecord {
+                            case_id: case_id.clone(),
+                            frozen_at: block_timestamp,
+                            expires_at: block_timestamp
+                                .saturating_add(crate::scheduled_event::FREEZE_MAX_SECONDS),
+                        },
+                    );
+                }
+            }
+            ScheduledEventAction::AccountUnfreeze { case_id, addresses } => {
+                for address in addresses {
+                    let address = normalize_address(address);
+                    match staking.frozen.get(&address) {
+                        Some(record) if &record.case_id == case_id => {
+                            staking.frozen.remove(&address);
+                        }
+                        _ => {
+                            return Err(format!(
+                                "사건 {case_id}로 동결된 주소가 아닙니다: {address}"
+                            ));
+                        }
+                    }
+                }
+            }
+            ScheduledEventAction::AccountRecovery {
+                case_id,
+                from,
+                payments,
+                release,
+            } => {
+                let from = normalize_address(from);
+                let record = staking
+                    .frozen
+                    .get(&from)
+                    .filter(|record| &record.case_id == case_id)
+                    .ok_or_else(|| format!("사건 {case_id}로 동결된 주소가 아닙니다: {from}"))?;
+                if block_timestamp
+                    < record
+                        .frozen_at
+                        .saturating_add(crate::scheduled_event::RECOVERY_NOTICE_SECONDS)
+                {
+                    return Err("동결 후 공개 유예(7일)가 지나야 복구할 수 있습니다.".into());
+                }
+                if block_timestamp >= record.expires_at {
+                    return Err("동결 기간이 끝나 복구할 수 없습니다.".into());
+                }
+                let total = payments.iter().try_fold(0u128, |sum, payment| {
+                    sum.checked_add(payment.amount)
+                        .ok_or("복구 금액 합계가 u128 범위를 넘습니다.")
+                })?;
+                let available = balances.get(&from).copied().unwrap_or(0);
+                if available < total {
+                    return Err("복구 금액이 동결 계정 잔액보다 큽니다.".into());
+                }
+                balances.insert(from.clone(), available - total);
+                for payment in payments {
+                    credit_balance(
+                        balances,
+                        &normalize_address(&payment.address),
+                        payment.amount,
+                        "복구 수령 잔액이 u128 범위를 넘습니다.",
+                    )?;
+                }
+                if *release {
+                    staking.frozen.remove(&from);
+                }
+            }
             ScheduledEventAction::NodeServiceDailyReward {
                 epoch,
                 payments,
@@ -652,12 +727,16 @@ fn apply_transactions(
         } else {
             verify_transaction(tx)?;
         }
+        if staking.is_frozen(&normalize_address(&tx.from), block_timestamp) {
+            return Err("동결된 계정은 거래를 보낼 수 없습니다(해킹 피해 대응 중).".into());
+        }
         let is_evm = crate::evm::is_evm_transaction(tx, evm);
         let is_staking = matches!(
             &tx.action,
             TransactionAction::Delegate { .. }
                 | TransactionAction::Undelegate { .. }
                 | TransactionAction::ClaimUnbonded
+                | TransactionAction::GrantAccrual { .. }
         );
         if is_staking && normalize_address(&tx.to) != crate::staking::STAKING_SYSTEM_ADDRESS {
             return Err("위임 거래의 수신 주소는 스테이킹 시스템 주소여야 합니다.".into());
@@ -705,7 +784,9 @@ fn apply_transactions(
         }
         let debit_amount = if matches!(
             &tx.action,
-            TransactionAction::Transfer | TransactionAction::Delegate { .. }
+            TransactionAction::Transfer
+                | TransactionAction::Delegate { .. }
+                | TransactionAction::GrantAccrual { .. }
         ) {
             tx.amount
         } else {
@@ -739,6 +820,19 @@ fn apply_transactions(
                     &tx.from,
                     claimed,
                     "해제 청구 잔액이 u128 범위를 넘습니다.",
+                )?;
+            }
+            TransactionAction::GrantAccrual { recipient } => {
+                let recipient = normalize_address(recipient);
+                let bond_room = crate::node_emission::SERVICE_BOND.saturating_sub(
+                    crate::node_emission::service_bond_of(staking, &recipient, block_timestamp),
+                );
+                staking.grant_accrual(
+                    &recipient,
+                    tx.amount,
+                    block_timestamp / crate::node_emission::REWARD_EPOCH_SECONDS,
+                    crate::node_emission::ACCRUAL_DAILY_CAP,
+                    bond_room,
                 )?;
             }
             TransactionAction::Evm => unreachable!("EVM 거래는 위에서 처리합니다."),
@@ -1050,5 +1144,201 @@ mod accrual_tests {
         chain.apply_block(block).unwrap();
         assert_eq!(chain.staking().locked_accrual_of(ADDRESS), 0);
         assert_eq!(chain.balance_of(FOUNDATION_FEE_ADDRESS), 1_000 * IEUM);
+    }
+
+    fn event(id: &str, action: ScheduledEventAction) -> ScheduledEvent {
+        ScheduledEvent {
+            id: id.into(),
+            execute_at: 1,
+            action,
+        }
+    }
+
+    fn apply(
+        chain: &mut Blockchain,
+        timestamp: u64,
+        txs: Vec<Transaction>,
+        events: Vec<ScheduledEvent>,
+    ) -> Result<(), String> {
+        let block = Block::new(
+            chain.tip_height() + 1,
+            chain.tip_hash().into(),
+            timestamp,
+            "producer".into(),
+            txs,
+        )
+        .with_system_events(events);
+        chain.apply_block(block).map(|_| ())
+    }
+
+    #[test]
+    fn web_grant_is_locked_and_shares_daily_cap_with_node_accrual() {
+        let operator = Wallet::from_seed([9; 32]);
+        let mut chain = Blockchain::new(vec![
+            (FOUNDATION_FEE_ADDRESS.into(), 1_000 * IEUM),
+            (operator.address(), 10 * IEUM),
+        ]);
+        let day = 20 * REWARD_EPOCH_SECONDS;
+        let grant = |amount, nonce| {
+            operator.sign_action(
+                crate::staking::STAKING_SYSTEM_ADDRESS.into(),
+                amount,
+                0,
+                nonce,
+                TransactionAction::GrantAccrual {
+                    recipient: ADDRESS.into(),
+                },
+            )
+        };
+        apply(&mut chain, day + 10, vec![grant(IEUM / 10, 0)], vec![]).unwrap();
+        assert_eq!(chain.balance_of(ADDRESS), 0);
+        assert_eq!(chain.staking().locked_accrual_of(ADDRESS), IEUM / 10);
+        assert_eq!(chain.balance_of(&operator.address()), 10 * IEUM - IEUM / 10);
+        // 오늘 남은 한도 0.2를 넘는 웹 적립은 거절됩니다.
+        assert!(apply(&mut chain, day + 20, vec![grant(3 * IEUM / 10, 1)], vec![]).is_err());
+        // 노드 적립은 같은 날 기록에 합산돼 이후 웹 적립을 막습니다.
+        let node = reward_event(
+            20,
+            vec![EventPayment {
+                address: ADDRESS.into(),
+                amount: 2 * IEUM / 10,
+            }],
+            vec![],
+        );
+        apply(&mut chain, day + 30, vec![], vec![node]).unwrap();
+        assert_eq!(
+            chain.staking().accrual_used_in(ADDRESS, 20, 3 * IEUM / 10),
+            3 * IEUM / 10
+        );
+        assert!(apply(&mut chain, day + 40, vec![grant(1, 1)], vec![]).is_err());
+        // 다음 날은 다시 한도가 생깁니다.
+        apply(
+            &mut chain,
+            day + REWARD_EPOCH_SECONDS,
+            vec![grant(3 * IEUM / 10, 1)],
+            vec![],
+        )
+        .unwrap();
+        assert_eq!(chain.staking().locked_accrual_of(ADDRESS), 6 * IEUM / 10);
+    }
+
+    #[test]
+    fn node_accrual_first_blocks_same_day_web_grant() {
+        let operator = Wallet::from_seed([8; 32]);
+        let mut chain = Blockchain::new(vec![
+            (FOUNDATION_FEE_ADDRESS.into(), 1_000 * IEUM),
+            (operator.address(), IEUM),
+        ]);
+        let node = reward_event(
+            30,
+            vec![EventPayment {
+                address: ADDRESS.into(),
+                amount: 3 * IEUM / 10,
+            }],
+            vec![],
+        );
+        let day = 30 * REWARD_EPOCH_SECONDS;
+        apply(&mut chain, day + 1, vec![], vec![node]).unwrap();
+        // v5 노드 적립만으로는 웹 기록이 생기지 않아 기존 상태 형식이 유지됩니다.
+        assert!(chain.staking().accrual_days.is_empty());
+        let tx = operator.sign_action(
+            crate::staking::STAKING_SYSTEM_ADDRESS.into(),
+            1,
+            0,
+            0,
+            TransactionAction::GrantAccrual {
+                recipient: ADDRESS.into(),
+            },
+        );
+        assert!(apply(&mut chain, day + 2, vec![tx], vec![]).is_err());
+    }
+
+    #[test]
+    fn frozen_account_cannot_send_and_recovery_waits_for_notice() {
+        let hacker = Wallet::from_seed([7; 32]);
+        let victim = "0x2222222222222222222222222222222222222222";
+        let mut chain = Blockchain::new(vec![(hacker.address(), 50 * IEUM)]);
+        let hash_before = chain.state_hash();
+        let start = 1_000;
+        apply(
+            &mut chain,
+            start,
+            vec![],
+            vec![event(
+                "freeze-case-1",
+                ScheduledEventAction::AccountFreeze {
+                    case_id: "case-1".into(),
+                    addresses: vec![hacker.address()],
+                    reason: "test incident".into(),
+                },
+            )],
+        )
+        .unwrap();
+        assert_ne!(chain.state_hash(), hash_before);
+        let send = hacker.sign_transfer(victim.into(), IEUM, 0, 0);
+        assert!(apply(&mut chain, start + 1, vec![send.clone()], vec![]).is_err());
+
+        let recovery = |id: &str| {
+            event(
+                id,
+                ScheduledEventAction::AccountRecovery {
+                    case_id: "case-1".into(),
+                    from: hacker.address(),
+                    payments: vec![EventPayment {
+                        address: victim.into(),
+                        amount: 40 * IEUM,
+                    }],
+                    release: true,
+                },
+            )
+        };
+        assert!(
+            apply(
+                &mut chain,
+                start + 60,
+                vec![],
+                vec![recovery("recover-early")]
+            )
+            .is_err()
+        );
+        let after_notice = start + crate::scheduled_event::RECOVERY_NOTICE_SECONDS;
+        apply(
+            &mut chain,
+            after_notice,
+            vec![],
+            vec![recovery("recover-case-1")],
+        )
+        .unwrap();
+        assert_eq!(chain.balance_of(victim), 40 * IEUM);
+        assert_eq!(chain.balance_of(&hacker.address()), 10 * IEUM);
+        // release=true면 동결이 풀려 남은 잔액을 다시 쓸 수 있습니다.
+        apply(&mut chain, after_notice + 1, vec![send], vec![]).unwrap();
+    }
+
+    #[test]
+    fn freeze_expires_and_unfreeze_requires_same_case() {
+        let hacker = Wallet::from_seed([6; 32]);
+        let mut chain = Blockchain::new(vec![(hacker.address(), 5 * IEUM)]);
+        let freeze = event(
+            "freeze-a",
+            ScheduledEventAction::AccountFreeze {
+                case_id: "a".into(),
+                addresses: vec![hacker.address()],
+                reason: "test".into(),
+            },
+        );
+        apply(&mut chain, 100, vec![], vec![freeze]).unwrap();
+        let wrong = event(
+            "unfreeze-b",
+            ScheduledEventAction::AccountUnfreeze {
+                case_id: "b".into(),
+                addresses: vec![hacker.address()],
+            },
+        );
+        assert!(apply(&mut chain, 101, vec![], vec![wrong]).is_err());
+        let late = 100 + crate::scheduled_event::FREEZE_MAX_SECONDS;
+        let send = hacker.sign_transfer(ADDRESS.into(), IEUM, 0, 0);
+        apply(&mut chain, late, vec![send], vec![]).unwrap();
+        assert_eq!(chain.balance_of(ADDRESS), IEUM);
     }
 }

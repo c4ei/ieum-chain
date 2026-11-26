@@ -49,6 +49,27 @@ pub struct StakingState {
     /// 비어 있으면 직렬화하지 않아 v5 이전 상태 해시가 그대로 유지됩니다.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub accruals: BTreeMap<Address, LockedAccrual>,
+    /// 웹 보상 적립(v6) 기록: 주소별 마지막 epoch와 그날 적립 합계입니다. 비어 있으면 직렬화하지 않습니다.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub accrual_days: BTreeMap<Address, AccrualDay>,
+    /// 해킹 피해 대응용 계정 동결(v6). 동결된 주소는 거래를 보낼 수 없고 받기만 합니다.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub frozen: BTreeMap<Address, FreezeRecord>,
+}
+
+/// 동결 기록입니다. 복구는 frozen_at + 공개 유예 이후, expires_at 이전에만 할 수 있습니다.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FreezeRecord {
+    pub case_id: String,
+    pub frozen_at: u64,
+    pub expires_at: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AccrualDay {
+    pub epoch: u64,
+    #[serde(with = "crate::model::decimal_u128")]
+    pub amount: u128,
 }
 
 impl StakingState {
@@ -72,6 +93,76 @@ impl StakingState {
             .checked_add(amount)
             .ok_or("적립 잔액이 u128 범위를 넘습니다.")?;
         entry.last_epoch = entry.last_epoch.max(epoch);
+        // 같은 날 웹 적립 기록이 있으면 노드 적립도 합산해 하루 한도를 함께 씁니다.
+        if let Some(day) = self.accrual_days.get_mut(address)
+            && day.epoch == epoch
+        {
+            day.amount = day.amount.saturating_add(amount);
+        }
+        Ok(())
+    }
+
+    pub fn is_frozen(&self, address: &str, timestamp: u64) -> bool {
+        self.frozen
+            .get(address)
+            .is_some_and(|record| timestamp < record.expires_at)
+    }
+
+    /// 이 epoch에 이미 쓴 하루 적립 한도입니다. 웹 기록 없이 노드 적립만 있었다면 한도를 다 쓴 것으로 봅니다.
+    pub fn accrual_used_in(&self, address: &str, epoch: u64, cap: u128) -> u128 {
+        match self.accrual_days.get(address) {
+            Some(day) if day.epoch == epoch => day.amount,
+            _ if self
+                .accruals
+                .get(address)
+                .is_some_and(|entry| entry.last_epoch == epoch) =>
+            {
+                cap
+            }
+            _ => 0,
+        }
+    }
+
+    /// 웹 보상 적립(v6). 보낸 사람 잔액에서 빠진 금액을 받는 주소의 잠긴 적립으로 넣습니다.
+    pub fn grant_accrual(
+        &mut self,
+        address: &str,
+        amount: u128,
+        epoch: u64,
+        cap: u128,
+        bond_room: u128,
+    ) -> Result<(), String> {
+        if amount == 0 {
+            return Err("적립액은 0보다 커야 합니다.".into());
+        }
+        let used = self.accrual_used_in(address, epoch, cap);
+        if used.saturating_add(amount) > cap {
+            return Err(format!(
+                "하루 적립 한도를 넘습니다(오늘 {used}, 한도 {cap})."
+            ));
+        }
+        if amount > bond_room {
+            return Err("담보 100 IEUM을 넘는 적립은 할 수 없습니다.".into());
+        }
+        self.accrual_days.insert(
+            address.into(),
+            AccrualDay {
+                epoch,
+                amount: used.saturating_add(amount),
+            },
+        );
+        let entry = self
+            .accruals
+            .entry(address.into())
+            .or_insert(LockedAccrual {
+                amount: 0,
+                last_epoch: epoch,
+            });
+        entry.amount = entry
+            .amount
+            .checked_add(amount)
+            .ok_or("적립 잔액이 u128 범위를 넘습니다.")?;
+        entry.last_epoch = entry.last_epoch.max(epoch);
         Ok(())
     }
 
@@ -80,6 +171,7 @@ impl StakingState {
         match self.accruals.get(address) {
             Some(entry) if entry.amount == amount => {
                 self.accruals.remove(address);
+                self.accrual_days.remove(address);
                 Ok(())
             }
             _ => Err("소멸할 적립 잔액이 현재 상태와 다릅니다.".into()),

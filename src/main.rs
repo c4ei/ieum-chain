@@ -30,7 +30,7 @@ const DEFAULT_BOOTSTRAP_PEERS: [&str; 4] = [
 ];
 const SERVER_INSTANCE_PORT: u16 = 49_889;
 const CLIENT_INSTANCE_PORT: u16 = 49_890;
-const SUPPORTED_PROTOCOL_VERSION: u32 = 5;
+const SUPPORTED_PROTOCOL_VERSION: u32 = 6;
 
 #[derive(Clone, Debug)]
 struct ServiceObservation {
@@ -895,7 +895,8 @@ async fn main() -> Result<(), String> {
             precommit: Duration::from_millis(args.precommit_timeout_ms),
         },
     )?;
-    let event_schedule = EventSchedule::load(&args.events_config)?;
+    let mut event_schedule = EventSchedule::load(&args.events_config)?;
+    let mut events_modified = file_modified(&args.events_config);
     consensus.set_event_schedule(event_schedule.clone())?;
     consensus.set_upgrade_schedule(upgrades.clone());
     consensus.set_validator_interest_policy(validator_interest_policy.clone())?;
@@ -998,6 +999,22 @@ async fn main() -> Result<(), String> {
                 break;
             }
             _ = sync_tick.tick() => {
+                // 동결 같은 긴급 이벤트를 재시작 없이 반영하려고 events 파일 변경을 5초마다 확인합니다.
+                let modified = file_modified(&args.events_config);
+                if modified != events_modified {
+                    events_modified = modified;
+                    match EventSchedule::load(&args.events_config)
+                        .and_then(|schedule| consensus.set_event_schedule(schedule.clone()).map(|_| schedule))
+                    {
+                        Ok(schedule) => {
+                            event_schedule = schedule;
+                            log_info!("이벤트 설정을 다시 읽었습니다({}개).", event_schedule.events.len());
+                        }
+                        Err(error) => ieum_chain::logger::write_repeated_error(&format!(
+                            "[이벤트 설정] 새 파일을 적용하지 않았습니다: {error}"
+                        )),
+                    }
+                }
                 ieum_chain::logger::write_repeated_info(&format!(
                     "[동기화 요청] 현재 높이 {} · 요청 시작 높이 {}",
                     consensus.chain.tip_height(),
@@ -1212,7 +1229,11 @@ async fn main() -> Result<(), String> {
                     }
                     let timestamp = unix_timestamp();
                     let mut due_events =
-                        event_schedule.due(timestamp, consensus.chain.executed_events());
+                        event_schedule.due_at_protocol(
+                            timestamp,
+                            consensus.chain.executed_events(),
+                            upgrades.version_at(consensus.chain.tip_height() + 1),
+                        );
                     if !consensus
                         .chain
                         .executed_events()
@@ -1370,8 +1391,10 @@ async fn main() -> Result<(), String> {
                         let drained = rpc.drain_transactions(1_000)?;
                         let next_height = consensus.chain.tip_height() + 1;
                         let evm_active = upgrades.version_at(next_height) >= ieum_chain::evm::EVM_PROTOCOL_VERSION;
+                        let recovery_active = upgrades.version_at(next_height) >= ieum_chain::node_emission::RECOVERY_PROTOCOL_VERSION;
                         let (allowed, too_early): (Vec<_>, Vec<_>) = drained.into_iter().partition(|tx| {
-                            evm_active || !matches!(tx.action, ieum_chain::model::TransactionAction::Evm)
+                            (evm_active || !matches!(tx.action, ieum_chain::model::TransactionAction::Evm))
+                                && (recovery_active || !matches!(tx.action, ieum_chain::model::TransactionAction::GrantAccrual { .. }))
                         });
                         // 실제로 적용해 보고 실패하는 거래는 빼서, 확정 뒤 적용 실패로 체인이 멈추지 않게 합니다.
                         let (pending, rejected) = consensus.chain.select_executable(
@@ -3169,4 +3192,10 @@ mod tests {
                 .any(|peer| peer.to_string().contains("/udp/7004/"))
         );
     }
+}
+
+fn file_modified(path: &std::path::Path) -> Option<std::time::SystemTime> {
+    std::fs::metadata(path)
+        .and_then(|meta| meta.modified())
+        .ok()
 }

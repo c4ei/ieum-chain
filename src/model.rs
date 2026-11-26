@@ -18,6 +18,10 @@ pub enum TransactionAction {
     ClaimUnbonded,
     /// 계약 배포(`to`가 빈 값) 또는 calldata가 있는 계약 호출입니다. Ethereum raw 거래로만 만듭니다.
     Evm,
+    /// 보낸 사람 잔액으로 받는 주소의 잠긴 적립을 채웁니다(프로토콜 v6, 웹 보상). 하루 한도는 노드 적립과 공유합니다.
+    GrantAccrual {
+        recipient: Address,
+    },
 }
 
 /// 사용자가 서명해 네트워크에 제출하는 가장 기본적인 코인 송금 거래입니다.
@@ -56,6 +60,11 @@ impl TransactionAction {
             }
             Self::ClaimUnbonded => vec![3],
             Self::Evm => vec![4],
+            Self::GrantAccrual { recipient } => {
+                let mut out = vec![5];
+                push_text(&mut out, recipient);
+                out
+            }
         }
     }
 }
