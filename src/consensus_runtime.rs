@@ -1114,8 +1114,7 @@ impl ConsensusRuntime {
                         &self.validator_peer_ids,
                         self.chain.staking(),
                         self.chain.balance_of(crate::FOUNDATION_FEE_ADDRESS),
-                        self.upgrade_schedule.version_at(block.height)
-                            >= crate::node_emission::ACCRUAL_PROTOCOL_VERSION,
+                        self.upgrade_schedule.version_at(block.height),
                     )?;
                     if *snapshot_height != self.chain.tip_height()
                         || *epoch != block.timestamp / crate::node_emission::REWARD_EPOCH_SECONDS

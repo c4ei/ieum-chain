@@ -30,7 +30,7 @@ const DEFAULT_BOOTSTRAP_PEERS: [&str; 4] = [
 ];
 const SERVER_INSTANCE_PORT: u16 = 49_889;
 const CLIENT_INSTANCE_PORT: u16 = 49_890;
-const SUPPORTED_PROTOCOL_VERSION: u32 = 6;
+const SUPPORTED_PROTOCOL_VERSION: u32 = 7;
 
 #[derive(Clone, Debug)]
 struct ServiceObservation {
@@ -1357,8 +1357,7 @@ async fn main() -> Result<(), String> {
                             .filter(|proof| proof.epoch == service_epoch)
                             .cloned()
                             .collect::<Vec<_>>();
-                        let accrual_active = upgrades.version_at(consensus.chain.tip_height() + 1)
-                            >= ieum_chain::node_emission::ACCRUAL_PROTOCOL_VERSION;
+                        let settlement_protocol = upgrades.version_at(consensus.chain.tip_height() + 1);
                         let settlement = ieum_chain::node_emission::calculate_service_settlement(
                             timestamp,
                             &proofs,
@@ -1366,7 +1365,7 @@ async fn main() -> Result<(), String> {
                             &validator_peer_ids,
                             consensus.chain.staking(),
                             consensus.chain.balance_of(ieum_chain::FOUNDATION_FEE_ADDRESS),
-                            accrual_active,
+                            settlement_protocol,
                         )?;
                         if !settlement.is_empty() {
                             due_events.push(ScheduledEvent {

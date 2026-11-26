@@ -106,6 +106,10 @@ pub const ACCRUAL_DAILY_CAP: u128 = 3 * IEUM / 10;
 /// 담보에 못 미친 적립이 이 일수 동안 늘지 않으면 재단(노드 보상 예산)으로 되돌립니다.
 pub const ACCRUAL_EXPIRY_EPOCHS: u64 = 60;
 
+/// 하루 신규 적립 주소 상한이 켜지는 버전과 상한입니다.
+pub const ACCRUAL_LIMIT_PROTOCOL_VERSION: u32 = 7;
+pub const MAX_NEW_ACCRUAL_ADDRESSES_PER_EPOCH: usize = 50;
+
 /// 웹 보상 적립 전용 거래(프로토콜 v6)와 계정 동결·복구 이벤트가 켜지는 버전입니다.
 pub const RECOVERY_PROTOCOL_VERSION: u32 = 6;
 
@@ -160,13 +164,14 @@ pub fn calculate_service_payments(
         validator_peer_ids,
         staking,
         foundation_balance,
-        false,
+        0,
     )
     .map(|settlement| settlement.payments)
 }
 
 /// 세 검증자의 독립 관측, 담보, 주소·대역 중복 상한을 모두 적용합니다.
-/// accrual_active(v5)면 담보 전 노드는 잠긴 적립을, 오래 멈춘 적립은 소멸을 함께 계산합니다.
+/// protocol ≥ v5면 담보 전 노드는 잠긴 적립을, 오래 멈춘 적립은 소멸을 함께 계산합니다.
+/// protocol ≥ v7이면 하루에 새로 적립을 시작하는 주소 수를 제한합니다.
 pub fn calculate_service_settlement(
     timestamp: u64,
     attestations: &[NodeServiceAttestation],
@@ -174,8 +179,9 @@ pub fn calculate_service_settlement(
     validator_peer_ids: &HashSet<String>,
     staking: &crate::staking::StakingState,
     foundation_balance: u128,
-    accrual_active: bool,
+    protocol: u32,
 ) -> Result<ServiceSettlement, String> {
+    let accrual_active = protocol >= ACCRUAL_PROTOCOL_VERSION;
     let epoch = timestamp / REWARD_EPOCH_SECONDS;
     let active: HashSet<_> = validators
         .iter()
@@ -254,6 +260,20 @@ pub fn calculate_service_settlement(
     };
     bonded.retain(|(_, _, network_group)| within_network_limit(network_group));
     unbonded.retain(|(_, _, network_group)| within_network_limit(network_group));
+
+    // v7: 이미 적립 중인 주소를 먼저 두고, 새 주소는 날마다 바뀌는 해시 순서로 하루 상한까지만 받습니다.
+    // 노드를 한꺼번에 많이 띄워도 하루에 늘어나는 적립 주소 수가 제한됩니다.
+    if protocol >= ACCRUAL_LIMIT_PROTOCOL_VERSION {
+        let (mut existing, mut fresh): (Vec<_>, Vec<_>) = unbonded
+            .into_iter()
+            .partition(|(_, address, _)| staking.accruals.contains_key(address));
+        fresh.sort_by_cached_key(|(_, address, _)| {
+            Sha256::digest(format!("ieum-accrual-new-v7:{epoch}:{address}").as_bytes()).to_vec()
+        });
+        fresh.truncate(MAX_NEW_ACCRUAL_ADDRESSES_PER_EPOCH);
+        existing.extend(fresh);
+        unbonded = existing;
+    }
 
     let mut settlement = ServiceSettlement::default();
     let mut budget = daily_budget(timestamp)
@@ -524,7 +544,7 @@ mod tests {
             &HashSet::new(),
             staking,
             2_000 * IEUM,
-            true,
+            6,
         )
         .unwrap()
     }
@@ -539,7 +559,7 @@ mod tests {
             &HashSet::new(),
             &staking,
             2_000 * IEUM,
-            false,
+            4,
         )
         .unwrap();
         assert!(before.is_empty());
@@ -586,6 +606,43 @@ mod tests {
                 .len(),
             2
         );
+    }
+
+    #[test]
+    fn v7_limits_new_accrual_addresses_per_day_but_keeps_existing_ones() {
+        let (timestamp, validators, _, mut staking) = service_fixture(IEUM, 0);
+        let epoch = timestamp / REWARD_EPOCH_SECONDS;
+        let mut proofs = Vec::new();
+        for index in 0..60u32 {
+            proofs.extend(proofs_for(
+                timestamp,
+                &format!("peer-{index}"),
+                &format!("0x{:040x}", 0x5000 + index),
+                &format!("ipv4:10.{}.{}.0/24", index / 200, index % 200),
+            ));
+        }
+        let existing = format!("0x{:040x}", 0x5000 + 59);
+        staking.add_accrual(&existing, IEUM, epoch - 1).unwrap();
+        let run = |protocol| {
+            calculate_service_settlement(
+                timestamp,
+                &proofs,
+                &validators,
+                &HashSet::new(),
+                &staking,
+                2_000 * IEUM,
+                protocol,
+            )
+            .unwrap()
+            .accruals
+        };
+        let before = run(6);
+        let limited = run(7);
+        assert!(before.len() > MAX_NEW_ACCRUAL_ADDRESSES_PER_EPOCH + 1);
+        assert_eq!(limited.len(), MAX_NEW_ACCRUAL_ADDRESSES_PER_EPOCH + 1);
+        assert_eq!(limited[0].address, existing);
+        // 같은 입력이면 모든 검증자가 같은 결과를 냅니다.
+        assert_eq!(limited, run(7));
     }
 
     #[test]
