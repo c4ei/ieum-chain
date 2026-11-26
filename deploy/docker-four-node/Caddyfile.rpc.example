@@ -1,0 +1,37 @@
+# MetaMask·chainlist.org용 공개 HTTPS RPC 예시입니다. 도메인을 실제 값으로 바꾸세요.
+# 네 노드에 나눠 보내고, /health가 503인 노드(동기화 중·피어 부족)는 자동으로 뺍니다.
+rpc.example.com {
+    encode zstd gzip
+
+    @health path /health
+    @rpc {
+        path /
+        method POST OPTIONS
+    }
+
+    request_body {
+        max_size 256KB
+    }
+
+    handle @health {
+        reverse_proxy 127.0.0.1:8989 127.0.0.1:8990 127.0.0.1:8991 127.0.0.1:8992
+    }
+    handle @rpc {
+        reverse_proxy 127.0.0.1:8989 127.0.0.1:8990 127.0.0.1:8991 127.0.0.1:8992 {
+            lb_policy round_robin
+            lb_try_duration 5s
+            health_uri /health
+            health_interval 10s
+            health_timeout 3s
+        }
+    }
+    handle {
+        respond "not found" 404
+    }
+
+    header {
+        Strict-Transport-Security "max-age=31536000"
+        X-Content-Type-Options "nosniff"
+        -Server
+    }
+}

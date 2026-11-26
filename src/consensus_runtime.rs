@@ -1083,18 +1083,24 @@ impl ConsensusRuntime {
                     epoch,
                     attestations,
                     payments,
+                    accruals,
+                    expired,
                 } if event.id == crate::node_emission::service_event_id(*epoch) => {
-                    let expected = crate::node_emission::calculate_service_payments(
+                    let expected = crate::node_emission::calculate_service_settlement(
                         block.timestamp,
                         attestations,
                         &self.validators,
                         &self.validator_peer_ids,
                         self.chain.staking(),
                         self.chain.balance_of(crate::FOUNDATION_FEE_ADDRESS),
+                        self.upgrade_schedule.version_at(block.height)
+                            >= crate::node_emission::ACCRUAL_PROTOCOL_VERSION,
                     )?;
                     if *snapshot_height != self.chain.tip_height()
                         || *epoch != block.timestamp / crate::node_emission::REWARD_EPOCH_SECONDS
-                        || payments != &expected
+                        || payments != &expected.payments
+                        || accruals != &expected.accruals
+                        || expired != &expected.expired
                     {
                         return Err(
                             "공개 노드 일일 보상이 담보·서비스 증명 계산과 일치하지 않습니다."

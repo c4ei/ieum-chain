@@ -99,7 +99,39 @@ pub fn service_event_id(epoch: u64) -> String {
     format!("ieum-node-service-reward-v1-{epoch}")
 }
 
-/// 세 검증자의 독립 관측, 100 IEUM 성숙 담보, 주소·대역 중복 상한을 모두 적용합니다.
+/// 담보 전 노드 적립이 켜지는 프로토콜 버전입니다. upgrades.json에 활성 높이를 등록해야 켜집니다.
+pub const ACCRUAL_PROTOCOL_VERSION: u32 = 5;
+/// 보상 주소 하나가 하루에 쌓을 수 있는 잠긴 적립 상한(0.3 IEUM)입니다. 100 IEUM까지 최소 334일.
+pub const ACCRUAL_DAILY_CAP: u128 = 3 * IEUM / 10;
+/// 담보에 못 미친 적립이 이 일수 동안 늘지 않으면 재단(노드 보상 예산)으로 되돌립니다.
+pub const ACCRUAL_EXPIRY_EPOCHS: u64 = 60;
+
+/// 공개 노드 하루 정산 결과입니다. payments는 일반 잔액, accruals는 잠긴 적립 잔액으로 들어갑니다.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ServiceSettlement {
+    pub payments: Vec<EventPayment>,
+    pub accruals: Vec<EventPayment>,
+    pub expired: Vec<EventPayment>,
+}
+
+impl ServiceSettlement {
+    pub fn is_empty(&self) -> bool {
+        self.payments.is_empty() && self.accruals.is_empty() && self.expired.is_empty()
+    }
+}
+
+/// 담보 인정액: 7일 지난 위임 + 잠긴 적립. 적립은 오래 가동해 쌓인 것이라 따로 숙성 기간을 두지 않습니다.
+pub fn service_bond_of(
+    staking: &crate::staking::StakingState,
+    address: &str,
+    timestamp: u64,
+) -> u128 {
+    staking
+        .mature_delegated_by(address, timestamp, SERVICE_BOND_MATURITY_SECONDS)
+        .saturating_add(staking.locked_accrual_of(address))
+}
+
+/// v5 이전과 같은 담보 노드 지급액만 계산합니다.
 pub fn calculate_service_payments(
     timestamp: u64,
     attestations: &[NodeServiceAttestation],
@@ -108,6 +140,29 @@ pub fn calculate_service_payments(
     staking: &crate::staking::StakingState,
     foundation_balance: u128,
 ) -> Result<Vec<EventPayment>, String> {
+    calculate_service_settlement(
+        timestamp,
+        attestations,
+        validators,
+        validator_peer_ids,
+        staking,
+        foundation_balance,
+        false,
+    )
+    .map(|settlement| settlement.payments)
+}
+
+/// 세 검증자의 독립 관측, 담보, 주소·대역 중복 상한을 모두 적용합니다.
+/// accrual_active(v5)면 담보 전 노드는 잠긴 적립을, 오래 멈춘 적립은 소멸을 함께 계산합니다.
+pub fn calculate_service_settlement(
+    timestamp: u64,
+    attestations: &[NodeServiceAttestation],
+    validators: &[Validator],
+    validator_peer_ids: &HashSet<String>,
+    staking: &crate::staking::StakingState,
+    foundation_balance: u128,
+    accrual_active: bool,
+) -> Result<ServiceSettlement, String> {
     let epoch = timestamp / REWARD_EPOCH_SECONDS;
     let active: HashSet<_> = validators
         .iter()
@@ -132,21 +187,23 @@ pub fn calculate_service_payments(
             .push(attestation);
     }
 
-    let mut eligible = Vec::<(String, String, String)>::new();
+    // 보상 주소 하나는 노드를 몇 대 돌려도 하루 한 몫(지급 또는 적립)만 받습니다.
+    let mut bonded = Vec::<(String, String, String)>::new();
+    let mut unbonded = Vec::<(String, String, String)>::new();
     let mut used_addresses = HashSet::new();
     for ((peer_id, reward_address), proofs) in groups {
         let unique_validators: HashSet<_> = proofs
             .iter()
             .map(|proof| proof.validator_id.as_str())
             .collect();
-        if unique_validators.len() < SERVICE_MINIMUM_VALIDATORS
-            || staking.mature_delegated_by(
-                &reward_address,
-                timestamp,
-                SERVICE_BOND_MATURITY_SECONDS,
-            ) < SERVICE_BOND
-            || !used_addresses.insert(reward_address.clone())
-        {
+        if unique_validators.len() < SERVICE_MINIMUM_VALIDATORS {
+            continue;
+        }
+        let is_bonded = service_bond_of(staking, &reward_address, timestamp) >= SERVICE_BOND;
+        if !is_bonded && !accrual_active {
+            continue;
+        }
+        if !used_addresses.insert(reward_address.clone()) {
             continue;
         }
         let mut network_counts = HashMap::<&str, usize>::new();
@@ -162,44 +219,88 @@ pub fn calculate_service_payments(
         if count < SERVICE_MINIMUM_VALIDATORS {
             continue;
         }
-        eligible.push((peer_id, reward_address, network_group.to_string()));
+        let entry = (peer_id, reward_address, network_group.to_string());
+        if is_bonded {
+            bonded.push(entry);
+        } else {
+            unbonded.push(entry);
+        }
     }
-    eligible.sort();
+    bonded.sort();
+    unbonded.sort();
 
+    // 같은 /24·/48 대역에서는 담보·적립을 합쳐 2대까지만 인정합니다. 담보 노드를 먼저 셉니다.
     let mut per_network = HashMap::<String, usize>::new();
-    eligible.retain(|(_, _, network_group)| {
+    let mut within_network_limit = |network_group: &String| {
         let count = per_network.entry(network_group.clone()).or_default();
         if *count >= SERVICE_MAX_REWARDED_PER_NETWORK_GROUP {
             return false;
         }
         *count += 1;
         true
-    });
-    if eligible.is_empty() {
-        return Ok(Vec::new());
-    }
-    let pool = daily_budget(timestamp)
+    };
+    bonded.retain(|(_, _, network_group)| within_network_limit(network_group));
+    unbonded.retain(|(_, _, network_group)| within_network_limit(network_group));
+
+    let mut settlement = ServiceSettlement::default();
+    let mut budget = daily_budget(timestamp)
         .min(SERVICE_DAILY_POOL_CAP)
         .min(foundation_balance);
-    if pool == 0 {
-        return Ok(Vec::new());
+
+    if accrual_active {
+        let accruing: HashSet<&str> = unbonded
+            .iter()
+            .map(|(_, address, _)| address.as_str())
+            .collect();
+        for (address, entry) in &staking.accruals {
+            if entry.amount < SERVICE_BOND
+                && !accruing.contains(address.as_str())
+                && epoch.saturating_sub(entry.last_epoch) > ACCRUAL_EXPIRY_EPOCHS
+            {
+                settlement.expired.push(EventPayment {
+                    address: address.clone(),
+                    amount: entry.amount,
+                });
+            }
+        }
+        // 소멸분은 같은 블록에서 재단으로 돌아오지만, 오늘 예산은 늘리지 않습니다.
+        for (_, address, _) in &unbonded {
+            let room = SERVICE_BOND
+                .saturating_sub(service_bond_of(staking, address, timestamp))
+                .min(ACCRUAL_DAILY_CAP)
+                .min(budget);
+            if room == 0 {
+                continue;
+            }
+            budget -= room;
+            settlement.accruals.push(EventPayment {
+                address: address.clone(),
+                amount: room,
+            });
+        }
     }
-    let eligible_count = eligible.len();
-    let each = pool / eligible_count as u128;
+
+    if bonded.is_empty() || budget == 0 {
+        return Ok(settlement);
+    }
+    let eligible_count = bonded.len();
+    let each = budget / eligible_count as u128;
     let mut assigned = 0u128;
-    Ok(eligible
+    settlement.payments = bonded
         .into_iter()
         .enumerate()
         .map(|(index, (_, address, _))| {
             let amount = if index + 1 == eligible_count {
-                pool - assigned
+                budget - assigned
             } else {
                 each
             };
             assigned += amount;
             EventPayment { address, amount }
         })
-        .collect())
+        .filter(|payment| payment.amount > 0)
+        .collect();
+    Ok(settlement)
 }
 
 pub fn is_reward_active(height: u64, timestamp: u64) -> bool {
@@ -376,6 +477,168 @@ mod tests {
             .delegate_at(reward_address, &wallets[0].address(), bond, delegated_at)
             .unwrap();
         (timestamp, validators, proofs, staking)
+    }
+
+    fn proofs_for(
+        timestamp: u64,
+        peer: &str,
+        address: &str,
+        group: &str,
+    ) -> Vec<NodeServiceAttestation> {
+        (1..=3)
+            .map(|seed| {
+                service_proof(
+                    &Wallet::from_seed([seed; 32]),
+                    peer,
+                    address,
+                    timestamp,
+                    group,
+                )
+            })
+            .collect()
+    }
+
+    fn settle(
+        timestamp: u64,
+        proofs: &[NodeServiceAttestation],
+        validators: &[Validator],
+        staking: &StakingState,
+    ) -> ServiceSettlement {
+        calculate_service_settlement(
+            timestamp,
+            proofs,
+            validators,
+            &HashSet::new(),
+            staking,
+            2_000 * IEUM,
+            true,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn unbonded_node_accrues_locked_daily_cap_only_after_v5() {
+        let (timestamp, validators, proofs, staking) = service_fixture(IEUM, 0);
+        let before = calculate_service_settlement(
+            timestamp,
+            &proofs,
+            &validators,
+            &HashSet::new(),
+            &staking,
+            2_000 * IEUM,
+            false,
+        )
+        .unwrap();
+        assert!(before.is_empty());
+
+        let after = settle(timestamp, &proofs, &validators, &staking);
+        assert!(after.payments.is_empty());
+        assert_eq!(after.accruals.len(), 1);
+        assert_eq!(after.accruals[0].amount, ACCRUAL_DAILY_CAP);
+    }
+
+    #[test]
+    fn many_nodes_on_one_address_accrue_once_per_day() {
+        let (timestamp, validators, _, staking) = service_fixture(IEUM, 0);
+        let address = "0x2222222222222222222222222222222222222222";
+        let mut proofs = Vec::new();
+        for index in 0..10 {
+            proofs.extend(proofs_for(
+                timestamp,
+                &format!("peer-{index}"),
+                address,
+                &format!("ipv4:198.51.{index}.0/24"),
+            ));
+        }
+        let settlement = settle(timestamp, &proofs, &validators, &staking);
+        assert_eq!(settlement.accruals.len(), 1);
+        assert_eq!(settlement.accruals[0].amount, ACCRUAL_DAILY_CAP);
+    }
+
+    #[test]
+    fn same_network_group_accrues_for_two_addresses_only() {
+        let (timestamp, validators, _, staking) = service_fixture(IEUM, 0);
+        let mut proofs = Vec::new();
+        for index in 0..10 {
+            proofs.extend(proofs_for(
+                timestamp,
+                &format!("peer-{index}"),
+                &format!("0x{:040x}", 0x3000 + index),
+                "ipv4:198.51.100.0/24",
+            ));
+        }
+        assert_eq!(
+            settle(timestamp, &proofs, &validators, &staking)
+                .accruals
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn accrual_stops_at_bond_and_full_accrual_counts_as_bond() {
+        let (timestamp, validators, proofs, mut staking) = service_fixture(IEUM, u64::MAX);
+        let address = "0x1111111111111111111111111111111111111111";
+        let epoch = timestamp / REWARD_EPOCH_SECONDS;
+        // 위임 1 IEUM(미성숙) + 적립 98.9 → 남은 1.1 중 하루 상한 0.3만 적립
+        staking
+            .add_accrual(address, 989 * IEUM / 10, epoch - 1)
+            .unwrap();
+        assert_eq!(
+            settle(timestamp, &proofs, &validators, &staking).accruals[0].amount,
+            ACCRUAL_DAILY_CAP
+        );
+        staking.add_accrual(address, IEUM, epoch - 1).unwrap();
+        assert_eq!(
+            settle(timestamp, &proofs, &validators, &staking).accruals[0].amount,
+            IEUM / 10
+        );
+        staking.add_accrual(address, IEUM / 10, epoch - 1).unwrap();
+        let bonded = settle(timestamp, &proofs, &validators, &staking);
+        assert!(bonded.accruals.is_empty());
+        assert_eq!(bonded.payments.len(), 1);
+    }
+
+    #[test]
+    fn stalled_accrual_expires_after_sixty_days_but_full_bond_does_not() {
+        let (timestamp, validators, _, mut staking) = service_fixture(IEUM, 0);
+        let epoch = timestamp / REWARD_EPOCH_SECONDS;
+        staking
+            .add_accrual(
+                "0x4444444444444444444444444444444444444444",
+                5 * IEUM,
+                epoch - 61,
+            )
+            .unwrap();
+        staking
+            .add_accrual(
+                "0x5555555555555555555555555555555555555555",
+                5 * IEUM,
+                epoch - 60,
+            )
+            .unwrap();
+        staking
+            .add_accrual(
+                "0x6666666666666666666666666666666666666666",
+                SERVICE_BOND,
+                epoch - 400,
+            )
+            .unwrap();
+        let settlement = settle(timestamp, &[], &validators, &staking);
+        assert_eq!(settlement.expired.len(), 1);
+        assert_eq!(
+            settlement.expired[0].address,
+            "0x4444444444444444444444444444444444444444"
+        );
+        assert_eq!(settlement.expired[0].amount, 5 * IEUM);
+    }
+
+    #[test]
+    fn accruals_do_not_change_pre_v5_staking_serialization() {
+        assert_eq!(
+            serde_json::to_string(&StakingState::default()).unwrap(),
+            r#"{"delegations":[],"unbonding":[],"applied_slashes":[]}"#
+        );
     }
 
     #[test]

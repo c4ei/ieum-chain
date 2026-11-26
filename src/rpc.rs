@@ -5,7 +5,14 @@ use crate::{
     ArchiveStore, Blockchain, CommunicationEnvelope, CommunicationInbox, GenesisConfig, Keystore,
     Mempool, SnapshotCertificate, StateStore, account::AccountWallet,
 };
-use axum::{Json, Router, routing::post};
+use axum::{
+    Json, Router,
+    extract::Request,
+    http::{HeaderValue, StatusCode, header},
+    middleware::{self, Next},
+    response::Response,
+    routing::{get, post},
+};
 use serde_json::{Value, json};
 use sha2::Digest;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -546,9 +553,7 @@ impl RpcServer {
 
     pub async fn run(self) -> Result<(), String> {
         let address = SocketAddr::new(self.config.listen_ip, self.config.port);
-        let app = Router::new()
-            .route("/", post(handle_rpc))
-            .with_state(self.state);
+        let app = rpc_router(self.state, !self.config.listen_ip.is_loopback());
         let listener = tokio::net::TcpListener::bind(address)
             .await
             .map_err(|error| format!("JSON-RPC 포트 열기 실패: {error}"))?;
@@ -563,6 +568,64 @@ impl RpcServer {
             state: Arc::clone(&self.state),
         }
     }
+}
+
+/// 외부 공개 노드(localhost가 아닌 주소)에만 CORS를 켭니다. localhost 노드는 계정 RPC가
+/// 열려 있으므로 브라우저의 다른 사이트가 호출하지 못하도록 CORS 헤더를 붙이지 않습니다.
+fn rpc_router(state: Arc<RwLock<RpcState>>, public_cors: bool) -> Router {
+    let router = Router::new()
+        .route(
+            "/",
+            post(handle_rpc).options(|| async { StatusCode::NO_CONTENT }),
+        )
+        .route("/health", get(handle_health))
+        .with_state(state);
+    if public_cors {
+        router.layer(middleware::from_fn(cors_headers))
+    } else {
+        router
+    }
+}
+
+async fn cors_headers(request: Request, next: Next) -> Response {
+    let mut response = next.run(request).await;
+    let headers = response.headers_mut();
+    for (name, value) in [
+        (header::ACCESS_CONTROL_ALLOW_ORIGIN, "*"),
+        (header::ACCESS_CONTROL_ALLOW_METHODS, "GET, POST, OPTIONS"),
+        (header::ACCESS_CONTROL_ALLOW_HEADERS, "content-type"),
+        (header::ACCESS_CONTROL_MAX_AGE, "86400"),
+    ] {
+        headers.insert(name, HeaderValue::from_static(value));
+    }
+    response
+}
+
+/// 리버스 프록시 상태 확인용입니다. 동기화가 끝났고 피어가 2개 이상이면 200을 돌려줍니다.
+async fn handle_health(
+    axum::extract::State(state): axum::extract::State<Arc<RwLock<RpcState>>>,
+) -> (StatusCode, Json<Value>) {
+    let Ok(state) = state.read() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"healthy": false})),
+        );
+    };
+    let healthy = !state.sync_active && state.peer_count >= 2;
+    let status = if healthy {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (
+        status,
+        Json(json!({
+            "healthy": healthy,
+            "height": state.chain.tip_height(),
+            "peers": state.peer_count,
+            "syncing": state.sync_active
+        })),
+    )
 }
 
 async fn handle_rpc(
@@ -1265,6 +1328,37 @@ fn dispatch(
             Ok(
                 json!({"height":state.chain.tip_height(),"systemAddress":crate::staking::STAKING_SYSTEM_ADDRESS,"minimumDelegation":crate::staking::MINIMUM_DELEGATION.to_string(),"unbondingSeconds":crate::staking::UNBONDING_SECONDS,"doubleVoteSlashBps":crate::staking::DOUBLE_VOTE_SLASH_BPS,"delegations":delegations,"unbonding":unbonding,"validators":validators,"votingPowerAffected":false}),
             )
+        }
+        "ieum_accrualStatus" => {
+            // 지갑·대시보드의 "담보 진행 막대"용입니다. 잠긴 적립은 보낼 수 없고 담보로만 인정됩니다.
+            let address = normalize_address(string_param(params, 0)?);
+            let state = read_state(state)?;
+            let staking = state.chain.staking();
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|v| v.as_secs())
+                .unwrap_or(0);
+            let locked = staking.locked_accrual_of(&address);
+            let bond = crate::node_emission::service_bond_of(staking, &address, now);
+            let remaining = crate::node_emission::SERVICE_BOND.saturating_sub(bond);
+            let cap = crate::node_emission::ACCRUAL_DAILY_CAP;
+            let last_epoch = staking.accruals.get(&address).map(|entry| entry.last_epoch);
+            Ok(json!({
+                "address": address,
+                "active": state.upgrade_schedule.version_at(state.chain.tip_height() + 1)
+                    >= crate::node_emission::ACCRUAL_PROTOCOL_VERSION,
+                "locked": locked.to_string(),
+                "bond": bond.to_string(),
+                "bondRequired": crate::node_emission::SERVICE_BOND.to_string(),
+                "remaining": remaining.to_string(),
+                "bonded": remaining == 0,
+                "dailyCap": cap.to_string(),
+                "minimumDaysToBond": remaining.div_ceil(cap),
+                "lastEpoch": last_epoch,
+                "expiresAfterEpoch": last_epoch
+                    .filter(|_| remaining > 0)
+                    .map(|epoch| epoch + crate::node_emission::ACCRUAL_EXPIRY_EPOCHS)
+            }))
         }
         "ieum_encodeStakingCall" => {
             let action = string_param(params, 0)?;
@@ -2757,6 +2851,57 @@ mod tests {
         let shared = RpcServer::new(test_rpc_config("malformed-raw-transaction")).state;
         let error = dispatch(&shared, "eth_sendRawTransaction", &[json!("0x00")]).unwrap_err();
         assert_eq!(error.0, -32000);
+    }
+
+    async fn http_request(router: Router, request: &str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await.unwrap();
+        response.to_lowercase()
+    }
+
+    #[tokio::test]
+    async fn public_rpc_answers_cors_preflight_and_health() {
+        let state = RpcServer::new(test_rpc_config("public-cors")).state;
+        state.write().unwrap().peer_count = 3;
+        let preflight = http_request(
+            rpc_router(Arc::clone(&state), true),
+            "OPTIONS / HTTP/1.1\r\nhost: x\r\norigin: https://chainlist.org\r\naccess-control-request-method: POST\r\nconnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(preflight.starts_with("http/1.1 204"));
+        assert!(preflight.contains("access-control-allow-origin: *"));
+
+        let health = http_request(
+            rpc_router(Arc::clone(&state), true),
+            "GET /health HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(health.starts_with("http/1.1 200"));
+        state.write().unwrap().peer_count = 1;
+        let unhealthy = http_request(
+            rpc_router(state, true),
+            "GET /health HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(unhealthy.starts_with("http/1.1 503"));
+    }
+
+    #[tokio::test]
+    async fn localhost_rpc_sends_no_cors_headers() {
+        let state = RpcServer::new(test_rpc_config("local-no-cors")).state;
+        let response = http_request(
+            rpc_router(state, false),
+            "POST / HTTP/1.1\r\nhost: x\r\norigin: https://evil.example\r\ncontent-type: application/json\r\ncontent-length: 59\r\nconnection: close\r\n\r\n{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"eth_chainId\",\"params\":[]}",
+        )
+        .await;
+        assert!(response.starts_with("http/1.1 200"));
+        assert!(!response.contains("access-control-allow-origin"));
     }
 
     #[test]

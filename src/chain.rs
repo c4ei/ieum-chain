@@ -455,6 +455,7 @@ impl Blockchain {
         if !self.staking.delegations.is_empty()
             || !self.staking.unbonding.is_empty()
             || !self.staking.applied_slashes.is_empty()
+            || !self.staking.accruals.is_empty()
         {
             hasher.update(b"staking-v1:");
             hasher.update(self.staking.state_bytes());
@@ -488,6 +489,7 @@ fn validate_supply_cap(
     let total = liquid
         .checked_add(delegated)
         .and_then(|value| value.checked_add(unbonding))
+        .and_then(|value| value.checked_add(staking.total_accruals()))
         .ok_or("총발행량 합계가 u128 범위를 넘습니다.")?;
     if total > crate::genesis::IEUM_MAX_SUPPLY {
         return Err("총발행량이 IEUM 최대 발행량 210,000,000을 넘습니다.".into());
@@ -572,9 +574,38 @@ fn apply_system_events(
                     transfer_from_foundation(balances, &payment.address, payment.amount)?;
                 }
             }
-            ScheduledEventAction::NodeServiceDailyReward { payments, .. } => {
+            ScheduledEventAction::NodeServiceDailyReward {
+                epoch,
+                payments,
+                accruals,
+                expired,
+                ..
+            } => {
                 for payment in payments {
                     transfer_from_foundation(balances, &payment.address, payment.amount)?;
+                }
+                for entry in expired {
+                    let address = normalize_address(&entry.address);
+                    staking.expire_accrual(&address, entry.amount)?;
+                    credit_balance(
+                        balances,
+                        FOUNDATION_FEE_ADDRESS,
+                        entry.amount,
+                        "재단 잔액이 u128 범위를 넘습니다.",
+                    )?;
+                }
+                // 적립은 재단에서 빼서 잠긴 적립 잔액으로만 옮깁니다. 일반 잔액에는 더하지 않습니다.
+                for accrual in accruals {
+                    let foundation = balances.get(FOUNDATION_FEE_ADDRESS).copied().unwrap_or(0);
+                    if foundation < accrual.amount {
+                        return Err("노드 적립을 실행할 재단 잔액이 부족합니다.".into());
+                    }
+                    balances.insert(FOUNDATION_FEE_ADDRESS.into(), foundation - accrual.amount);
+                    staking.add_accrual(
+                        &normalize_address(&accrual.address),
+                        accrual.amount,
+                        *epoch,
+                    )?;
                 }
             }
         }
@@ -916,5 +947,108 @@ mod staking_transaction_tests {
             chain.balance_of(&alice.address()),
             14 * MINIMUM_DELEGATION - 3
         );
+    }
+}
+
+#[cfg(test)]
+mod accrual_tests {
+    use super::*;
+    use crate::node_emission::{NodeServiceAttestation, REWARD_EPOCH_SECONDS, service_event_id};
+    use crate::scheduled_event::{EventPayment, ScheduledEvent, ScheduledEventAction};
+    use crate::wallet::Wallet;
+
+    const IEUM: u128 = 10u128.pow(18);
+    const ADDRESS: &str = "0x1111111111111111111111111111111111111111";
+
+    fn reward_event(
+        epoch: u64,
+        accruals: Vec<EventPayment>,
+        expired: Vec<EventPayment>,
+    ) -> ScheduledEvent {
+        let attestations = if accruals.is_empty() {
+            Vec::new()
+        } else {
+            (1..=3)
+                .map(|seed| {
+                    let wallet = Wallet::from_seed([seed; 32]);
+                    let mut proof = NodeServiceAttestation {
+                        peer_id: "peer".into(),
+                        reward_address: ADDRESS.into(),
+                        epoch,
+                        observed_at: epoch * REWARD_EPOCH_SECONDS,
+                        uptime_bps: 9_000,
+                        network_group: "ipv4:203.0.113.0/24".into(),
+                        validator_id: wallet.address(),
+                        signature_hex: String::new(),
+                    };
+                    proof.signature_hex = wallet.sign_bytes(&proof.bytes_to_sign());
+                    proof
+                })
+                .collect()
+        };
+        ScheduledEvent {
+            id: service_event_id(epoch),
+            execute_at: 1,
+            action: ScheduledEventAction::NodeServiceDailyReward {
+                snapshot_height: 0,
+                epoch,
+                attestations,
+                payments: vec![],
+                accruals,
+                expired,
+            },
+        }
+    }
+
+    #[test]
+    fn accrual_is_locked_not_spendable_and_expiry_returns_it() {
+        let mut chain = Blockchain::new(vec![(FOUNDATION_FEE_ADDRESS.into(), 1_000 * IEUM)]);
+        let hash_before = chain.state_hash();
+        let amount = 3 * IEUM / 10;
+        let event = reward_event(
+            10,
+            vec![EventPayment {
+                address: ADDRESS.into(),
+                amount,
+            }],
+            vec![],
+        );
+        let block = Block::new(1, chain.tip_hash().into(), 1, "producer".into(), vec![])
+            .with_system_events(vec![event]);
+        chain.apply_block(block).unwrap();
+        assert_eq!(chain.balance_of(ADDRESS), 0);
+        assert_eq!(chain.staking().locked_accrual_of(ADDRESS), amount);
+        assert_eq!(
+            chain.balance_of(FOUNDATION_FEE_ADDRESS),
+            1_000 * IEUM - amount
+        );
+        assert_eq!(chain.staking().accruals[ADDRESS].last_epoch, 10);
+        assert_ne!(chain.state_hash(), hash_before);
+
+        let wrong = reward_event(
+            80,
+            vec![],
+            vec![EventPayment {
+                address: ADDRESS.into(),
+                amount: amount + 1,
+            }],
+        );
+        let block = Block::new(2, chain.tip_hash().into(), 2, "producer".into(), vec![])
+            .with_system_events(vec![wrong]);
+        assert!(chain.apply_block(block).is_err());
+
+        let expiry = reward_event(
+            80,
+            vec![],
+            vec![EventPayment {
+                address: ADDRESS.into(),
+                amount,
+            }],
+        );
+        let block = Block::new(2, chain.tip_hash().into(), 2, "producer".into(), vec![])
+            .with_system_events(vec![expiry]);
+        chain.apply_block(block).unwrap();
+        assert_eq!(chain.staking().locked_accrual_of(ADDRESS), 0);
+        assert_eq!(chain.balance_of(FOUNDATION_FEE_ADDRESS), 1_000 * IEUM);
     }
 }
