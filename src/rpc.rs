@@ -259,6 +259,7 @@ impl RpcNodeHandle {
                 &transaction.action,
                 crate::model::TransactionAction::Transfer
                     | crate::model::TransactionAction::Delegate { .. }
+                    | crate::model::TransactionAction::GrantAccrual { .. }
                     | crate::model::TransactionAction::Evm
             ) {
                 transaction.amount
@@ -1329,15 +1330,31 @@ fn dispatch(
                 json!({"height":state.chain.tip_height(),"systemAddress":crate::staking::STAKING_SYSTEM_ADDRESS,"minimumDelegation":crate::staking::MINIMUM_DELEGATION.to_string(),"unbondingSeconds":crate::staking::UNBONDING_SECONDS,"doubleVoteSlashBps":crate::staking::DOUBLE_VOTE_SLASH_BPS,"delegations":delegations,"unbonding":unbonding,"validators":validators,"votingPowerAffected":false}),
             )
         }
+        "ieum_freezeStatus" => {
+            // 동결 이력 공개용입니다. 동결 중이면 사건 ID와 복구 가능 시각을 보여 줍니다.
+            let raw_address = string_param(params, 0)?;
+            valid_account_address(raw_address)?;
+            let address = normalize_address(raw_address);
+            let state = read_state(state)?;
+            let now = unix_now();
+            let record = state.chain.staking().frozen.get(&address).cloned();
+            Ok(json!({
+                "address": address,
+                "frozen": state.chain.staking().is_frozen(&address, now),
+                "caseId": record.as_ref().map(|r| r.case_id.clone()),
+                "frozenAt": record.as_ref().map(|r| r.frozen_at),
+                "recoverableAfter": record.as_ref().map(|r| r.frozen_at.saturating_add(crate::scheduled_event::RECOVERY_NOTICE_SECONDS)),
+                "expiresAt": record.as_ref().map(|r| r.expires_at),
+            }))
+        }
         "ieum_accrualStatus" => {
             // 지갑·대시보드의 "담보 진행 막대"용입니다. 잠긴 적립은 보낼 수 없고 담보로만 인정됩니다.
-            let address = normalize_address(string_param(params, 0)?);
+            let raw_address = string_param(params, 0)?;
+            valid_account_address(raw_address)?;
+            let address = normalize_address(raw_address);
             let state = read_state(state)?;
             let staking = state.chain.staking();
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|v| v.as_secs())
-                .unwrap_or(0);
+            let now = unix_now();
             let locked = staking.locked_accrual_of(&address);
             let bond = crate::node_emission::service_bond_of(staking, &address, now);
             let remaining = crate::node_emission::SERVICE_BOND.saturating_sub(bond);
@@ -1354,6 +1371,9 @@ fn dispatch(
                 "bonded": remaining == 0,
                 "dailyCap": cap.to_string(),
                 "minimumDaysToBond": remaining.div_ceil(cap),
+                "todayUsed": staking
+                    .accrual_used_in(&address, now / crate::node_emission::REWARD_EPOCH_SECONDS, cap)
+                    .to_string(),
                 "lastEpoch": last_epoch,
                 "expiresAfterEpoch": last_epoch
                     .filter(|_| remaining > 0)
@@ -1634,6 +1654,7 @@ fn dispatch(
                         "프로토콜 v3 활성화 높이 전에는 위임 거래를 제출할 수 없습니다.".into(),
                     ));
                 }
+                submission_policy(&guard, &transaction)?;
             }
             {
                 let guard = read_state(state)?;
@@ -1744,6 +1765,7 @@ fn send_raw_transaction(
             "프로토콜 v3 활성화 높이 전에는 위임 거래를 제출할 수 없습니다.".into(),
         ));
     }
+    submission_policy(&state, &transaction)?;
     if let crate::model::TransactionAction::Delegate { validator } = &transaction.action
         && !state
             .validators
@@ -1996,6 +2018,69 @@ fn block_json(block: &Block, full_transactions: bool, chain_id: u64) -> Value {
         "transactionsRoot": format!("0x{}", block.hash),
         "size": quantity(serde_json::to_vec(block).map(|bytes| bytes.len()).unwrap_or(0) as u64)
     })
+}
+
+/// 동결 계정과 v6 이전 웹 적립 거래를 제출 단계에서 바로 거절해 이유를 알려 줍니다.
+fn submission_policy(state: &RpcState, transaction: &Transaction) -> Result<(), (i64, String)> {
+    let now = unix_now();
+    if state
+        .chain
+        .staking()
+        .is_frozen(&normalize_address(&transaction.from), now)
+    {
+        return Err((
+            -32000,
+            "동결된 계정은 거래를 보낼 수 없습니다(해킹 피해 대응 중).".into(),
+        ));
+    }
+    if let crate::model::TransactionAction::GrantAccrual { recipient } = &transaction.action {
+        if state
+            .upgrade_schedule
+            .version_at(state.chain.tip_height().saturating_add(1))
+            < crate::node_emission::RECOVERY_PROTOCOL_VERSION
+        {
+            return Err((
+                -32000,
+                "웹 적립 거래는 프로토콜 v6 활성화 높이 이후에 제출할 수 있습니다.".into(),
+            ));
+        }
+        let recipient = normalize_address(recipient);
+        let staking = state.chain.staking();
+        let cap = crate::node_emission::ACCRUAL_DAILY_CAP;
+        let used = staking.accrual_used_in(
+            &recipient,
+            now / crate::node_emission::REWARD_EPOCH_SECONDS,
+            cap,
+        );
+        if used.saturating_add(transaction.amount) > cap {
+            return Err((
+                -32000,
+                format!("오늘 적립 한도를 넘습니다(오늘 {used}, 한도 {cap})."),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|value| value.as_secs())
+        .unwrap_or(0)
+}
+
+fn valid_account_address(address: &str) -> Result<(), (i64, String)> {
+    let valid = address.len() == 42
+        && address.starts_with("0x")
+        && address[2..].bytes().all(|byte| byte.is_ascii_hexdigit());
+    if valid {
+        Ok(())
+    } else {
+        Err((
+            -32602,
+            format!("0x로 시작하는 40자리 주소가 필요합니다: {address}"),
+        ))
+    }
 }
 
 /// legacy(type 0) 서명 필드입니다. IEUM 자체 서명 거래는 v=27, r=s=0으로 표시합니다.

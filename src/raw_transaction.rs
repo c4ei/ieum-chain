@@ -101,6 +101,17 @@ fn decode_action(to: &[u8], data: &[u8]) -> Result<TransactionAction, String> {
             validator: v.into(),
         });
     }
+    if let Some(v) = text.strip_prefix("accrue:") {
+        let valid = v.len() == 42
+            && v.starts_with("0x")
+            && v[2..].bytes().all(|byte| byte.is_ascii_hexdigit());
+        if !valid {
+            return Err("적립 받을 주소가 올바르지 않습니다.".into());
+        }
+        return Ok(TransactionAction::GrantAccrual {
+            recipient: v.to_ascii_lowercase(),
+        });
+    }
     Err("지원하지 않는 스테이킹 calldata입니다.".into())
 }
 
@@ -426,6 +437,25 @@ mod tests {
 
     fn signed_raw(to: [u8; 20], amount: u128, data: &[u8], chain_id: u64) -> String {
         sign_legacy_for_test([1; 32], to, amount, data, chain_id, 0, 1, 50_000)
+    }
+
+    #[test]
+    fn accrue_calldata_decodes_to_web_grant() {
+        let to: [u8; 20] =
+            hex::decode(crate::staking::STAKING_SYSTEM_ADDRESS.trim_start_matches("0x"))
+                .unwrap()
+                .try_into()
+                .unwrap();
+        let data = b"accrue:0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let tx = decode_legacy(&signed_raw(to, 1, data, 21_004), 21_004).unwrap();
+        assert_eq!(
+            tx.action,
+            TransactionAction::GrantAccrual {
+                recipient: format!("0x{}", "a".repeat(40))
+            }
+        );
+        let bad = signed_raw(to, 1, b"accrue:0x12", 21_004);
+        assert!(decode_legacy(&bad, 21_004).is_err());
     }
 
     #[test]

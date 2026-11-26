@@ -929,6 +929,26 @@ impl ConsensusRuntime {
                 "계약 거래는 프로토콜 v4(EVM) 활성화 높이 이전에 사용할 수 없습니다.".into(),
             );
         }
+        if protocol < crate::node_emission::RECOVERY_PROTOCOL_VERSION
+            && (block.transactions.iter().any(|tx| {
+                matches!(
+                    tx.action,
+                    crate::model::TransactionAction::GrantAccrual { .. }
+                )
+            }) || block.system_events.iter().any(|event| {
+                matches!(
+                    &event.action,
+                    crate::scheduled_event::ScheduledEventAction::AccountFreeze { .. }
+                        | crate::scheduled_event::ScheduledEventAction::AccountUnfreeze { .. }
+                        | crate::scheduled_event::ScheduledEventAction::AccountRecovery { .. }
+                )
+            }))
+        {
+            return Err(
+                "웹 적립·계정 동결/복구는 프로토콜 v6 활성화 높이 이전에 사용할 수 없습니다."
+                    .into(),
+            );
+        }
         for transaction in &block.transactions {
             if let crate::model::TransactionAction::Delegate { validator } = &transaction.action
                 && !self
@@ -960,6 +980,7 @@ impl ConsensusRuntime {
             block.timestamp,
             &configured_events,
             self.chain.executed_events(),
+            protocol,
         )?;
         for event in &block.system_events {
             match &event.action {

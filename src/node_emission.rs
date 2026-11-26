@@ -106,6 +106,19 @@ pub const ACCRUAL_DAILY_CAP: u128 = 3 * IEUM / 10;
 /// 담보에 못 미친 적립이 이 일수 동안 늘지 않으면 재단(노드 보상 예산)으로 되돌립니다.
 pub const ACCRUAL_EXPIRY_EPOCHS: u64 = 60;
 
+/// 웹 보상 적립 전용 거래(프로토콜 v6)와 계정 동결·복구 이벤트가 켜지는 버전입니다.
+pub const RECOVERY_PROTOCOL_VERSION: u32 = 6;
+
+/// 오늘 웹 보상으로 이미 들어간 적립액입니다. 노드 적립은 남은 한도만 씁니다.
+fn web_accrued_in(staking: &crate::staking::StakingState, address: &str, epoch: u64) -> u128 {
+    staking
+        .accrual_days
+        .get(address)
+        .filter(|day| day.epoch == epoch)
+        .map(|day| day.amount)
+        .unwrap_or(0)
+}
+
 /// 공개 노드 하루 정산 결과입니다. payments는 일반 잔액, accruals는 잠긴 적립 잔액으로 들어갑니다.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ServiceSettlement {
@@ -267,7 +280,7 @@ pub fn calculate_service_settlement(
         for (_, address, _) in &unbonded {
             let room = SERVICE_BOND
                 .saturating_sub(service_bond_of(staking, address, timestamp))
-                .min(ACCRUAL_DAILY_CAP)
+                .min(ACCRUAL_DAILY_CAP.saturating_sub(web_accrued_in(staking, address, epoch)))
                 .min(budget);
             if room == 0 {
                 continue;
